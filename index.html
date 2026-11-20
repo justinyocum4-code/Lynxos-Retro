@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lynxos Retro</title>
+<style>
+  * { box-sizing: border-box; }
+  body { margin: 0; background: #000000; color: #ffffff; font-family: sans-serif; font-size: 18px; }
+  #lynxos-retro-app { max-width: 1100px; margin: 0 auto; padding: 16px; }
+  h1 { color: #F5C518; font-size: 36px; margin: 8px 0 4px 0; }
+  h2 { color: #F5C518; font-size: 26px; margin: 16px 0 8px 0; }
+  p { line-height: 1.5; }
+  .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+  #syncStatus { color: #cccccc; font-size: 16px; margin: 4px 0 16px 0; }
+  .note { color: #cccccc; font-size: 16px; }
+  .error { color: #ff8080; font-size: 17px; font-weight: bold; }
+  .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
+  button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
+  button:focus, input:focus, select:focus { outline: 3px solid #F5C518; outline-offset: 2px; }
+  button:active { background: #333333; }
+  [role="tablist"] { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0 16px 0; }
+  [role="tab"] { font-size: 18px; min-height: 52px; }
+  [role="tab"][aria-selected="true"] { background: #F5C518; color: #000000; font-weight: bold; }
+  #gameList { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
+  .game-card { display: block; width: 100%; text-align: left; background: #141414; border: 2px solid #555555; border-radius: 12px; padding: 16px; margin: 0; min-height: 110px; }
+  .game-card:focus { border-color: #F5C518; outline: 3px solid #F5C518; outline-offset: 2px; }
+  .game-title { display: block; font-size: 22px; font-weight: bold; color: #ffffff; margin-bottom: 6px; }
+  .game-meta { display: block; font-size: 16px; color: #cccccc; }
+  .game-tag { display: inline-block; font-size: 15px; color: #F5C518; border: 1px solid #F5C518; border-radius: 8px; padding: 2px 8px; margin-top: 8px; }
+  .game-note { display: block; font-size: 16px; color: #ffcc66; margin-top: 6px; }
+  .actions { margin: 20px 0; }
+  label { display: block; font-size: 19px; font-weight: bold; margin: 16px 0 6px 0; }
+  input[type="text"], input[type="email"], input[type="password"], input[type="url"], select { width: 100%; max-width: 560px; font-size: 19px; padding: 12px; border-radius: 10px; border: 2px solid #888888; background: #1a1a1a; color: #ffffff; }
+  input[type="file"] { font-size: 18px; color: #ffffff; }
+  #game { width: 100%; height: 72vh; min-height: 420px; background: #000000; border: 2px solid #F5C518; border-radius: 12px; margin-top: 12px; }
+  #game canvas { max-width: 100%; }
+</style>
+</head>
+<body>
+<div id="lynxos-retro-app">
+  <h1>Lynxos Retro</h1>
+  <p id="syncStatus" role="status">Checking cloud sync…</p>
+  <div id="live" aria-live="polite" class="sr-only"></div>
+
+  <!-- Library -->
+  <main id="libraryScreen" aria-label="Game library">
+    <div role="tablist" aria-label="Game systems" id="systemTabs"></div>
+    <p id="gameCount" role="status"></p>
+    <ul id="gameList" role="list"></ul>
+    <p id="emptyState" class="note" hidden></p>
+    <div class="actions">
+      <button type="button" id="addGameBtn">Add a game</button>
+      <button type="button" id="syncBtn">Sync now</button>
+      <button type="button" id="accountBtn">Account</button>
+    </div>
+    <p class="note">Controls: on the tablet use the on-screen gamepad. On TV use the remote D-pad and OK to start, or pair a Bluetooth gamepad. Start is Enter. Quick save is 1, quick load is 2.</p>
+    <p class="note">The games included here are free homebrew and public-domain games, released free by their authors. No commercial games are included.</p>
+  </main>
+
+  <!-- Add a game -->
+  <section id="addScreen" hidden aria-label="Add a game">
+    <h2>Add a game</h2>
+    <p id="addStatus" role="status"></p>
+    <label for="addTitle">Game title</label>
+    <input type="text" id="addTitle" placeholder="e.g. My Game">
+    <label for="addSystem">System</label>
+    <select id="addSystem"></select>
+    <label for="addUrl">Game link (web address of the game file)</label>
+    <input type="url" id="addUrl" placeholder="https://example.com/game.nes">
+    <p class="note">Or pick a game file from this device:</p>
+    <label for="addFile">Game file</label>
+    <input type="file" id="addFile">
+    <p class="note" id="addSyncNote"></p>
+    <div class="actions">
+      <button type="button" id="addSaveBtn">Add game</button>
+      <button type="button" id="addCancelBtn">Back to library</button>
+    </div>
+  </section>
+
+  <!-- Account / cloud sync -->
+  <section id="accountScreen" hidden aria-label="Account and cloud sync">
+    <h2>Account and cloud sync</h2>
+    <p id="accountStatus" role="status"></p>
+    <p class="note">Sign in with email and password and your game library syncs between your tablet and your Google TV. A game added on the tablet shows up on the TV.</p>
+    <label for="authEmail">Email</label>
+    <input type="email" id="authEmail" autocomplete="email">
+    <label for="authPassword">Password</label>
+    <input type="password" id="authPassword" autocomplete="current-password">
+    <div class="actions">
+      <button type="button" id="signInBtn">Sign in</button>
+      <button type="button" id="signUpBtn">Sign up</button>
+      <button type="button" id="signOutBtn">Sign out</button>
+      <button type="button" id="accountBackBtn">Back to library</button>
+    </div>
+  </section>
+
+  <!-- Player -->
+  <section id="playerScreen" hidden aria-label="Game player">
+    <div class="actions">
+      <button type="button" id="backBtn">Back to library</button>
+    </div>
+    <p id="nowPlaying" role="status"></p>
+    <p class="note">Touch gamepad on tablet. D-pad + Enter on TV. Bluetooth gamepad supported. Start is Enter. Quick save is 1, quick load is 2.</p>
+    <div id="game" role="region" aria-label="Game player"></div>
+  </section>
+</div>
+<script src="assets/emulatorjs/supabase-js/supabase.js"></script>
+<script src="supabase-config.js"></script>
+<script>
+(function () {
+  'use strict';
+
+  // ---------- Data ----------
+
+  // System id -> tab label + EmulatorJS core id.
+  var SYSTEMS = [
+    { id: 'all', label: 'All', core: null },
+    { id: 'nes', label: 'NES', core: 'nes' },
+    { id: 'snes', label: 'SNES', core: 'snes' },
+    { id: 'gb', label: 'Game Boy', core: 'gb' },
+    { id: 'gbc', label: 'Game Boy Color', core: 'gb' },
+    { id: 'gba', label: 'Game Boy Advance', core: 'gba' },
+    { id: 'segaMD', label: 'Genesis', core: 'segaMD' },
+    { id: 'segaMS', label: 'Master System', core: 'segaMS' },
+    { id: 'segaGG', label: 'Game Gear', core: 'segaGG' },
+    { id: 'atari2600', label: 'Atari 2600', core: 'atari2600' },
+    { id: 'n64', label: 'Nintendo 64', core: 'n64' },
+    { id: 'nds', label: 'Nintendo DS', core: 'nds' }
+  ];
+
+  function systemLabel(id) {
+    for (var i = 0; i < SYSTEMS.length; i++) {
+      if (SYSTEMS[i].id === id) return SYSTEMS[i].label;
+    }
+    return id;
+  }
+  function systemCore(id) {
+    for (var i = 0; i < SYSTEMS.length; i++) {
+      if (SYSTEMS[i].id === id) return SYSTEMS[i].core;
+    }
+    return 'nes';
+  }
+
+  // The 12 bundled games — all free homebrew / public domain, verified.
+  // genmddj is a Mega Drive music tracker, NOT a game; it is labelled
+  // honestly as one wherever it appears.
+  var BUNDLED = [
+    { id: 'thwaite', title: 'Thwaite', system: 'nes', author: 'Damian Yerrick', file: 'assets/roms/thwaite.nes', source: 'bundled' },
+    { id: 'croom', title: 'Concentration Room', system: 'nes', author: 'Damian Yerrick', file: 'assets/roms/croom.nes', source: 'bundled' },
+    { id: 'nova', title: 'Nova the Squirrel', system: 'nes', author: 'NovaSquirrel', file: 'assets/roms/nova.nes', source: 'bundled' },
+    { id: 'libbet', title: 'Libbet and the Magic Floor', system: 'gb', author: 'Damian Yerrick', file: 'assets/roms/libbet.gb', source: 'bundled' },
+    { id: 'ucity', title: 'uCity', system: 'gbc', author: 'AntonioND', file: 'assets/roms/ucity.gbc', source: 'bundled' },
+    { id: 'cascade7', title: 'CASCADE7', system: 'gba', author: 'mick-schroeder', file: 'assets/roms/CASCADE7.gba', source: 'bundled' },
+    { id: 'bossgaiden', title: 'Super Boss Gaiden', system: 'snes', author: 'Dieter von Laser', file: 'assets/roms/SuperBossGaiden.sfc', source: 'bundled' },
+    { id: 'platform-explorer', title: 'Platform Explorer', system: 'segaMS', author: 'Steven Boland', file: 'assets/roms/PlatformExplorer-1.0.sms', source: 'bundled' },
+    { id: 'genmddj', title: 'genmddj', system: 'segaMD', author: 'little-scale', file: 'assets/roms/genmddj-v0.17.bin', source: 'bundled', note: 'Mega Drive music tracker, not a game' },
+    { id: 'firefly', title: 'FIREFLY', system: 'atari2600', author: 'retroromrunner', file: 'assets/roms/firefly.bin', source: 'bundled' },
+    { id: 'pong-oman', title: 'Pong by Oman', system: 'n64', author: 'Oman (public domain)', file: 'assets/roms/pong-oman.z64', source: 'bundled' },
+    { id: 'negative-space', title: 'Negative Space', system: 'nds', author: 'beyondds', file: 'assets/roms/NegativeSpace.nds', source: 'bundled' }
+  ];
+
+  // ---------- State ----------
+
+  var currentTab = 'all';
+  var syncedGames = [];   // from Supabase game_library, newest first
+  var localGames = loadLocalGames(); // from localStorage, newest first
+
+  function $(id) { return document.getElementById(id); }
+  function announce(text) { $('live').textContent = text; }
+  function setStatus(el, text, kind) {
+    el.textContent = text;
+    el.className = kind || '';
+  }
+
+  function loadLocalGames() {
+    try {
+      var raw = localStorage.getItem('lr_local_games');
+      if (!raw) return [];
+      var list = JSON.parse(raw);
+      return Array.isArray(list) ? list : [];
+    } catch (e) { return []; }
+  }
+  function saveLocalGames() {
+    try { localStorage.setItem('lr_local_games', JSON.stringify(localGames)); } catch (e) {}
+  }
+
+  // ---------- Screens ----------
+
+  function showScreen(name) {
+    $('libraryScreen').hidden = name !== 'library';
+    $('addScreen').hidden = name !== 'add';
+    $('accountScreen').hidden = name !== 'account';
+    $('playerScreen').hidden = name !== 'player';
+  }
+
+  // ---------- Tabs + library ----------
+
+  function buildTabs() {
+    var tabs = $('systemTabs');
+    tabs.innerHTML = '';
+    SYSTEMS.forEach(function (sys) {
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.setAttribute('role', 'tab');
+      b.setAttribute('aria-selected', sys.id === currentTab ? 'true' : 'false');
+      b.textContent = sys.label;
+      b.addEventListener('click', function () { selectTab(sys.id); });
+      b.addEventListener('keydown', function (ev) {
+        var idx = SYSTEMS.findIndex(function (s) { return s.id === currentTab; });
+        var next = null;
+        if (ev.key === 'ArrowRight') next = SYSTEMS[(idx + 1) % SYSTEMS.length];
+        if (ev.key === 'ArrowLeft') next = SYSTEMS[(idx - 1 + SYSTEMS.length) % SYSTEMS.length];
+        if (next) {
+          ev.preventDefault();
+          selectTab(next.id);
+          var btns = tabs.querySelectorAll('[role="tab"]');
+          btns[SYSTEMS.findIndex(function (s) { return s.id === next.id; })].focus();
+        }
+      });
+      tabs.appendChild(b);
+    });
+    var sel = $('addSystem');
+    sel.innerHTML = '';
+    SYSTEMS.filter(function (s) { return s.id !== 'all'; }).forEach(function (sys) {
+      var o = document.createElement('option');
+      o.value = sys.id;
+      o.textContent = sys.label;
+      sel.appendChild(o);
+    });
+  }
+
+  function selectTab(id) {
+    currentTab = id;
+    buildTabs();
+    renderList();
+    var count = filteredGames().length;
+    announce(systemLabel(id) + ' games. ' + count + (count === 1 ? ' game.' : ' games.'));
+  }
+
+  function allGames() {
+    // Synced games first (newest first), then games added on this
+    // device (newest first), then the bundled games.
+    return syncedGames.concat(localGames).concat(BUNDLED);
+  }
+  function filteredGames() {
+    if (currentTab === 'all') return allGames();
+    return allGames().filter(function (g) { return g.system === currentTab; });
+  }
+
+  function sourceTag(game) {
+    if (game.source === 'synced') return 'Synced';
+    if (game.source === 'local') return 'On this device';
+    if (game.note) return 'Music tracker';
+    return 'Included';
+  }
+
+  function renderList() {
+    var list = $('gameList');
+    list.innerHTML = '';
+    var games = filteredGames();
+    $('gameCount').textContent = games.length + (games.length === 1 ? ' game' : ' games');
+    var empty = $('emptyState');
+    if (games.length === 0) {
+      empty.hidden = false;
+      empty.textContent = currentTab === 'segaGG'
+        ? 'No Game Gear games included yet — add your own.'
+        : 'No games in this system yet — add your own.';
+    } else {
+      empty.hidden = true;
+    }
+    games.forEach(function (game) {
+      var li = document.createElement('li');
+      li.setAttribute('role', 'listitem');
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'game-card';
+      btn.setAttribute('aria-label', 'Play ' + game.title + ', ' + systemLabel(game.system));
+      var title = document.createElement('span');
+      title.className = 'game-title';
+      title.textContent = game.title;
+      var meta = document.createElement('span');
+      meta.className = 'game-meta';
+      meta.textContent = systemLabel(game.system) + ' — by ' + (game.author || 'you');
+      var tag = document.createElement('span');
+      tag.className = 'game-tag';
+      tag.textContent = sourceTag(game);
+      btn.appendChild(title);
+      btn.appendChild(meta);
+      btn.appendChild(tag);
+      if (game.note) {
+        var note = document.createElement('span');
+        note.className = 'game-note';
+        note.textContent = game.note;
+        btn.appendChild(note);
+      }
+      btn.addEventListener('click', function () { playGame(game); });
+      li.appendChild(btn);
+      list.appendChild(li);
+    });
+  }
+
+  // ---------- Local ROM storage (IndexedDB, for files added offline) ----------
+
+  function idb() {
+    return new Promise(function (resolve, reject) {
+      var req = indexedDB.open('lynxos-retro', 1);
+      req.onupgradeneeded = function () { req.result.createObjectStore('roms'); };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  function idbPut(key, blob) {
+    return idb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction('roms', 'readwrite');
+        tx.objectStore('roms').put(blob, key);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
+      });
+    });
+  }
+  function idbGet(key) {
+    return idb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var req = db.transaction('roms').objectStore('roms').get(key);
+        req.onsuccess = function () { resolve(req.result); };
+        req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+
+  // ---------- Player ----------
+
+  function playGame(game) {
+    resolveGameUrl(game).then(function (url) {
+      if (!url) {
+        announce('Could not load ' + game.title + '.');
+        return;
+      }
+      showScreen('player');
+      $('nowPlaying').textContent = 'Now playing: ' + game.title + ' (' + systemLabel(game.system) + ')';
+      announce('Now playing ' + game.title + ', ' + systemLabel(game.system));
+      window.EJS_player = '#game';
+      window.EJS_core = game.core || systemCore(game.system);
+      window.EJS_gameUrl = url;
+      window.EJS_pathtodata = 'assets/emulatorjs/data/';
+      window.EJS_biosUrl = '';
+      window.EJS_lightgun = false;
+      window.EJS_language = 'en-US';
+      window.EJS_disableAutoLang = true;
+      window.EJS_startOnLoaded = true;
+      var s = document.createElement('script');
+      s.src = 'assets/emulatorjs/data/loader.js';
+      s.onerror = function () {
+        $('nowPlaying').textContent = 'The emulator did not load. Check your connection and try again.';
+        announce('The emulator did not load.');
+      };
+      document.head.appendChild(s);
+    }).catch(function (err) {
+      announce('Could not load ' + game.title + ': ' + (err && err.message ? err.message : 'unknown error'));
+      showScreen('library');
+    });
+  }
+
+  // Returns a playable URL for a game: a bundled file path, a remote
+  // link, a downloaded cloud file, or a locally stored file.
+  function resolveGameUrl(game) {
+    if (game.file) return Promise.resolve(game.file);
+    if (game.romUrl) return Promise.resolve(game.romUrl);
+    if (game.storagePath) {
+      if (!supabaseClient) return Promise.reject(new Error('Not signed in.'));
+      return supabaseClient.storage.from('roms').download(game.storagePath).then(function (res) {
+        if (res.error) throw res.error;
+        return URL.createObjectURL(res.data);
+      });
+    }
+    if (game.idbKey) {
+      return idbGet(game.idbKey).then(function (blob) {
+        if (!blob) throw new Error('File not found on this device.');
+        return URL.createObjectURL(blob);
+      });
+    }
+    return Promise.resolve(null);
+  }
+
+  // TV remote Back: leave the player, otherwise exit the app.
+  window.tvBack = function () {
+    if (!$('playerScreen').hidden) {
+      location.reload();
+      return 'handled';
+    }
+    return 'exit';
+  };
+
+  // ---------- Cloud sync (Supabase) ----------
+
+  var supabaseClient = null;
+  var currentUser = null;
+  var syncConfigured = false;
+
+  function initSupabase() {
+    var url = window.SUPABASE_URL;
+    var key = window.SUPABASE_ANON_KEY;
+    if (!url || !key || url.indexOf('YOUR_') === 0 || key.indexOf('YOUR_') === 0) {
+      syncConfigured = false;
+      return;
+    }
+    if (typeof window.supabase === 'undefined' || !window.supabase.createClient) {
+      syncConfigured = false;
+      return;
+    }
+    try {
+      supabaseClient = window.supabase.createClient(url, key, {
+        auth: { persistSession: true, autoRefreshToken: true }
+      });
+      syncConfigured = true;
+    } catch (e) {
+      syncConfigured = false;
+      supabaseClient = null;
+    }
+  }
+
+  function updateSyncStatus() {
+    var el = $('syncStatus');
+    if (!syncConfigured) {
+      el.textContent = 'Cloud sync is not set up yet — the games included in the app work offline.';
+    } else if (currentUser) {
+      el.textContent = 'Signed in as ' + currentUser.email + ' — your library syncs to the cloud.';
+    } else {
+      el.textContent = 'Not signed in — games you add stay on this device. Sign in to sync them to your TV.';
+    }
+    var note = $('addSyncNote');
+    if (note) {
+      note.textContent = (!syncConfigured)
+        ? 'Cloud sync is not set up yet, so this game will be added on this device only.'
+        : (currentUser
+          ? 'Signed in — this game will be saved to your cloud library and show up on your TV.'
+          : 'Not signed in — this game will be added on this device only. Sign in to sync it.');
+    }
+  }
+
+  function updateAccountStatus(msg, kind) {
+    var el = $('accountStatus');
+    if (msg) setStatus(el, msg, kind);
+    else if (!syncConfigured) setStatus(el, 'Cloud sync is not set up yet. The app works offline with the games included.', '');
+    else if (currentUser) setStatus(el, 'Signed in as ' + currentUser.email + '.', 'ok');
+    else setStatus(el, 'Not signed in.', '');
+  }
+
+  function syncLibrary() {
+    if (!supabaseClient || !currentUser) return Promise.resolve();
+    return supabaseClient
+      .from('game_library')
+      .select('*')
+      .order('added_at', { ascending: false })
+      .then(function (res) {
+        if (res.error) {
+          announce('Sync did not work: ' + res.error.message);
+          return;
+        }
+        syncedGames = (res.data || []).map(function (row) {
+          var isUpload = row.source === 'upload';
+          return {
+            id: 'sync-' + row.id,
+            title: row.title,
+            system: row.system,
+            core: row.core,
+            author: 'You',
+            source: 'synced',
+            romUrl: isUpload ? null : row.rom_url,
+            storagePath: isUpload ? row.rom_url : null,
+            addedAt: row.added_at
+          };
+        });
+        renderList();
+        announce('Library synced. ' + syncedGames.length + ' synced games.');
+      });
+  }
+
+  function refreshSession() {
+    if (!supabaseClient) return Promise.resolve();
+    return supabaseClient.auth.getSession().then(function (res) {
+      currentUser = res.data && res.data.session ? res.data.session.user : null;
+      updateSyncStatus();
+      updateAccountStatus();
+      if (currentUser) return syncLibrary();
+    });
+  }
+
+  // ---------- Add a game ----------
+
+  function addGame() {
+    var title = $('addTitle').value.trim();
+    var system = $('addSystem').value;
+    var url = $('addUrl').value.trim();
+    var file = $('addFile').files && $('addFile').files[0];
+    var status = $('addStatus');
+    if (!url && !file) {
+      setStatus(status, 'Add a game file or paste a game link first.', 'error');
+      return;
+    }
+    if (!title) title = file ? file.name.replace(/\.[^.]+$/, '') : 'Untitled game';
+    var core = systemCore(system);
+    setStatus(status, 'Adding ' + title + '…', '');
+
+    if (file && supabaseClient && currentUser) {
+      // Signed in: upload the file to the cloud, then save the row.
+      var path = currentUser.id + '/' + Date.now() + '-' + file.name;
+      supabaseClient.storage.from('roms').upload(path, file).then(function (up) {
+        if (up.error) { setStatus(status, 'Upload did not work: ' + up.error.message, 'error'); return; }
+        return supabaseClient.from('game_library').insert({
+          user_id: currentUser.id, title: title, system: system,
+          core: core, rom_url: path, source: 'upload'
+        });
+      }).then(function (ins) {
+        if (!ins) return;
+        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); return; }
+        setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
+        announce('Added ' + title + ' to your cloud library.');
+        syncLibrary().then(function () { showScreen('library'); });
+      }).catch(function (err) {
+        setStatus(status, 'Could not add: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+      });
+      return;
+    }
+
+    if (file) {
+      // Not signed in: keep the file on this device (IndexedDB).
+      var id = 'local-' + Date.now();
+      idbPut(id, file).then(function () {
+        localGames.unshift({
+          id: id, title: title, system: system, core: core, author: 'You',
+          source: 'local', idbKey: id, fileName: file.name,
+          addedAt: new Date().toISOString()
+        });
+        saveLocalGames();
+        renderList();
+        setStatus(status, 'Added ' + title + ' on this device only. Sign in to sync it to your TV.', 'ok');
+        announce('Added ' + title + ' on this device only.');
+        showScreen('library');
+      }).catch(function (err) {
+        setStatus(status, 'Could not save the file: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+      });
+      return;
+    }
+
+    // Link only.
+    if (supabaseClient && currentUser) {
+      supabaseClient.from('game_library').insert({
+        user_id: currentUser.id, title: title, system: system,
+        core: core, rom_url: url, source: 'url'
+      }).then(function (ins) {
+        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); return; }
+        setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
+        announce('Added ' + title + ' to your cloud library.');
+        syncLibrary().then(function () { showScreen('library'); });
+      });
+    } else {
+      localGames.unshift({
+        id: 'local-' + Date.now(), title: title, system: system, core: core,
+        author: 'You', source: 'local', romUrl: url,
+        addedAt: new Date().toISOString()
+      });
+      saveLocalGames();
+      renderList();
+      setStatus(status, 'Added ' + title + ' on this device only. Sign in to sync it to your TV.', 'ok');
+      announce('Added ' + title + ' on this device only.');
+      showScreen('library');
+    }
+  }
+
+  // ---------- Wire up ----------
+
+  function init() {
+    buildTabs();
+    renderList();
+    initSupabase();
+    updateSyncStatus();
+    updateAccountStatus();
+
+    $('addGameBtn').addEventListener('click', function () {
+      setStatus($('addStatus'), '', '');
+      updateSyncStatus();
+      showScreen('add');
+      $('addTitle').focus();
+    });
+    $('addCancelBtn').addEventListener('click', function () { showScreen('library'); });
+    $('addSaveBtn').addEventListener('click', addGame);
+    $('accountBtn').addEventListener('click', function () {
+      updateAccountStatus();
+      showScreen('account');
+    });
+    $('accountBackBtn').addEventListener('click', function () { showScreen('library'); });
+    $('syncBtn').addEventListener('click', function () {
+      if (!syncConfigured) {
+        announce('Cloud sync is not set up yet.');
+      } else if (!currentUser) {
+        announce('Sign in first, then sync.');
+      } else {
+        syncLibrary();
+      }
+    });
+    $('backBtn').addEventListener('click', function () { location.reload(); });
+
+    if (supabaseClient) {
+      supabaseClient.auth.onAuthStateChange(function (_event, session) {
+        currentUser = session ? session.user : null;
+        updateSyncStatus();
+        updateAccountStatus();
+        if (currentUser) syncLibrary(); else { syncedGames = []; renderList(); }
+      });
+      refreshSession();
+    }
+
+    announce('Lynxos Retro. ' + BUNDLED.length + ' games included.');
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+})();
+</script>
+</body>
+</html>
