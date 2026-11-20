@@ -82,7 +82,7 @@
   <section id="accountScreen" hidden aria-label="Account and cloud sync">
     <h2>Account and cloud sync</h2>
     <p id="accountStatus" role="status"></p>
-    <p class="note">Sign in with email and password and your game library syncs between your tablet and your Google TV. A game added on the tablet shows up on the TV.</p>
+    <p class="note">Sign in with email and password and your game library syncs between your tablet and your Google TV. A game added on the tablet shows up on the TV. When you sign up, we send a confirmation email — tap the link in it to finish signing up.</p>
     <label for="authEmail">Email</label>
     <input type="email" id="authEmail" autocomplete="email">
     <label for="authPassword">Password</label>
@@ -91,7 +91,24 @@
       <button type="button" id="signInBtn">Sign in</button>
       <button type="button" id="signUpBtn">Sign up</button>
       <button type="button" id="signOutBtn">Sign out</button>
+      <button type="button" id="forgotBtn">Forgot password?</button>
       <button type="button" id="accountBackBtn">Back to library</button>
+    </div>
+    <div id="resetSection" hidden>
+      <h2>Reset your password</h2>
+      <p class="note">Enter your email in the Email box above, then tap "Send reset email". You will get an email with a link. Tap the link and come back here to choose a new password.</p>
+      <div class="actions">
+        <button type="button" id="sendResetBtn">Send reset email</button>
+      </div>
+      <div id="newPasswordForm" hidden>
+        <label for="newPassword">New password</label>
+        <input type="password" id="newPassword" autocomplete="new-password">
+        <label for="confirmPassword">Repeat the new password</label>
+        <input type="password" id="confirmPassword" autocomplete="new-password">
+        <div class="actions">
+          <button type="button" id="savePasswordBtn">Set a new password</button>
+        </div>
+      </div>
     </div>
   </section>
 
@@ -448,6 +465,174 @@
     else setStatus(el, 'Not signed in.', '');
   }
 
+  // ---------- Account: sign in, sign up, sign out, password reset ----------
+
+  var recoveryMode = false;
+
+  function setAuthBusy(busy) {
+    $('signInBtn').disabled = busy;
+    $('signUpBtn').disabled = busy;
+    $('signOutBtn').disabled = busy;
+  }
+
+  function authStatus(msg, kind) {
+    updateAccountStatus(msg, kind);
+    announce(msg);
+  }
+
+  function readAuthFields() {
+    return {
+      email: $('authEmail').value.trim(),
+      password: $('authPassword').value
+    };
+  }
+
+  function signIn() {
+    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    var f = readAuthFields();
+    if (!f.email || !f.password) {
+      authStatus('Enter your email and password first.', 'error');
+      return;
+    }
+    setAuthBusy(true);
+    supabaseClient.auth.signInWithPassword({ email: f.email, password: f.password }).then(function (res) {
+      setAuthBusy(false);
+      if (res.error) { authStatus(res.error.message, 'error'); return; }
+      // Success: the onAuthStateChange handler updates the status.
+    }).catch(function (err) {
+      setAuthBusy(false);
+      authStatus(err && err.message ? err.message : 'Sign in did not work.', 'error');
+    });
+  }
+
+  function signUp() {
+    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    var f = readAuthFields();
+    if (!f.email || !f.password) {
+      authStatus('Enter your email and password first.', 'error');
+      return;
+    }
+    setAuthBusy(true);
+    supabaseClient.auth.signUp({
+      email: f.email,
+      password: f.password,
+      options: { emailRedirectTo: 'com.lynxosretro.app://auth-callback' }
+    }).then(function (res) {
+      setAuthBusy(false);
+      if (res.error) {
+        if (/already registered/i.test(res.error.message)) {
+          authStatus('That email already has an account — try Sign in, or use Forgot password.', 'error');
+        } else {
+          authStatus(res.error.message, 'error');
+        }
+        return;
+      }
+      var user = res.data && res.data.user;
+      // Supabase sometimes answers an existing email with no error
+      // and a user with no identities, instead of an error.
+      if (user && user.identities && user.identities.length === 0) {
+        authStatus('That email already has an account — try Sign in, or use Forgot password.', 'error');
+        return;
+      }
+      if (res.data && res.data.session) {
+        // Email confirmation is off: signed straight in.
+        // The onAuthStateChange handler updates the status.
+        return;
+      }
+      authStatus('Account created. Check your email and tap the confirmation link to finish signing up.', 'ok');
+    }).catch(function (err) {
+      setAuthBusy(false);
+      authStatus(err && err.message ? err.message : 'Sign up did not work.', 'error');
+    });
+  }
+
+  function signOut() {
+    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    setAuthBusy(true);
+    supabaseClient.auth.signOut().then(function () {
+      setAuthBusy(false);
+      // The onAuthStateChange handler clears the user and the status.
+    }).catch(function (err) {
+      setAuthBusy(false);
+      authStatus(err && err.message ? err.message : 'Sign out did not work.', 'error');
+    });
+  }
+
+  function showResetSection() {
+    $('resetSection').hidden = false;
+    $('newPasswordForm').hidden = !recoveryMode;
+  }
+
+  function sendResetEmail() {
+    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    var email = $('authEmail').value.trim();
+    if (!email) { authStatus('Enter your email first.', 'error'); return; }
+    $('sendResetBtn').disabled = true;
+    supabaseClient.auth.resetPasswordForEmail(email, {
+      redirectTo: 'com.lynxosretro.app://auth-callback'
+    }).then(function (res) {
+      $('sendResetBtn').disabled = false;
+      if (res.error) { authStatus(res.error.message, 'error'); return; }
+      authStatus('Reset email sent — check your inbox and tap the link.', 'ok');
+    }).catch(function (err) {
+      $('sendResetBtn').disabled = false;
+      authStatus(err && err.message ? err.message : 'Could not send the reset email.', 'error');
+    });
+  }
+
+  function saveNewPassword() {
+    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    var pw = $('newPassword').value;
+    var pw2 = $('confirmPassword').value;
+    if (pw !== pw2) { authStatus('Passwords do not match.', 'error'); return; }
+    if (pw.length < 6) { authStatus('Password must be at least 6 characters.', 'error'); return; }
+    $('savePasswordBtn').disabled = true;
+    supabaseClient.auth.updateUser({ password: pw }).then(function (res) {
+      $('savePasswordBtn').disabled = false;
+      if (res.error) { authStatus(res.error.message, 'error'); return; }
+      $('newPassword').value = '';
+      $('confirmPassword').value = '';
+      $('newPasswordForm').hidden = true;
+      recoveryMode = false;
+      authStatus('Password changed. You\'re signed in.', 'ok');
+    }).catch(function (err) {
+      $('savePasswordBtn').disabled = false;
+      authStatus(err && err.message ? err.message : 'Could not change the password.', 'error');
+    });
+  }
+
+  // Called by the Android app when an auth email link is tapped:
+  // com.lynxosretro.app://auth-callback#access_token=...&type=signup
+  // (or type=recovery for a password reset).
+  window.handleAuthCallback = function (url) {
+    if (!url || url.indexOf('#') === -1) return;
+    var frag = url.slice(url.indexOf('#') + 1);
+    var params = {};
+    frag.split('&').forEach(function (pair) {
+      var kv = pair.split('=');
+      if (kv.length === 2) params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
+    });
+    if (!params.access_token) return;
+    if (!supabaseClient) return;
+    recoveryMode = params.type === 'recovery';
+    supabaseClient.auth.setSession({
+      access_token: params.access_token,
+      refresh_token: params.refresh_token || ''
+    }).then(function (res) {
+      if (res.error) { authStatus(res.error.message, 'error'); return; }
+      if (recoveryMode) {
+        showScreen('account');
+        showResetSection();
+        authStatus('Choose a new password.', '');
+        $('newPassword').focus();
+      } else {
+        authStatus('Signed in.', 'ok');
+      }
+    }).catch(function (err) {
+      authStatus(err && err.message ? err.message : 'Could not finish signing in.', 'error');
+    });
+  };
+
   function syncLibrary() {
     if (!supabaseClient || !currentUser) return Promise.resolve();
     return supabaseClient
@@ -592,6 +777,15 @@
       showScreen('account');
     });
     $('accountBackBtn').addEventListener('click', function () { showScreen('library'); });
+    $('signInBtn').addEventListener('click', signIn);
+    $('signUpBtn').addEventListener('click', signUp);
+    $('signOutBtn').addEventListener('click', signOut);
+    $('forgotBtn').addEventListener('click', function () {
+      showResetSection();
+      $('authEmail').focus();
+    });
+    $('sendResetBtn').addEventListener('click', sendResetEmail);
+    $('savePasswordBtn').addEventListener('click', saveNewPassword);
     $('syncBtn').addEventListener('click', function () {
       if (!syncConfigured) {
         announce('Cloud sync is not set up yet.');
@@ -607,10 +801,16 @@
       supabaseClient.auth.onAuthStateChange(function (_event, session) {
         currentUser = session ? session.user : null;
         updateSyncStatus();
-        updateAccountStatus();
+        // In recovery mode the "Choose a new password." message must
+        // stay on screen; the default status would overwrite it.
+        if (!recoveryMode) updateAccountStatus();
         if (currentUser) syncLibrary(); else { syncedGames = []; renderList(); }
       });
       refreshSession();
+      // Opened from an auth email link: the tokens are in the URL hash.
+      if (window.location.hash && window.location.hash.indexOf('access_token') !== -1) {
+        window.handleAuthCallback(window.location.href);
+      }
     }
 
     announce('Lynxos Retro. ' + BUNDLED.length + ' games included.');
