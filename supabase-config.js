@@ -8,5 +8,5 @@
 // and the roms storage bucket (see README.md).
 // Until these are filled in, the app works fully offline with the
 // games included in the app, and shows "Cloud sync is not set up yet".
-window.SUPABASE_URL = "YOUR_SUPABASE_URL_HERE";
-window.SUPABASE_ANON_KEY = "YOUR_SUPABASE_ANON_KEY_HERE";
+window.SUPABASE_URL = "https://pyewacxllhmtizkylidv.supabase.co";
+window.SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InB5ZXdhY3hsbGhtdGl6a3lsaWR2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTUyMDg1MzUsImV4cCI6MjExMDc4NDUzNX0.icoJa0aeRcNp1jnSoR9BzKxapYa4Ktc_YUZUyNPpyRc";
