@@ -225,6 +225,9 @@ jobs:
           import android.content.res.Configuration;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.os.SystemClock;
           import android.view.KeyEvent;
           import android.view.InputDevice;
           import android.webkit.JavascriptInterface;
@@ -244,6 +247,14 @@ jobs:
               private boolean gamePlaying = false;
               private boolean isTV = false;
               private long backDownTime = 0;
+              private boolean okHoldFired = false;
+              private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              private final Runnable okHoldRunnable = new Runnable() {
+                  @Override public void run() {
+                      okHoldFired = true;
+                      injectKeyDownUp(KeyEvent.KEYCODE_ENTER);
+                  }
+              };
               private static MainActivity instance;
 
               /* Bridge the page calls: the page tells us when a game is
@@ -397,14 +408,20 @@ jobs:
                  While a game is playing on TV, the sideways D-pad is
                  rotated 90 degrees (remote up = game left, remote
                  right = game up, remote down = game right, remote
-                 left = game down); the volume rocker is A/B, the
-                 channel rocker is X/Y and mute is Select. Outside a
-                 game every button works normally. Back is held to
-                 leave a game; a short press inside a game does
-                 nothing. While a game is playing the RemoteKeyService
-                 (accessibility service) reports every other button's
-                 code to the page and swallows the app buttons, so
-                 this activity only reports buttons outside a game. */
+                 left = game down); the channel rocker is A/B, OK tap
+                 is X and OK hold is Start, Back tap is Y and Back
+                 hold leaves the game, and mute is Select. The volume
+                 rocker stays mapped to A/B but the TV's audio system
+                 swallows those keys before any app sees them, so
+                 they never arrive. Outside a game every button works
+                 normally. While a game is playing the
+                 RemoteKeyService (accessibility service) reports
+                 every other button's code to the page and swallows
+                 the app buttons, so this activity only reports
+                 buttons outside a game — plus any key it cannot
+                 map while a game is playing, so a wrong code for
+                 the channel rocker surfaces instead of silently
+                 doing nothing. */
               @Override
               public boolean dispatchKeyEvent(KeyEvent event) {
                   int code = event.getKeyCode();
@@ -418,12 +435,34 @@ jobs:
                           long held = event.getEventTime() - backDownTime;
                           if (gamePlaying) {
                               if (held >= 800) exitPlayer();
+                              else if (isTV) injectKeyDownUp(KeyEvent.KEYCODE_A);
                           } else {
                               onBackPressed();
                           }
                           return true;
                       }
                       return true;
+                  }
+                  /* OK (centre button) in a game on TV: a tap is
+                     the X button (roll on Super Nintendo), a hold
+                     of half a second is Start (pause). The hold
+                     fires on a timer so a tap stays snappy; a tap
+                     that has already fired Start does not also
+                     roll. Outside a game OK works normally. */
+                  if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
+                      if (gamePlaying && isTV) {
+                          if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                              okHoldFired = false;
+                              mainHandler.postDelayed(okHoldRunnable, 500);
+                              return true;
+                          }
+                          if (action == KeyEvent.ACTION_UP) {
+                              mainHandler.removeCallbacks(okHoldRunnable);
+                              if (!okHoldFired) injectKeyDownUp(KeyEvent.KEYCODE_S);
+                              return true;
+                          }
+                          return true;
+                      }
                   }
                   if (gamePlaying && isTV) {
                       int rotated = rotateDpadCode(code);
@@ -435,6 +474,20 @@ jobs:
                       if (gameKey != 0) {
                           injectKey(event, gameKey);
                           return true;
+                      }
+                      /* A key this build cannot map (for example the
+                         channel rocker if it sends a code other than
+                         167): say its code out loud once, so the
+                         mapping can be fixed instead of the button
+                         silently doing nothing. */
+                      if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                          final int c = code;
+                          webView.post(new Runnable() {
+                              @Override public void run() {
+                                  webView.evaluateJavascript(
+                                      "(function(){ try { if (window.__remoteKeyTest) window.__remoteKeyTest(" + c + "); } catch(e){} })()", null);
+                              }
+                          });
                       }
                   }
                   if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
@@ -476,12 +529,17 @@ jobs:
 
               /* Rocker / mute buttons as game buttons (EmulatorJS
                  default keys: A = X, B = Z, X = S, Y = A key,
-                 Select = Shift). Returns 0 for other keys. */
+                 Select = Shift). The channel rocker is A/B — the
+                 two buttons every system has (Nintendo, Game Boy,
+                 Sega, Super Nintendo) — so this map works on every
+                 platform. The volume rocker stays A/B but the TV's
+                 audio system swallows those keys, so they never
+                 arrive. Returns 0 for other keys. */
               private int gameButtonCode(int code) {
                   if (code == KeyEvent.KEYCODE_VOLUME_UP) return KeyEvent.KEYCODE_X;
                   if (code == KeyEvent.KEYCODE_VOLUME_DOWN) return KeyEvent.KEYCODE_Z;
-                  if (code == KeyEvent.KEYCODE_CHANNEL_UP) return KeyEvent.KEYCODE_S;
-                  if (code == KeyEvent.KEYCODE_CHANNEL_DOWN) return KeyEvent.KEYCODE_A;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_UP) return KeyEvent.KEYCODE_X;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_DOWN) return KeyEvent.KEYCODE_Z;
                   if (code == KeyEvent.KEYCODE_MUTE) return KeyEvent.KEYCODE_SHIFT_LEFT;
                   return 0;
               }
@@ -495,6 +553,24 @@ jobs:
                       code, src.getRepeatCount(), src.getMetaState(),
                       src.getDeviceId(), 0, 0, InputDevice.SOURCE_KEYBOARD);
                   webView.dispatchKeyEvent(injected);
+              }
+
+              /* Inject a whole key press (down then up) at once,
+                 for buttons decided on release (OK tap = X, Back
+                 tap = Y) and for the OK hold (Start). The key is
+                 held for a frame or two: a down and up in the same
+                 instant can be missed by the emulator's per-frame
+                 poll. */
+              private void injectKeyDownUp(int code) {
+                  long now = SystemClock.uptimeMillis();
+                  final KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
+                      code, 0, 0, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
+                  final KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP,
+                      code, 0, 0, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
+                  webView.dispatchKeyEvent(down);
+                  mainHandler.postDelayed(new Runnable() {
+                      @Override public void run() { webView.dispatchKeyEvent(up); }
+                  }, 60);
               }
 
               private void exitPlayer() {
