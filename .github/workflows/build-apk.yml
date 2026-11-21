@@ -186,6 +186,7 @@ jobs:
           import android.net.Uri;
           import android.os.Bundle;
           import android.view.KeyEvent;
+          import android.view.InputDevice;
           import android.webkit.JavascriptInterface;
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
@@ -235,6 +236,12 @@ jobs:
                       public void onPageFinished(WebView view, String url) {
                           pageReady = true;
                           gamePlaying = false; /* fresh page = library */
+                          if (isTV) {
+                              /* Belt and braces: make sure the TV
+                                 layout is on even if the page's own
+                                 bridge check ever misses. */
+                              webView.evaluateJavascript("document.body.classList.add('tv')", null);
+                          }
                           if (pendingAuthUrl != null) {
                               final String u = pendingAuthUrl; pendingAuthUrl = null;
                               forwardAuth(u);
@@ -317,12 +324,22 @@ jobs:
                   try { outState.clear(); } catch (Exception ignored) {}
               }
 
-              /* Remote as a game controller (TV): while a game is playing
-                 the volume rocker is A/B, the channel rocker is X/Y and
-                 mute is Select. Outside a game those buttons work
-                 normally. Back is held to leave a game; a short press
-                 inside a game does nothing. Any other remote button is
-                 reported to the page (button test) but not consumed. */
+              /* Remote as a game controller (TV): the translation is
+                 done here, with real key presses injected into the
+                 WebView. The page used to translate keys itself with
+                 synthetic DOM events, but the emulator listens for
+                 keys on the game container, not the window, so those
+                 presses never reached the game. Real injected keys
+                 arrive exactly like a physical keyboard.
+                 While a game is playing on TV, the sideways D-pad is
+                 rotated 90 degrees (remote up = game left, remote
+                 right = game up, remote down = game right, remote
+                 left = game down); the volume rocker is A/B, the
+                 channel rocker is X/Y and mute is Select. Outside a
+                 game every button works normally. Back is held to
+                 leave a game; a short press inside a game does
+                 nothing. Any other remote button is reported to the
+                 page (button test) but not consumed. */
               @Override
               public boolean dispatchKeyEvent(KeyEvent event) {
                   int code = event.getKeyCode();
@@ -343,14 +360,17 @@ jobs:
                       }
                       return true;
                   }
-                  if (gamePlaying && event.getRepeatCount() == 0
-                          && (code == KeyEvent.KEYCODE_VOLUME_UP
-                              || code == KeyEvent.KEYCODE_VOLUME_DOWN
-                              || code == KeyEvent.KEYCODE_CHANNEL_UP
-                              || code == KeyEvent.KEYCODE_CHANNEL_DOWN
-                              || code == KeyEvent.KEYCODE_MUTE)) {
-                      forwardGameKey(code, action == KeyEvent.ACTION_DOWN);
-                      return true;
+                  if (gamePlaying && isTV) {
+                      int rotated = rotateDpadCode(code);
+                      if (rotated != 0) {
+                          injectKey(event, rotated);
+                          return true;
+                      }
+                      int gameKey = gameButtonCode(code);
+                      if (gameKey != 0) {
+                          injectKey(event, gameKey);
+                          return true;
+                      }
                   }
                   if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
                           && code != KeyEvent.KEYCODE_DPAD_UP
@@ -376,21 +396,47 @@ jobs:
                   return super.dispatchKeyEvent(event);
               }
 
+              /* Sideways D-pad, remote held with the top to the left:
+                 up = game left, right = game up, down = game right,
+                 left = game down. Returns 0 when the key is not a
+                 D-pad direction. */
+              private int rotateDpadCode(int code) {
+                  if (code == KeyEvent.KEYCODE_DPAD_UP) return KeyEvent.KEYCODE_DPAD_LEFT;
+                  if (code == KeyEvent.KEYCODE_DPAD_RIGHT) return KeyEvent.KEYCODE_DPAD_UP;
+                  if (code == KeyEvent.KEYCODE_DPAD_DOWN) return KeyEvent.KEYCODE_DPAD_RIGHT;
+                  if (code == KeyEvent.KEYCODE_DPAD_LEFT) return KeyEvent.KEYCODE_DPAD_DOWN;
+                  return 0;
+              }
+
+              /* Rocker / mute buttons as game buttons (EmulatorJS
+                 default keys: A = X, B = Z, X = S, Y = A key,
+                 Select = Shift). Returns 0 for other keys. */
+              private int gameButtonCode(int code) {
+                  if (code == KeyEvent.KEYCODE_VOLUME_UP) return KeyEvent.KEYCODE_X;
+                  if (code == KeyEvent.KEYCODE_VOLUME_DOWN) return KeyEvent.KEYCODE_Z;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_UP) return KeyEvent.KEYCODE_S;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_DOWN) return KeyEvent.KEYCODE_A;
+                  if (code == KeyEvent.KEYCODE_MUTE) return KeyEvent.KEYCODE_SHIFT_LEFT;
+                  return 0;
+              }
+
+              /* Inject a real key press into the WebView, built from
+                 the remote's own event so down-time, repeats and
+                 action (down/up) are preserved. */
+              private void injectKey(KeyEvent src, int code) {
+                  KeyEvent injected = new KeyEvent(
+                      src.getDownTime(), src.getEventTime(), src.getAction(),
+                      code, src.getRepeatCount(), src.getMetaState(),
+                      src.getDeviceId(), 0, 0, InputDevice.SOURCE_KEYBOARD);
+                  webView.dispatchKeyEvent(injected);
+              }
+
               private void exitPlayer() {
                   gamePlaying = false;
                   webView.post(new Runnable() {
                       @Override public void run() {
                           webView.evaluateJavascript(
                               "(function(){ try { if (window.__exitPlayer) window.__exitPlayer(); } catch(e){} })()", null);
-                      }
-                  });
-              }
-
-              private void forwardGameKey(final int code, final boolean down) {
-                  webView.post(new Runnable() {
-                      @Override public void run() {
-                          webView.evaluateJavascript(
-                              "(function(){ try { if (window.__remoteGameKey) window.__remoteGameKey(" + code + "," + down + "); } catch(e){} })()", null);
                       }
                   });
               }
