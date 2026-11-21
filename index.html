@@ -1057,7 +1057,10 @@
           clearInterval(stallTimer);
           reject(new Error('Upload timed out. Check your connection and try again.'));
         };
-        xhr.timeout = 600000;
+        xhr.timeout = 0; // No overall cap: a slow upload can take as
+        // long as it needs while it is moving. The 60-second stall
+        // check above is what catches a dead connection, so a stuck
+        // upload still fails loudly instead of hanging forever.
         xhr.send(file);
       });
     });
