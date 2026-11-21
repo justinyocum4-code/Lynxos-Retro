@@ -247,14 +247,7 @@ jobs:
               private boolean gamePlaying = false;
               private boolean isTV = false;
               private long backDownTime = 0;
-              private boolean okHoldFired = false;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
-              private final Runnable okHoldRunnable = new Runnable() {
-                  @Override public void run() {
-                      okHoldFired = true;
-                      injectKeyDownUp(KeyEvent.KEYCODE_ENTER);
-                  }
-              };
               private static MainActivity instance;
 
               /* Bridge the page calls: the page tells us when a game is
@@ -434,8 +427,8 @@ jobs:
                       if (action == KeyEvent.ACTION_UP) {
                           long held = event.getEventTime() - backDownTime;
                           if (gamePlaying) {
-                              if (held >= 800) exitPlayer();
-                              else if (isTV) injectKeyDownUp(KeyEvent.KEYCODE_A);
+                              if (held >= 500) exitPlayer();
+                              else if (isTV) injectKeyDownUp(KeyEvent.KEYCODE_S);
                           } else {
                               onBackPressed();
                           }
@@ -443,31 +436,24 @@ jobs:
                       }
                       return true;
                   }
-                  /* OK (centre button) in a game on TV: a tap is
-                     the X button (roll on Super Nintendo), a hold
-                     of half a second is Start (pause). The hold
-                     fires on a timer so a tap stays snappy; a tap
-                     that has already fired Start does not also
-                     roll. Outside a game OK works normally. */
-                  if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) {
-                      if (gamePlaying && isTV) {
-                          if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
-                              okHoldFired = false;
-                              mainHandler.postDelayed(okHoldRunnable, 500);
-                              return true;
-                          }
-                          if (action == KeyEvent.ACTION_UP) {
-                              mainHandler.removeCallbacks(okHoldRunnable);
-                              if (!okHoldFired) injectKeyDownUp(KeyEvent.KEYCODE_S);
-                              return true;
-                          }
-                          return true;
-                      }
-                  }
+                  /* OK (centre button) is Start on every system:
+                     it passes through to the WebView untouched, so
+                     a tap starts and pauses any game. It used to be
+                     tap = roll / hold = Start, but a tap that is not
+                     Start cannot start a game — on Nintendo a tap
+                     did nothing at all. The roll moved to Back tap. */
                   if (gamePlaying && isTV) {
-                      int rotated = rotateDpadCode(code);
-                      if (rotated != 0) {
-                          injectKey(event, rotated);
+                      /* D-pad, remote held the normal way up: up is
+                         up, down is down — no rotation. The old
+                         sideways rotation made "down" mean game-right,
+                         so a vertical menu (Mario's 1 player / 2
+                         player) could never be navigated. Injected
+                         so the keys reach the emulator container. */
+                      if (code == KeyEvent.KEYCODE_DPAD_UP
+                              || code == KeyEvent.KEYCODE_DPAD_DOWN
+                              || code == KeyEvent.KEYCODE_DPAD_LEFT
+                              || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
+                          injectKey(event, code);
                           return true;
                       }
                       int gameKey = gameButtonCode(code);
@@ -515,18 +501,6 @@ jobs:
                   return super.dispatchKeyEvent(event);
               }
 
-              /* Sideways D-pad, remote held with the top to the left:
-                 up = game left, right = game up, down = game right,
-                 left = game down. Returns 0 when the key is not a
-                 D-pad direction. */
-              private int rotateDpadCode(int code) {
-                  if (code == KeyEvent.KEYCODE_DPAD_UP) return KeyEvent.KEYCODE_DPAD_LEFT;
-                  if (code == KeyEvent.KEYCODE_DPAD_RIGHT) return KeyEvent.KEYCODE_DPAD_UP;
-                  if (code == KeyEvent.KEYCODE_DPAD_DOWN) return KeyEvent.KEYCODE_DPAD_RIGHT;
-                  if (code == KeyEvent.KEYCODE_DPAD_LEFT) return KeyEvent.KEYCODE_DPAD_DOWN;
-                  return 0;
-              }
-
               /* Rocker / mute buttons as game buttons (EmulatorJS
                  default keys: A = X, B = Z, X = S, Y = A key,
                  Select = Shift). The channel rocker is A/B — the
@@ -556,11 +530,10 @@ jobs:
               }
 
               /* Inject a whole key press (down then up) at once,
-                 for buttons decided on release (OK tap = X, Back
-                 tap = Y) and for the OK hold (Start). The key is
-                 held for a frame or two: a down and up in the same
-                 instant can be missed by the emulator's per-frame
-                 poll. */
+                 for buttons decided on release (Back tap = X, the
+                 roll). The key is held for a frame or two: a down
+                 and up in the same instant can be missed by the
+                 emulator's per-frame poll. */
               private void injectKeyDownUp(int code) {
                   long now = SystemClock.uptimeMillis();
                   final KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
