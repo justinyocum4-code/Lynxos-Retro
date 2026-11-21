@@ -25,6 +25,7 @@
   #gameList { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 12px; }
   .game-card { display: block; width: 100%; text-align: left; background: #141414; border: 2px solid #555555; border-radius: 12px; padding: 16px; margin: 0; min-height: 110px; }
   .game-card:focus { border-color: #F5C518; outline: 3px solid #F5C518; outline-offset: 2px; }
+  .game-options { display: block; width: 100%; margin: 8px 0 0 0; min-height: 48px; font-size: 17px; border-color: #888888; }
   .game-title { display: block; font-size: 22px; font-weight: bold; color: #ffffff; margin-bottom: 6px; }
   .game-meta { display: block; font-size: 16px; color: #cccccc; }
   .game-tag { display: inline-block; font-size: 15px; color: #F5C518; border: 1px solid #F5C518; border-radius: 8px; padding: 2px 8px; margin-top: 8px; }
@@ -46,6 +47,7 @@
   body.tv button:focus, body.tv input:focus, body.tv select:focus { outline-width: 5px; outline-offset: 3px; }
   body.tv #gameList { grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 22px; }
   body.tv .game-card { min-height: 170px; padding: 26px; }
+  body.tv .game-options { min-height: 64px; font-size: 24px; }
   body.tv .game-card:focus { background: #2b2b00; }
   body.tv .game-title { font-size: 32px; }
   body.tv .game-meta { font-size: 23px; }
@@ -104,6 +106,22 @@
     <div class="actions">
       <button type="button" id="addSaveBtn">Add game</button>
       <button type="button" id="addCancelBtn">Back to library</button>
+    </div>
+  </section>
+
+  <!-- Edit or delete a game -->
+  <section id="editScreen" hidden aria-label="Edit or delete a game">
+    <h2>Edit game</h2>
+    <p id="editStatus" role="status"></p>
+    <label for="editTitle">Game title</label>
+    <input type="text" id="editTitle">
+    <label for="editSystem">System</label>
+    <select id="editSystem"></select>
+    <p class="note">Games that came with the app cannot be changed. Only games you added can be edited or deleted.</p>
+    <div class="actions">
+      <button type="button" id="editSaveBtn">Save changes</button>
+      <button type="button" id="editDeleteBtn">Delete game</button>
+      <button type="button" id="editCancelBtn">Back to library</button>
     </div>
   </section>
 
@@ -346,13 +364,25 @@
     if (/^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName)) return;
     var dir = key.slice(5).toLowerCase(); // up / down / left / right
     var isTab = ae.getAttribute && ae.getAttribute('role') === 'tab';
-    var isCard = ae.classList && ae.classList.contains('game-card');
+    var isCard = ae.classList && (ae.classList.contains('game-card') || ae.classList.contains('game-options'));
     var inActions = false;
     if (ae.closest) {
       var a = ae.closest('.actions');
       inActions = !!a && $('libraryScreen').contains(a);
     }
     if (isCard) {
+      var isOpt = ae.classList.contains('game-options');
+      if (isOpt && dir === 'up') {
+        // From an Options button, Up goes back to its own game card.
+        var own = ae.parentElement && ae.parentElement.querySelector('.game-card');
+        if (own) { ev.preventDefault(); own.focus(); }
+        return;
+      }
+      if (!isOpt && dir === 'down') {
+        // From a game card, Down first reaches its own Options button.
+        var ownOpt = ae.parentElement && ae.parentElement.querySelector('.game-options');
+        if (ownOpt) { ev.preventDefault(); ownOpt.focus(); return; }
+      }
       if (dir === 'left' || dir === 'right') {
         var next = nearestCard(ae, dir);
         if (next) { ev.preventDefault(); next.focus(); }
@@ -388,6 +418,7 @@
   function showScreen(name) {
     $('libraryScreen').hidden = name !== 'library';
     $('addScreen').hidden = name !== 'add';
+    $('editScreen').hidden = name !== 'edit';
     $('accountScreen').hidden = name !== 'account';
     $('playerScreen').hidden = name !== 'player';
   }
@@ -425,6 +456,14 @@
       o.value = sys.id;
       o.textContent = sys.label;
       sel.appendChild(o);
+    });
+    var esel = $('editSystem');
+    esel.innerHTML = '';
+    SYSTEMS.filter(function (s) { return s.id !== 'all'; }).forEach(function (sys) {
+      var eo = document.createElement('option');
+      eo.value = sys.id;
+      eo.textContent = sys.label;
+      esel.appendChild(eo);
     });
   }
 
@@ -494,6 +533,15 @@
       }
       btn.addEventListener('click', function () { playGame(game); });
       li.appendChild(btn);
+      if (game.source !== 'bundled') {
+        var opt = document.createElement('button');
+        opt.type = 'button';
+        opt.className = 'game-options';
+        opt.setAttribute('aria-label', 'Options for ' + game.title);
+        opt.textContent = 'Options';
+        opt.addEventListener('click', function () { openEdit(game); });
+        li.appendChild(opt);
+      }
       list.appendChild(li);
     });
   }
@@ -524,6 +572,16 @@
         var req = db.transaction('roms').objectStore('roms').get(key);
         req.onsuccess = function () { resolve(req.result); };
         req.onerror = function () { reject(req.error); };
+      });
+    });
+  }
+  function idbDelete(key) {
+    return idb().then(function (db) {
+      return new Promise(function (resolve, reject) {
+        var tx = db.transaction('roms', 'readwrite');
+        tx.objectStore('roms').delete(key);
+        tx.oncomplete = function () { resolve(); };
+        tx.onerror = function () { reject(tx.error); };
       });
     });
   }
@@ -984,6 +1042,134 @@
     }
   }
 
+  // ---------- Edit or delete a game ----------
+
+  var currentEditGame = null;
+  var deleteArmed = false;
+
+  function openEdit(game) {
+    currentEditGame = game;
+    deleteArmed = false;
+    $('editDeleteBtn').textContent = 'Delete game';
+    setStatus($('editStatus'), '', '');
+    $('editTitle').value = game.title;
+    $('editSystem').value = game.system;
+    showScreen('edit');
+    announce('Editing ' + game.title + '. Change the title or system, then save, or delete the game.');
+    $('editTitle').focus();
+  }
+
+  function saveEdit() {
+    var game = currentEditGame;
+    if (!game) return;
+    var title = $('editTitle').value.trim();
+    var system = $('editSystem').value;
+    var status = $('editStatus');
+    if (!title) {
+      setStatus(status, 'Give the game a title first.', 'error');
+      announce('Give the game a title first.');
+      return;
+    }
+    var core = systemCore(system);
+    if (game.source === 'local') {
+      var found = null;
+      for (var i = 0; i < localGames.length; i++) {
+        if (localGames[i].id === game.id) { found = localGames[i]; break; }
+      }
+      if (!found) {
+        setStatus(status, 'Could not find that game on this device.', 'error');
+        announce('Could not find that game on this device.');
+        return;
+      }
+      found.title = title;
+      found.system = system;
+      found.core = core;
+      saveLocalGames();
+      renderList();
+      announce('Saved ' + title + '.');
+      showScreen('library');
+      selectTab(system);
+      return;
+    }
+    if (game.source === 'synced') {
+      if (!supabaseClient || !currentUser) {
+        setStatus(status, 'Sign in to change a synced game.', 'error');
+        announce('Sign in to change a synced game.');
+        return;
+      }
+      var rowId = String(game.id).replace(/^sync-/, '');
+      supabaseClient.from('game_library').update({ title: title, system: system, core: core }).eq('id', rowId).then(function (res) {
+        if (res.error) {
+          setStatus(status, 'Could not save: ' + res.error.message, 'error');
+          announce('Could not save: ' + res.error.message);
+          return;
+        }
+        announce('Saved ' + title + '.');
+        syncLibrary().then(function () { showScreen('library'); selectTab(system); });
+      }).catch(function (err) {
+        setStatus(status, 'Could not save: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+        announce('Could not save: ' + (err && err.message ? err.message : 'unknown error'));
+      });
+      return;
+    }
+    setStatus(status, 'Games that came with the app cannot be changed.', 'error');
+    announce('Games that came with the app cannot be changed.');
+  }
+
+  function deleteGame() {
+    var game = currentEditGame;
+    if (!game) return;
+    var status = $('editStatus');
+    if (!deleteArmed) {
+      deleteArmed = true;
+      $('editDeleteBtn').textContent = 'Tap again to delete';
+      announce('Tap delete again to remove ' + game.title + '.');
+      return;
+    }
+    deleteArmed = false;
+    $('editDeleteBtn').textContent = 'Delete game';
+    if (game.source === 'local') {
+      localGames = localGames.filter(function (g) { return g.id !== game.id; });
+      var done = Promise.resolve();
+      if (game.idbKey) done = idbDelete(game.idbKey).catch(function () {});
+      done.then(function () {
+        saveLocalGames();
+        renderList();
+        announce('Deleted ' + game.title + '.');
+        showScreen('library');
+      });
+      return;
+    }
+    if (game.source === 'synced') {
+      if (!supabaseClient || !currentUser) {
+        setStatus(status, 'Sign in to delete a synced game.', 'error');
+        announce('Sign in to delete a synced game.');
+        return;
+      }
+      var rowId = String(game.id).replace(/^sync-/, '');
+      var removeFile = game.storagePath
+        ? supabaseClient.storage.from('roms').remove([game.storagePath])
+        : Promise.resolve();
+      removeFile.then(function () {
+        return supabaseClient.from('game_library').delete().eq('id', rowId);
+      }).then(function (res) {
+        if (res.error) {
+          setStatus(status, 'Could not delete: ' + res.error.message, 'error');
+          announce('Could not delete: ' + res.error.message);
+          return;
+        }
+        announce('Deleted ' + game.title + '.');
+        syncLibrary().then(function () { showScreen('library'); });
+      }).catch(function (err) {
+        setStatus(status, 'Could not delete: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+        announce('Could not delete: ' + (err && err.message ? err.message : 'unknown error'));
+      });
+      return;
+    }
+    setStatus(status, 'Games that came with the app cannot be deleted.', 'error');
+    announce('Games that came with the app cannot be deleted.');
+  }
+
   // ---------- Wire up ----------
 
   function init() {
@@ -1003,6 +1189,9 @@
     });
     $('addCancelBtn').addEventListener('click', function () { showScreen('library'); });
     $('addSaveBtn').addEventListener('click', addGame);
+    $('editSaveBtn').addEventListener('click', saveEdit);
+    $('editDeleteBtn').addEventListener('click', deleteGame);
+    $('editCancelBtn').addEventListener('click', function () { showScreen('library'); });
     $('accountBtn').addEventListener('click', function () {
       updateAccountStatus();
       showScreen('account');
