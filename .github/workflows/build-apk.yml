@@ -443,17 +443,14 @@ jobs:
                      Start cannot start a game — on Nintendo a tap
                      did nothing at all. The roll moved to Back tap. */
                   if (gamePlaying && isTV) {
-                      /* D-pad, remote held the normal way up: up is
-                         up, down is down — no rotation. The old
-                         sideways rotation made "down" mean game-right,
-                         so a vertical menu (Mario's 1 player / 2
-                         player) could never be navigated. Injected
-                         so the keys reach the emulator container. */
-                      if (code == KeyEvent.KEYCODE_DPAD_UP
-                              || code == KeyEvent.KEYCODE_DPAD_DOWN
-                              || code == KeyEvent.KEYCODE_DPAD_LEFT
-                              || code == KeyEvent.KEYCODE_DPAD_RIGHT) {
-                          injectKey(event, code);
+                      /* D-pad, remote held sideways (top to the
+                         left), Justin's mapping: right arrow is up,
+                         down arrow is forward (right), left arrow is
+                         down, up arrow is back (left). Injected so
+                         the keys reach the emulator container. */
+                      int rotated = rotateDpadCode(code);
+                      if (rotated != 0) {
+                          injectKey(event, rotated);
                           return true;
                       }
                       int gameKey = gameButtonCode(code);
@@ -499,6 +496,19 @@ jobs:
                       });
                   }
                   return super.dispatchKeyEvent(event);
+              }
+
+              /* Sideways D-pad, remote held with the top to the left:
+                 right arrow = game up, down arrow = game right
+                 (forward), left arrow = game down, up arrow = game
+                 left (back). Returns 0 when the key is not a
+                 D-pad direction. */
+              private int rotateDpadCode(int code) {
+                  if (code == KeyEvent.KEYCODE_DPAD_UP) return KeyEvent.KEYCODE_DPAD_LEFT;
+                  if (code == KeyEvent.KEYCODE_DPAD_RIGHT) return KeyEvent.KEYCODE_DPAD_UP;
+                  if (code == KeyEvent.KEYCODE_DPAD_DOWN) return KeyEvent.KEYCODE_DPAD_RIGHT;
+                  if (code == KeyEvent.KEYCODE_DPAD_LEFT) return KeyEvent.KEYCODE_DPAD_DOWN;
+                  return 0;
               }
 
               /* Rocker / mute buttons as game buttons (EmulatorJS
