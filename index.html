@@ -35,12 +35,40 @@
   input[type="file"] { font-size: 18px; color: #ffffff; }
   #game { width: 100%; height: 72vh; min-height: 420px; background: #000000; border: 2px solid #F5C518; border-radius: 12px; margin-top: 12px; }
   #game canvas { max-width: 100%; }
+  .tv-only { display: none; }
+  /* TV (big-screen) layout: applied when the app adds class "tv" to body. */
+  body.tv #lynxos-retro-app { max-width: none; padding: 28px 56px; }
+  body.tv { font-size: 24px; }
+  body.tv h1 { font-size: 58px; }
+  body.tv h2 { font-size: 38px; }
+  body.tv button { font-size: 28px; min-height: 76px; padding: 16px 28px; }
+  body.tv [role="tab"] { font-size: 26px; min-height: 68px; padding: 14px 22px; }
+  body.tv button:focus, body.tv input:focus, body.tv select:focus { outline-width: 5px; outline-offset: 3px; }
+  body.tv #gameList { grid-template-columns: repeat(auto-fill, minmax(420px, 1fr)); gap: 22px; }
+  body.tv .game-card { min-height: 170px; padding: 26px; }
+  body.tv .game-card:focus { background: #2b2b00; }
+  body.tv .game-title { font-size: 32px; }
+  body.tv .game-meta { font-size: 23px; }
+  body.tv .game-tag { font-size: 21px; }
+  body.tv #syncStatus, body.tv .note { font-size: 23px; }
+  body.tv input[type="text"], body.tv input[type="email"], body.tv input[type="password"], body.tv input[type="url"], body.tv select { max-width: 900px; font-size: 26px; }
+  body.tv label { font-size: 25px; }
+  /* On TV the Add / Sync / Account buttons sit at the top of the library. */
+  body.tv #libraryScreen:not([hidden]) { display: flex; flex-direction: column; }
+  body.tv #libraryScreen .actions { order: -1; }
+  body.tv .tv-only { display: block; }
+  /* Full-screen player on TV: the game fills the whole TV. */
+  body.tv #playerScreen:not([hidden]) { position: fixed; inset: 0; z-index: 10; background: #000000; padding: 0; }
+  body.tv #playerScreen .actions, body.tv #playerScreen .note { display: none; }
+  body.tv #game { width: 100vw; height: 100vh; min-height: 0; margin: 0; border: 0; border-radius: 0; }
+  body.tv #game canvas { max-width: 100%; max-height: 100%; }
 </style>
 </head>
 <body>
 <div id="lynxos-retro-app">
   <h1>Lynxos Retro</h1>
   <p id="syncStatus" role="status">Checking cloud sync…</p>
+  <p id="keyTest" class="note tv-only" role="status"></p>
   <div id="live" aria-live="polite" class="sr-only"></div>
 
   <!-- Library -->
@@ -54,7 +82,7 @@
       <button type="button" id="syncBtn">Sync now</button>
       <button type="button" id="accountBtn">Account</button>
     </div>
-    <p class="note">Controls: on the tablet use the on-screen gamepad. On TV use the remote D-pad and OK to start, or pair a Bluetooth gamepad. Start is Enter. Quick save is 1, quick load is 2.</p>
+    <p class="note">Controls: on the tablet use the on-screen gamepad. On TV hold the remote sideways: the D-pad moves, volume up is A, volume down is B, channel up is X, channel down is Y, and the mute button is Select. OK is Start and pause. Hold Back to leave a game. Or pair a Bluetooth gamepad. Quick save is 1, quick load is 2.</p>
     <p class="note">The games included here are free homebrew and public-domain games, released free by their authors. No commercial games are included.</p>
   </main>
 
@@ -118,7 +146,7 @@
       <button type="button" id="backBtn">Back to library</button>
     </div>
     <p id="nowPlaying" role="status"></p>
-    <p class="note">Touch gamepad on tablet. D-pad + Enter on TV. Bluetooth gamepad supported. Start is Enter. Quick save is 1, quick load is 2.</p>
+    <p class="note">Touch gamepad on tablet. On TV hold the remote sideways: D-pad moves, volume is A and B, channel is X and Y, mute is Select. OK is Start and pause. Hold Back to leave the game. Quick save is 1, quick load is 2.</p>
     <div id="game" role="region" aria-label="Game player"></div>
   </section>
 </div>
@@ -200,6 +228,188 @@
   }
   function saveLocalGames() {
     try { localStorage.setItem('lr_local_games', JSON.stringify(localGames)); } catch (e) {}
+  }
+
+  // ---------- TV mode + remote as a game controller ----------
+
+  // TV detection: the Android app answers isTV() through the
+  // LynxosRetro bridge; ?tv=1 in the address also turns it on
+  // (handy for testing the TV layout in a desktop browser).
+  var IS_TV = false;
+  try {
+    IS_TV = window.location.search.indexOf('tv=1') !== -1 ||
+      (window.LynxosRetro && window.LynxosRetro.isTV && window.LynxosRetro.isTV());
+  } catch (e) { IS_TV = false; }
+
+  function setPlayingBridge(playing) {
+    try {
+      if (window.LynxosRetro && window.LynxosRetro.setPlaying) window.LynxosRetro.setPlaying(playing);
+    } catch (e) {}
+  }
+
+  // EmulatorJS keyboard map (its default controls): the game reads
+  // plain keyboard key codes, so the remote's buttons are translated
+  // into those codes. A = X key (88), B = Z (90), X = S (83),
+  // Y = A key (65), Select = Shift (16), Start = Enter (13).
+  var GAME_KEY_INFO = {
+    88: { key: 'x', code: 'KeyX' },
+    90: { key: 'z', code: 'KeyZ' },
+    83: { key: 's', code: 'KeyS' },
+    65: { key: 'a', code: 'KeyA' },
+    16: { key: 'Shift', code: 'ShiftLeft' },
+    13: { key: 'Enter', code: 'Enter' },
+    37: { key: 'ArrowLeft', code: 'ArrowLeft' },
+    38: { key: 'ArrowUp', code: 'ArrowUp' },
+    39: { key: 'ArrowRight', code: 'ArrowRight' },
+    40: { key: 'ArrowDown', code: 'ArrowDown' }
+  };
+
+  function sendGameKey(keyCode, isDown) {
+    var info = GAME_KEY_INFO[keyCode];
+    if (!info) return;
+    var ev = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
+      key: info.key, code: info.code, keyCode: keyCode,
+      bubbles: true, cancelable: true
+    });
+    // Belt and braces: some WebViews need keyCode set directly.
+    try { Object.defineProperty(ev, 'keyCode', { value: keyCode }); } catch (e) {}
+    try { Object.defineProperty(ev, 'which', { value: keyCode }); } catch (e) {}
+    window.dispatchEvent(ev);
+  }
+
+  // Called by the Android app for the rocker / mute buttons while a
+  // game is playing. Android key codes: volume up 24 = A, volume
+  // down 25 = B, channel up 166 = X, channel down 167 = Y,
+  // mute 164 = Select. Outside a game these buttons work normally.
+  var REMOTE_GAME_KEYS = { 24: 88, 25: 90, 166: 83, 167: 65, 164: 16 };
+  window.__remoteGameKey = function (androidCode, isDown) {
+    var keyCode = REMOTE_GAME_KEYS[androidCode];
+    if (!keyCode) return;
+    sendGameKey(keyCode, !!isDown);
+  };
+
+  // Called by the Android app for any other remote button (star,
+  // settings, apps, ...). Shows the button's code on screen so the
+  // next build can wire it up.
+  window.__remoteKeyTest = function (androidCode) {
+    var el = $('keyTest');
+    if (el) el.textContent = 'Button code: ' + androidCode;
+    announce('Button code ' + androidCode);
+  };
+
+  // Called by the Android app when Back is held inside a game.
+  window.__exitPlayer = function () {
+    setPlayingBridge(false);
+    location.reload();
+  };
+
+  // Sideways remote: with the remote turned sideways (top to the
+  // left) the D-pad is rotated 90 degrees. Real up = game left,
+  // real right = game up, real down = game right, real left = game
+  // down. Only inside a game on TV; the menus use the D-pad
+  // straight. The emulator has no "trusted event" check, so the
+  // translated keys reach the game.
+  var ROTATE_DPAD = { 38: 37, 39: 38, 40: 39, 37: 40 };
+  function rotateDpad(ev) {
+    if (!IS_TV) return;
+    if ($('playerScreen').hidden) return;
+    if (!ev.isTrusted) return;
+    var rotated = ROTATE_DPAD[ev.keyCode];
+    if (!rotated) return;
+    ev.preventDefault();
+    ev.stopImmediatePropagation();
+    sendGameKey(rotated, ev.type === 'keydown');
+  }
+
+  // ---------- D-pad grid navigation (library) ----------
+
+  function focusSelectedTab() {
+    var idx = SYSTEMS.findIndex(function (s) { return s.id === currentTab; });
+    var btns = $('systemTabs').querySelectorAll('[role="tab"]');
+    if (btns[idx]) btns[idx].focus();
+  }
+  function focusFirstCard() {
+    var c = document.querySelector('.game-card');
+    if (c) c.focus();
+  }
+  function focusLastCard() {
+    var cards = document.querySelectorAll('.game-card');
+    if (cards.length) cards[cards.length - 1].focus();
+  }
+  function focusFirstAction() {
+    var b = document.querySelector('#libraryScreen .actions button');
+    if (b) b.focus();
+  }
+
+  function nearestCard(fromEl, dir) {
+    var from = fromEl.getBoundingClientRect();
+    var fx = from.left + from.width / 2, fy = from.top + from.height / 2;
+    var best = null, bestScore = Infinity;
+    var cards = document.querySelectorAll('.game-card');
+    for (var i = 0; i < cards.length; i++) {
+      var c = cards[i];
+      if (c === fromEl) continue;
+      var r = c.getBoundingClientRect();
+      var cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+      var dx = cx - fx, dy = cy - fy;
+      if (dir === 'right' && dx <= 0) continue;
+      if (dir === 'left' && dx >= 0) continue;
+      if (dir === 'down' && dy <= 0) continue;
+      if (dir === 'up' && dy >= 0) continue;
+      var primary = (dir === 'right' || dir === 'left') ? Math.abs(dx) : Math.abs(dy);
+      var perp = (dir === 'right' || dir === 'left') ? Math.abs(dy) : Math.abs(dx);
+      var score = primary + perp * 3;
+      if (score < bestScore) { bestScore = score; best = c; }
+    }
+    return best;
+  }
+
+  function libraryGridNav(ev) {
+    if ($('playerScreen').hidden === false) return;
+    if ($('libraryScreen').hidden) return;
+    if (ev.defaultPrevented) return;
+    var key = ev.key;
+    if (key !== 'ArrowUp' && key !== 'ArrowDown' && key !== 'ArrowLeft' && key !== 'ArrowRight') return;
+    var ae = document.activeElement;
+    if (!ae || ae === document.body) return;
+    if (/^(INPUT|SELECT|TEXTAREA)$/.test(ae.tagName)) return;
+    var dir = key.slice(5).toLowerCase(); // up / down / left / right
+    var isTab = ae.getAttribute && ae.getAttribute('role') === 'tab';
+    var isCard = ae.classList && ae.classList.contains('game-card');
+    var inActions = false;
+    if (ae.closest) {
+      var a = ae.closest('.actions');
+      inActions = !!a && $('libraryScreen').contains(a);
+    }
+    if (isCard) {
+      if (dir === 'left' || dir === 'right') {
+        var next = nearestCard(ae, dir);
+        if (next) { ev.preventDefault(); next.focus(); }
+      } else if (dir === 'up') {
+        var up = nearestCard(ae, 'up');
+        ev.preventDefault();
+        if (up) up.focus(); else focusSelectedTab();
+      } else if (dir === 'down') {
+        var down = nearestCard(ae, 'down');
+        if (down) { ev.preventDefault(); down.focus(); }
+      }
+      return;
+    }
+    if (isTab) {
+      if (dir === 'down') { ev.preventDefault(); focusFirstCard(); }
+      else if (dir === 'up' && IS_TV) { ev.preventDefault(); focusFirstAction(); }
+      return;
+    }
+    if (inActions) {
+      if (dir === 'left' || dir === 'right') {
+        var btns = Array.prototype.slice.call(document.querySelectorAll('#libraryScreen .actions button'));
+        var idx = btns.indexOf(ae);
+        var n = dir === 'right' ? idx + 1 : idx - 1;
+        if (btns[n]) { ev.preventDefault(); btns[n].focus(); }
+      } else if (dir === 'down' && IS_TV) { ev.preventDefault(); focusSelectedTab(); }
+      else if (dir === 'up' && !IS_TV) { ev.preventDefault(); focusLastCard(); }
+      return;
+    }
   }
 
   // ---------- Screens ----------
@@ -356,6 +566,7 @@
         return;
       }
       showScreen('player');
+      setPlayingBridge(true);
       $('nowPlaying').textContent = 'Now playing: ' + game.title + ' (' + systemLabel(game.system) + ')';
       announce('Now playing ' + game.title + ', ' + systemLabel(game.system));
       window.EJS_player = '#game';
@@ -761,6 +972,10 @@
   // ---------- Wire up ----------
 
   function init() {
+    if (IS_TV) document.body.classList.add('tv');
+    window.addEventListener('keydown', rotateDpad, true);
+    window.addEventListener('keyup', rotateDpad, true);
+    window.addEventListener('keydown', libraryGridNav);
     buildTabs();
     renderList();
     initSupabase();
