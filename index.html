@@ -73,6 +73,7 @@
   <p id="syncStatus" role="status">Checking cloud sync…</p>
   <p id="keyTest" class="note tv-only" role="status"></p>
   <div id="live" aria-live="polite" class="sr-only"></div>
+  <div id="liveAssertive" aria-live="assertive" class="sr-only"></div>
 
   <!-- Library -->
   <main id="libraryScreen" aria-label="Game library">
@@ -93,6 +94,10 @@
   <section id="addScreen" hidden aria-label="Add a game">
     <h2>Add a game</h2>
     <p id="addStatus" role="status"></p>
+    <div id="addProgressWrap" hidden>
+      <progress id="addProgress" max="100" value="0" aria-hidden="true"></progress>
+      <p id="addProgressText"></p>
+    </div>
     <label for="addTitle">Game title</label>
     <input type="text" id="addTitle" placeholder="e.g. My Game">
     <label for="addSystem">System</label>
@@ -233,6 +238,46 @@
 
   function $(id) { return document.getElementById(id); }
   function announce(text) { $('live').textContent = text; }
+  // Failures must reach the user even if TalkBack missed the polite
+  // live region: assertive interrupts and is read right away.
+  function announceUrgent(text) { $('liveAssertive').textContent = text; }
+
+  // Translate a raw upload/save error into plain words, never just
+  // "unknown error". Returns the reason to speak and show.
+  function plainErrorReason(err) {
+    var msg = (err && err.message) ? err.message : '';
+    var m = msg.toLowerCase();
+    if (!msg) return 'Something went wrong, but the app did not say what. Check your connection and try again.';
+    if (m.indexOf('failed to fetch') !== -1 || m.indexOf('network') !== -1) return 'The connection dropped. Check your Wi-Fi and try again.';
+    if (m.indexOf('timeout') !== -1 || m.indexOf('timed out') !== -1 || m.indexOf('stuck') !== -1) return 'The upload timed out. Your connection may be slow, try again.';
+    if (m.indexOf('too large') !== -1 || m.indexOf('payload') !== -1 || m.indexOf('413') !== -1) return 'The file is too big for the cloud. Try a smaller file or a zip.';
+    if (m.indexOf('row-level security') !== -1 || m.indexOf('permission') !== -1 || m.indexOf('unauthorized') !== -1 || m.indexOf('401') !== -1 || m.indexOf('403') !== -1) return 'The cloud would not let you upload. Try signing out and back in.';
+    if (m.indexOf('already exists') !== -1 || m.indexOf('duplicate') !== -1) return 'That file is already in the cloud. It may have uploaded already, check your library.';
+    return msg;
+  }
+
+  // One place for every add-game failure: visible text, spoken aloud
+  // through the assertive live region, with a plain-language reason.
+  function failAdd(status, title, err) {
+    var reason = plainErrorReason(err);
+    var text = 'Could not add ' + title + '. ' + reason;
+    setStatus(status, text, 'error');
+    announce(text);
+    announceUrgent(text);
+    showAddProgress(false);
+  }
+
+  function showAddProgress(show) {
+    var wrap = $('addProgressWrap');
+    if (wrap) wrap.hidden = !show;
+  }
+
+  function setAddProgress(percent, title) {
+    var bar = $('addProgress');
+    var label = $('addProgressText');
+    if (bar) bar.value = percent;
+    if (label) label.textContent = 'Uploading ' + title + ', ' + percent + ' percent.';
+  }
   // Called by the Android app to speak a short message (run latch on/off).
   window.__announce = function (text) { announce(text); };
 
@@ -959,6 +1004,65 @@
 
   // ---------- Add a game ----------
 
+  // Upload a file to the roms bucket with real progress. The Supabase
+  // storage upload call has no progress callback, so this posts the
+  // file directly to the Storage API, which reports upload progress.
+  // onProgress gets 0-100. Fails loudly if nothing moves for 60 s.
+  function uploadWithProgress(path, file, title, onProgress) {
+    return supabaseClient.auth.getSession().then(function (sess) {
+      var token = (sess && sess.data && sess.data.session) ? sess.data.session.access_token : window.SUPABASE_ANON_KEY;
+      return new Promise(function (resolve, reject) {
+        var url = window.SUPABASE_URL + '/storage/v1/object/roms/' +
+          path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+        var xhr = new XMLHttpRequest();
+        var lastMove = Date.now();
+        var lastMilestone = 0;
+        var stallTimer = setInterval(function () {
+          if (Date.now() - lastMove > 60000) {
+            clearInterval(stallTimer);
+            try { xhr.abort(); } catch (e) {}
+            reject(new Error('Upload seems stuck: nothing went up for a minute. Check your connection and try again.'));
+          }
+        }, 5000);
+        xhr.open('POST', url);
+        xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+        xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.setRequestHeader('x-upsert', 'false');
+        xhr.upload.onprogress = function (e) {
+          lastMove = Date.now();
+          if (!e.lengthComputable) return;
+          var percent = Math.min(100, Math.round(e.loaded * 100 / e.total));
+          onProgress(percent);
+          var milestone = Math.floor(percent / 25) * 25;
+          if (milestone > lastMilestone && milestone < 100) {
+            lastMilestone = milestone;
+            announce('Uploading ' + title + ', ' + milestone + ' percent.');
+          }
+        };
+        xhr.onload = function () {
+          clearInterval(stallTimer);
+          if (xhr.status >= 200 && xhr.status < 300) { onProgress(100); resolve(); }
+          else {
+            var detail = '';
+            try { var body = JSON.parse(xhr.responseText || '{}'); detail = body.message || body.error || ''; } catch (e) {}
+            reject(new Error(detail || ('Cloud upload failed, status ' + xhr.status + '.')));
+          }
+        };
+        xhr.onerror = function () {
+          clearInterval(stallTimer);
+          reject(new Error('Network error while uploading. Check your connection and try again.'));
+        };
+        xhr.ontimeout = function () {
+          clearInterval(stallTimer);
+          reject(new Error('Upload timed out. Check your connection and try again.'));
+        };
+        xhr.timeout = 600000;
+        xhr.send(file);
+      });
+    });
+  }
+
   function addGame() {
     var title = $('addTitle').value.trim();
     var system = $('addSystem').value;
@@ -976,22 +1080,33 @@
 
     if (file && supabaseClient && currentUser) {
       // Signed in: upload the file to the cloud, then save the row.
+      // The Supabase upload call reports no progress, so this uses a
+      // direct request instead, which does: the progress bar fills as
+      // the file goes up, and a stall fails loudly instead of sitting
+      // silent on "Adding...".
       var path = currentUser.id + '/' + Date.now() + '-' + file.name;
-      supabaseClient.storage.from('roms').upload(path, file).then(function (up) {
-        if (up.error) { setStatus(status, 'Upload did not work: ' + up.error.message, 'error'); announce('Upload did not work: ' + up.error.message); return; }
+      showAddProgress(true);
+      setAddProgress(0, title);
+      setStatus(status, 'Uploading ' + title + ', 0 percent.', '');
+      announce('Uploading ' + title + ', 0 percent.');
+      uploadWithProgress(path, file, title, function (percent) {
+        setAddProgress(percent, title);
+      }).then(function () {
+        showAddProgress(false);
         return supabaseClient.from('game_library').insert({
           user_id: currentUser.id, title: title, system: system,
           core: core, rom_url: path, source: 'upload'
         });
       }).then(function (ins) {
         if (!ins) return;
-        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); announce('Could not save: ' + ins.error.message); return; }
+        if (ins.error) { failAdd(status, title, ins.error); return; }
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
+        announceUrgent('Added ' + title + ' to your cloud library.');
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
-        setStatus(status, 'Could not add: ' + (err && err.message ? err.message : 'unknown error'), 'error');
-        announce('Could not add: ' + (err && err.message ? err.message : 'unknown error'));
+        showAddProgress(false);
+        failAdd(status, title, err);
       });
       return;
     }
@@ -1011,8 +1126,7 @@
         announce('Added ' + title + ' on this device only.');
         showScreen('library'); selectTab(system);
       }).catch(function (err) {
-        setStatus(status, 'Could not save the file: ' + (err && err.message ? err.message : 'unknown error'), 'error');
-        announce('Could not save the file: ' + (err && err.message ? err.message : 'unknown error'));
+        failAdd(status, title, err);
       });
       return;
     }
@@ -1023,10 +1137,13 @@
         user_id: currentUser.id, title: title, system: system,
         core: core, rom_url: url, source: 'url'
       }).then(function (ins) {
-        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); announce('Could not save: ' + ins.error.message); return; }
+        if (ins.error) { failAdd(status, title, ins.error); return; }
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
+        announceUrgent('Added ' + title + ' to your cloud library.');
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
+      }).catch(function (err) {
+        failAdd(status, title, err);
       });
     } else {
       localGames.unshift({
