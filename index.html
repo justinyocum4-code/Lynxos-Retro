@@ -683,6 +683,7 @@
     var status = $('addStatus');
     if (!url && !file) {
       setStatus(status, 'Add a game file or paste a game link first.', 'error');
+      announce('Add a game file or paste a game link first.');
       return;
     }
     if (!title) title = file ? file.name.replace(/\.[^.]+$/, '') : 'Untitled game';
@@ -693,19 +694,20 @@
       // Signed in: upload the file to the cloud, then save the row.
       var path = currentUser.id + '/' + Date.now() + '-' + file.name;
       supabaseClient.storage.from('roms').upload(path, file).then(function (up) {
-        if (up.error) { setStatus(status, 'Upload did not work: ' + up.error.message, 'error'); return; }
+        if (up.error) { setStatus(status, 'Upload did not work: ' + up.error.message, 'error'); announce('Upload did not work: ' + up.error.message); return; }
         return supabaseClient.from('game_library').insert({
           user_id: currentUser.id, title: title, system: system,
           core: core, rom_url: path, source: 'upload'
         });
       }).then(function (ins) {
         if (!ins) return;
-        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); return; }
+        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); announce('Could not save: ' + ins.error.message); return; }
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
-        syncLibrary().then(function () { showScreen('library'); });
+        syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
         setStatus(status, 'Could not add: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+        announce('Could not add: ' + (err && err.message ? err.message : 'unknown error'));
       });
       return;
     }
@@ -723,9 +725,10 @@
         renderList();
         setStatus(status, 'Added ' + title + ' on this device only. Sign in to sync it to your TV.', 'ok');
         announce('Added ' + title + ' on this device only.');
-        showScreen('library');
+        showScreen('library'); selectTab(system);
       }).catch(function (err) {
         setStatus(status, 'Could not save the file: ' + (err && err.message ? err.message : 'unknown error'), 'error');
+        announce('Could not save the file: ' + (err && err.message ? err.message : 'unknown error'));
       });
       return;
     }
@@ -736,10 +739,10 @@
         user_id: currentUser.id, title: title, system: system,
         core: core, rom_url: url, source: 'url'
       }).then(function (ins) {
-        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); return; }
+        if (ins.error) { setStatus(status, 'Could not save: ' + ins.error.message, 'error'); announce('Could not save: ' + ins.error.message); return; }
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
-        syncLibrary().then(function () { showScreen('library'); });
+        syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       });
     } else {
       localGames.unshift({
@@ -751,7 +754,7 @@
       renderList();
       setStatus(status, 'Added ' + title + ' on this device only. Sign in to sync it to your TV.', 'ok');
       announce('Added ' + title + ' on this device only.');
-      showScreen('library');
+      showScreen('library'); selectTab(system);
     }
   }
 
