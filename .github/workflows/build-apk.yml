@@ -247,6 +247,10 @@ jobs:
               private boolean gamePlaying = false;
               private boolean isTV = false;
               private long backDownTime = 0;
+              private boolean backHeld = false;
+              private boolean backChordUsed = false;
+              private boolean runLatched = false;
+              private long lastChDnUpTime = 0;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
               private static MainActivity instance;
 
@@ -303,6 +307,7 @@ jobs:
                       public void onPageFinished(WebView view, String url) {
                           pageReady = true;
                           gamePlaying = false; /* fresh page = library */
+                          if (runLatched) MainActivity.this.releaseLatchedB();
                           if (isTV) {
                               /* Belt and braces: make sure the TV
                                  layout is on even if the page's own
@@ -402,12 +407,18 @@ jobs:
                  rotated 90 degrees (remote up = game left, remote
                  right = game up, remote down = game right, remote
                  left = game down); the channel rocker is A/B, OK tap
-                 is X and OK hold is Start, Back tap is Y and Back
-                 hold leaves the game, and mute is Select. The volume
-                 rocker stays mapped to A/B but the TV's audio system
-                 swallows those keys before any app sees them, so
-                 they never arrive. Outside a game every button works
-                 normally. While a game is playing the
+                 is Start, Back tap is X (the roll), and mute is
+                 Select. Hold Back + another button for the extra
+                 Super Nintendo buttons (Back+OK = Y, Back+channel-up
+                 = L, Back+channel-down = R); a chord marks the Back
+                 hold as used, so letting go of Back after a chord
+                 does NOT exit — the exit only happens when Back is
+                 held all by itself for half a second. Double-tap
+                 channel-down to latch B (run) on and off for Mario.
+                 The volume rocker stays mapped to A/B but the TV's
+                 audio system swallows those keys before any app sees
+                 them, so they never arrive. Outside a game every
+                 button works normally. While a game is playing the
                  RemoteKeyService (accessibility service) reports
                  every other button's code to the page and swallows
                  the app buttons, so this activity only reports
@@ -421,14 +432,29 @@ jobs:
                   int action = event.getAction();
                   if (code == KeyEvent.KEYCODE_BACK) {
                       if (action == KeyEvent.ACTION_DOWN) {
-                          if (event.getRepeatCount() == 0) backDownTime = event.getEventTime();
+                          if (event.getRepeatCount() == 0) {
+                              backDownTime = event.getEventTime();
+                              backHeld = true;
+                              backChordUsed = false;
+                          }
                           return true;
                       }
                       if (action == KeyEvent.ACTION_UP) {
+                          backHeld = false;
                           long held = event.getEventTime() - backDownTime;
                           if (gamePlaying) {
-                              if (held >= 500) exitPlayer();
-                              else if (isTV) injectKeyDownUp(KeyEvent.KEYCODE_S);
+                              /* A chord was used while Back was held:
+                                 the extra button already fired, so
+                                 letting go of Back does nothing — no
+                                 exit, no roll. The exit only happens
+                                 when Back is held all by itself. */
+                              if (backChordUsed) {
+                                  backChordUsed = false;
+                              } else if (held >= 500) {
+                                  exitPlayer();
+                              } else if (isTV) {
+                                  injectKeyDownUp(KeyEvent.KEYCODE_S);
+                              }
                           } else {
                               onBackPressed();
                           }
@@ -443,6 +469,52 @@ jobs:
                      Start cannot start a game — on Nintendo a tap
                      did nothing at all. The roll moved to Back tap. */
                   if (gamePlaying && isTV) {
+                      /* Hold Back + another button = the extra Super
+                         Nintendo buttons (chords). Back+OK is Y,
+                         Back+channel-up is L, Back+channel-down is
+                         R. The chord fires the moment the second
+                         button is pressed, and it marks the Back
+                         hold as used, so letting go of Back after a
+                         chord does NOT exit the game — the exit only
+                         happens when Back is held all by itself. */
+                      if (backHeld && action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                          int chordKey = chordButtonCode(code);
+                          if (chordKey != 0) {
+                              backChordUsed = true;
+                              injectKeyDownUp(chordKey);
+                              return true;
+                          }
+                      }
+                      /* Channel-down (B) double-tap = latch run on
+                         and off (for Mario: press twice quickly to
+                         hold run without holding the button, press
+                         again to let go). A single tap is a normal
+                         B press. */
+                      if (code == KeyEvent.KEYCODE_CHANNEL_DOWN) {
+                          if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                              if (runLatched) {
+                                  releaseLatchedB();
+                                  announceJs("Run off");
+                                  return true;
+                              }
+                              long now = event.getEventTime();
+                              if (now - lastChDnUpTime < 400) {
+                                  runLatched = true;
+                                  injectKeyDownOnly(KeyEvent.KEYCODE_Z);
+                                  announceJs("Run on");
+                                  return true;
+                              }
+                              injectKey(event, KeyEvent.KEYCODE_Z);
+                              return true;
+                          }
+                          if (action == KeyEvent.ACTION_UP) {
+                              lastChDnUpTime = event.getEventTime();
+                              if (runLatched) return true;
+                              injectKey(event, KeyEvent.KEYCODE_Z);
+                              return true;
+                          }
+                          return true;
+                      }
                       /* D-pad, remote held sideways (top to the
                          left), Justin's mapping: right arrow is up,
                          down arrow is forward (right), left arrow is
@@ -528,6 +600,47 @@ jobs:
                   return 0;
               }
 
+              /* Extra Super Nintendo buttons, reached by holding
+                 Back and pressing another button. Y = A key, L = Q,
+                 R = W (EmulatorJS defaults). Returns 0 otherwise. */
+              private int chordButtonCode(int code) {
+                  if (code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER) return KeyEvent.KEYCODE_A;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_UP) return KeyEvent.KEYCODE_Q;
+                  if (code == KeyEvent.KEYCODE_CHANNEL_DOWN) return KeyEvent.KEYCODE_W;
+                  return 0;
+              }
+
+              /* Send only a key-down (no key-up yet): used to latch
+                 B on for the run latch. */
+              private void injectKeyDownOnly(int code) {
+                  long now = SystemClock.uptimeMillis();
+                  final KeyEvent down = new KeyEvent(now, now, KeyEvent.ACTION_DOWN,
+                      code, 0, 0, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
+                  webView.dispatchKeyEvent(down);
+              }
+
+              /* Release a latched B (send the key-up that was held back). */
+              private void releaseLatchedB() {
+                  if (!runLatched) return;
+                  runLatched = false;
+                  long now = SystemClock.uptimeMillis();
+                  final KeyEvent up = new KeyEvent(now, now, KeyEvent.ACTION_UP,
+                      KeyEvent.KEYCODE_Z, 0, 0, -1, 0, 0, InputDevice.SOURCE_KEYBOARD);
+                  webView.dispatchKeyEvent(up);
+              }
+
+              /* Speak a short message in the page (TalkBack reads the
+                 live region). */
+              private void announceJs(final String text) {
+                  final String safe = text.replace("\\", "\\\\").replace("'", "\\'");
+                  webView.post(new Runnable() {
+                      @Override public void run() {
+                          webView.evaluateJavascript(
+                              "(function(){ try { if (window.__announce) window.__announce('" + safe + "'); } catch(e){} })()", null);
+                      }
+                  });
+              }
+
               /* Inject a real key press into the WebView, built from
                  the remote's own event so down-time, repeats and
                  action (down/up) are preserved. */
@@ -557,6 +670,7 @@ jobs:
               }
 
               private void exitPlayer() {
+                  if (runLatched) releaseLatchedB();
                   gamePlaying = false;
                   webView.post(new Runnable() {
                       @Override public void run() {
