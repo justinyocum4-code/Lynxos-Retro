@@ -180,9 +180,13 @@ jobs:
           package com.lynxosretro.app;
 
           import android.app.Activity;
+          import android.app.UiModeManager;
           import android.content.Intent;
+          import android.content.res.Configuration;
           import android.net.Uri;
           import android.os.Bundle;
+          import android.view.KeyEvent;
+          import android.webkit.JavascriptInterface;
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
           import android.webkit.WebSettings;
@@ -196,6 +200,19 @@ jobs:
               private boolean backArmed = false;
               private String pendingAuthUrl = null;
               private boolean pageReady = false;
+              private boolean gamePlaying = false;
+              private boolean isTV = false;
+              private long backDownTime = 0;
+
+              /* Bridge the page calls: the page tells us when a game is
+                 playing (so the rocker keys become game buttons) and asks
+                 whether this is a TV (so it can use the big layout). */
+              private class LynxosBridge {
+                  @JavascriptInterface
+                  public void setPlaying(boolean p) { gamePlaying = p; }
+                  @JavascriptInterface
+                  public boolean isTV() { return isTV; }
+              }
 
               @Override
               protected void onCreate(Bundle savedInstanceState) {
@@ -217,6 +234,7 @@ jobs:
                       @Override
                       public void onPageFinished(WebView view, String url) {
                           pageReady = true;
+                          gamePlaying = false; /* fresh page = library */
                           if (pendingAuthUrl != null) {
                               final String u = pendingAuthUrl; pendingAuthUrl = null;
                               forwardAuth(u);
@@ -243,6 +261,12 @@ jobs:
                           return true;
                       }
                   });
+                  /* TV detection + JS bridge, before the page loads. */
+                  try {
+                      UiModeManager um = (UiModeManager) getSystemService(UI_MODE_SERVICE);
+                      isTV = um != null && um.getCurrentModeType() == Configuration.UI_MODE_TYPE_TELEVISION;
+                  } catch (Exception ignored) {}
+                  webView.addJavascriptInterface(new LynxosBridge(), "LynxosRetro");
                   setContentView(webView);
                   webView.loadUrl("file:///android_asset/www/index.html");
               }
@@ -291,6 +315,84 @@ jobs:
               protected void onSaveInstanceState(Bundle outState) {
                   super.onSaveInstanceState(outState);
                   try { outState.clear(); } catch (Exception ignored) {}
+              }
+
+              /* Remote as a game controller (TV): while a game is playing
+                 the volume rocker is A/B, the channel rocker is X/Y and
+                 mute is Select. Outside a game those buttons work
+                 normally. Back is held to leave a game; a short press
+                 inside a game does nothing. Any other remote button is
+                 reported to the page (button test) but not consumed. */
+              @Override
+              public boolean dispatchKeyEvent(KeyEvent event) {
+                  int code = event.getKeyCode();
+                  int action = event.getAction();
+                  if (code == KeyEvent.KEYCODE_BACK) {
+                      if (action == KeyEvent.ACTION_DOWN) {
+                          if (event.getRepeatCount() == 0) backDownTime = event.getEventTime();
+                          return true;
+                      }
+                      if (action == KeyEvent.ACTION_UP) {
+                          long held = event.getEventTime() - backDownTime;
+                          if (gamePlaying) {
+                              if (held >= 800) exitPlayer();
+                          } else {
+                              onBackPressed();
+                          }
+                          return true;
+                      }
+                      return true;
+                  }
+                  if (gamePlaying && event.getRepeatCount() == 0
+                          && (code == KeyEvent.KEYCODE_VOLUME_UP
+                              || code == KeyEvent.KEYCODE_VOLUME_DOWN
+                              || code == KeyEvent.KEYCODE_CHANNEL_UP
+                              || code == KeyEvent.KEYCODE_CHANNEL_DOWN
+                              || code == KeyEvent.KEYCODE_MUTE)) {
+                      forwardGameKey(code, action == KeyEvent.ACTION_DOWN);
+                      return true;
+                  }
+                  if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                          && code != KeyEvent.KEYCODE_DPAD_UP
+                          && code != KeyEvent.KEYCODE_DPAD_DOWN
+                          && code != KeyEvent.KEYCODE_DPAD_LEFT
+                          && code != KeyEvent.KEYCODE_DPAD_RIGHT
+                          && code != KeyEvent.KEYCODE_DPAD_CENTER
+                          && code != KeyEvent.KEYCODE_ENTER
+                          && code != KeyEvent.KEYCODE_VOLUME_UP
+                          && code != KeyEvent.KEYCODE_VOLUME_DOWN
+                          && code != KeyEvent.KEYCODE_CHANNEL_UP
+                          && code != KeyEvent.KEYCODE_CHANNEL_DOWN
+                          && code != KeyEvent.KEYCODE_MUTE
+                          && code != KeyEvent.KEYCODE_BACK) {
+                      final int c = code;
+                      webView.post(new Runnable() {
+                          @Override public void run() {
+                              webView.evaluateJavascript(
+                                  "(function(){ try { if (window.__remoteKeyTest) window.__remoteKeyTest(" + c + "); } catch(e){} })()", null);
+                          }
+                      });
+                  }
+                  return super.dispatchKeyEvent(event);
+              }
+
+              private void exitPlayer() {
+                  gamePlaying = false;
+                  webView.post(new Runnable() {
+                      @Override public void run() {
+                          webView.evaluateJavascript(
+                              "(function(){ try { if (window.__exitPlayer) window.__exitPlayer(); } catch(e){} })()", null);
+                      }
+                  });
+              }
+
+              private void forwardGameKey(final int code, final boolean down) {
+                  webView.post(new Runnable() {
+                      @Override public void run() {
+                          webView.evaluateJavascript(
+                              "(function(){ try { if (window.__remoteGameKey) window.__remoteGameKey(" + code + "," + down + "); } catch(e){} })()", null);
+                      }
+                  });
               }
 
               @Override
