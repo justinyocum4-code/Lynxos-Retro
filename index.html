@@ -247,46 +247,12 @@
     } catch (e) {}
   }
 
-  // EmulatorJS keyboard map (its default controls): the game reads
-  // plain keyboard key codes, so the remote's buttons are translated
-  // into those codes. A = X key (88), B = Z (90), X = S (83),
-  // Y = A key (65), Select = Shift (16), Start = Enter (13).
-  var GAME_KEY_INFO = {
-    88: { key: 'x', code: 'KeyX' },
-    90: { key: 'z', code: 'KeyZ' },
-    83: { key: 's', code: 'KeyS' },
-    65: { key: 'a', code: 'KeyA' },
-    16: { key: 'Shift', code: 'ShiftLeft' },
-    13: { key: 'Enter', code: 'Enter' },
-    37: { key: 'ArrowLeft', code: 'ArrowLeft' },
-    38: { key: 'ArrowUp', code: 'ArrowUp' },
-    39: { key: 'ArrowRight', code: 'ArrowRight' },
-    40: { key: 'ArrowDown', code: 'ArrowDown' }
-  };
-
-  function sendGameKey(keyCode, isDown) {
-    var info = GAME_KEY_INFO[keyCode];
-    if (!info) return;
-    var ev = new KeyboardEvent(isDown ? 'keydown' : 'keyup', {
-      key: info.key, code: info.code, keyCode: keyCode,
-      bubbles: true, cancelable: true
-    });
-    // Belt and braces: some WebViews need keyCode set directly.
-    try { Object.defineProperty(ev, 'keyCode', { value: keyCode }); } catch (e) {}
-    try { Object.defineProperty(ev, 'which', { value: keyCode }); } catch (e) {}
-    window.dispatchEvent(ev);
-  }
-
-  // Called by the Android app for the rocker / mute buttons while a
-  // game is playing. Android key codes: volume up 24 = A, volume
-  // down 25 = B, channel up 166 = X, channel down 167 = Y,
-  // mute 164 = Select. Outside a game these buttons work normally.
-  var REMOTE_GAME_KEYS = { 24: 88, 25: 90, 166: 83, 167: 65, 164: 16 };
-  window.__remoteGameKey = function (androidCode, isDown) {
-    var keyCode = REMOTE_GAME_KEYS[androidCode];
-    if (!keyCode) return;
-    sendGameKey(keyCode, !!isDown);
-  };
+  // Remote-to-game translation lives in the Android app now
+  // (MainActivity injects real key presses into the WebView). The
+  // page used to translate keys itself with synthetic events sent to
+  // the window, but the emulator listens for keys on the game
+  // container, not the window, so those presses never reached the
+  // game — that is why v1.1.0's sideways D-pad did nothing.
 
   // Called by the Android app for any other remote button (star,
   // settings, apps, ...). Shows the button's code on screen so the
@@ -302,24 +268,6 @@
     setPlayingBridge(false);
     location.reload();
   };
-
-  // Sideways remote: with the remote turned sideways (top to the
-  // left) the D-pad is rotated 90 degrees. Real up = game left,
-  // real right = game up, real down = game right, real left = game
-  // down. Only inside a game on TV; the menus use the D-pad
-  // straight. The emulator has no "trusted event" check, so the
-  // translated keys reach the game.
-  var ROTATE_DPAD = { 38: 37, 39: 38, 40: 39, 37: 40 };
-  function rotateDpad(ev) {
-    if (!IS_TV) return;
-    if ($('playerScreen').hidden) return;
-    if (!ev.isTrusted) return;
-    var rotated = ROTATE_DPAD[ev.keyCode];
-    if (!rotated) return;
-    ev.preventDefault();
-    ev.stopImmediatePropagation();
-    sendGameKey(rotated, ev.type === 'keydown');
-  }
 
   // ---------- D-pad grid navigation (library) ----------
 
@@ -973,8 +921,6 @@
 
   function init() {
     if (IS_TV) document.body.classList.add('tv');
-    window.addEventListener('keydown', rotateDpad, true);
-    window.addEventListener('keyup', rotateDpad, true);
     window.addEventListener('keydown', libraryGridNav);
     buildTabs();
     renderList();
