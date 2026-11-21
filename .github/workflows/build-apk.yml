@@ -172,8 +172,48 @@ jobs:
                           <data android:scheme="com.lynxosretro.app" android:host="auth-callback" />
                       </intent-filter>
                   </activity>
+                  <!-- Remote key service: sees the remote's app
+                       buttons (YouTube, Netflix, ...) before the
+                       system launches their apps. Only active while
+                       a game is playing on TV; otherwise it passes
+                       every key through untouched. -->
+                  <service
+                      android:name="com.lynxosretro.app.RemoteKeyService"
+                      android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.accessibilityservice.AccessibilityService" />
+                      </intent-filter>
+                      <meta-data
+                          android:name="android.accessibilityservice"
+                          android:resource="@xml/remote_key_service" />
+                  </service>
               </application>
           </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/remote_key_service.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- Lynxos Retro remote key service: only watches remote
+               button presses (flagRequestFilterKeyEvents). It cannot
+               read the screen (canRetrieveWindowContent=false) and
+               ignores accessibility events entirely. -->
+          <accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+              android:description="@string/accessibility_service_description"
+              android:accessibilityEventTypes="typeAllMask"
+              android:accessibilityFeedbackType="feedbackGeneric"
+              android:accessibilityFlags="flagRequestFilterKeyEvents"
+              android:notificationTimeout="100"
+              android:canRetrieveWindowContent="false"
+              android:canRequestFilterKeyEvents="true" />
+          EOF
+
+          mkdir -p app/src/main/res/values
+          cat > app/src/main/res/values/strings.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="accessibility_service_description">Lets Lynxos Retro use the remote\'s bottom app buttons (YouTube, Netflix and the rest) as game buttons while a game is playing. It only watches remote button presses; it does not read the screen or collect anything.</string>
+          </resources>
           EOF
 
           cat > app/src/main/java/com/lynxosretro/app/MainActivity.java <<'EOF'
@@ -204,6 +244,7 @@ jobs:
               private boolean gamePlaying = false;
               private boolean isTV = false;
               private long backDownTime = 0;
+              private static MainActivity instance;
 
               /* Bridge the page calls: the page tells us when a game is
                  playing (so the rocker keys become game buttons) and asks
@@ -215,6 +256,27 @@ jobs:
                   public boolean isTV() { return isTV; }
               }
 
+              /* Shared with RemoteKeyService (the accessibility
+                 service that sees the bottom app buttons): it only
+                 acts while a game is playing on TV, and reports
+                 each key's code to the page for the button test. */
+              public static boolean isGamePlaying() {
+                  return instance != null && instance.gamePlaying;
+              }
+              public static boolean isTvMode() {
+                  return instance != null && instance.isTV;
+              }
+              public static void reportKeyFromService(final int code) {
+                  final MainActivity a = instance;
+                  if (a == null || a.webView == null) return;
+                  a.webView.post(new Runnable() {
+                      @Override public void run() {
+                          a.webView.evaluateJavascript(
+                              "(function(){ try { if (window.__remoteKeyTest) window.__remoteKeyTest(" + code + "); } catch(e){} })()", null);
+                      }
+                  });
+              }
+
               @Override
               protected void onCreate(Bundle savedInstanceState) {
                   super.onCreate(savedInstanceState);
@@ -223,6 +285,7 @@ jobs:
                       pendingAuthUrl = data.toString();
                   }
                   webView = new WebView(this);
+                  instance = this;
                   webView.setBackgroundColor(0xFF000000);
                   WebSettings s = webView.getSettings();
                   s.setJavaScriptEnabled(true);
@@ -338,8 +401,10 @@ jobs:
                  channel rocker is X/Y and mute is Select. Outside a
                  game every button works normally. Back is held to
                  leave a game; a short press inside a game does
-                 nothing. Any other remote button is reported to the
-                 page (button test) but not consumed. */
+                 nothing. While a game is playing the RemoteKeyService
+                 (accessibility service) reports every other button's
+                 code to the page and swallows the app buttons, so
+                 this activity only reports buttons outside a game. */
               @Override
               public boolean dispatchKeyEvent(KeyEvent event) {
                   int code = event.getKeyCode();
@@ -373,6 +438,7 @@ jobs:
                       }
                   }
                   if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0
+                          && !(gamePlaying && isTV)
                           && code != KeyEvent.KEYCODE_DPAD_UP
                           && code != KeyEvent.KEYCODE_DPAD_DOWN
                           && code != KeyEvent.KEYCODE_DPAD_LEFT
@@ -466,8 +532,84 @@ jobs:
 
               @Override
               protected void onDestroy() {
+                  if (instance == this) instance = null;
                   try { if (webView != null) webView.destroy(); } catch (Exception ignored) {}
                   super.onDestroy();
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/lynxosretro/app/RemoteKeyService.java <<'EOF'
+          package com.lynxosretro.app;
+
+          import android.accessibilityservice.AccessibilityService;
+          import android.view.KeyEvent;
+          import android.view.accessibility.AccessibilityEvent;
+
+          /* Sees remote buttons before the system acts on them
+             (AccessibilityService with flagRequestFilterKeyEvents).
+             The bottom app buttons (YouTube, Netflix, ...) never
+             reach a normal app — the system launches their apps
+             instead — but this service sees every key first.
+             v1.1.2 is the learning build: while a game is playing
+             on TV it REPORTS each unknown key's code to the page
+             (spoken + on screen, via __remoteKeyTest) and swallows
+             keys the game activity does not handle, so pressing an
+             app button cannot jump out of the game. The D-pad,
+             Back, Enter and channel-up pass through silently —
+             the activity already handles those. Volume, mute and
+             channel-down are reported but passed through, so the
+             report also tells us whether they reach an app at all.
+             Outside a game every key passes through untouched, so
+             the buttons keep their normal jobs. */
+          public class RemoteKeyService extends AccessibilityService {
+              @Override
+              public void onAccessibilityEvent(AccessibilityEvent event) {
+                  /* Key-only service: nothing to do with screen events. */
+              }
+
+              @Override
+              public void onInterrupt() {
+              }
+
+              @Override
+              public boolean onKeyEvent(KeyEvent event) {
+                  if (!MainActivity.isGamePlaying() || !MainActivity.isTvMode()) {
+                      return false;
+                  }
+                  int code = event.getKeyCode();
+                  int action = event.getAction();
+                  /* Keys the activity already handles and we know
+                     work: the D-pad, Back, Enter and channel-up.
+                     Let them pass through silently. */
+                  if (code == KeyEvent.KEYCODE_DPAD_UP
+                          || code == KeyEvent.KEYCODE_DPAD_DOWN
+                          || code == KeyEvent.KEYCODE_DPAD_LEFT
+                          || code == KeyEvent.KEYCODE_DPAD_RIGHT
+                          || code == KeyEvent.KEYCODE_DPAD_CENTER
+                          || code == KeyEvent.KEYCODE_ENTER
+                          || code == KeyEvent.KEYCODE_BACK
+                          || code == KeyEvent.KEYCODE_CHANNEL_UP) {
+                      return false;
+                  }
+                  /* Everything else gets reported once per press:
+                     the app buttons we are learning, plus volume,
+                     mute and channel-down — reporting those tells
+                     us whether they reach an app at all. */
+                  if (action == KeyEvent.ACTION_DOWN && event.getRepeatCount() == 0) {
+                      MainActivity.reportKeyFromService(code);
+                  }
+                  /* Swallow the app buttons (and anything else
+                     unknown) so they cannot jump out of the game;
+                     let volume, mute and channel-down pass through
+                     to the activity, which maps them when it can. */
+                  if (code == KeyEvent.KEYCODE_VOLUME_UP
+                          || code == KeyEvent.KEYCODE_VOLUME_DOWN
+                          || code == KeyEvent.KEYCODE_MUTE
+                          || code == KeyEvent.KEYCODE_CHANNEL_DOWN) {
+                      return false;
+                  }
+                  return true;
               }
           }
           EOF
