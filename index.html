@@ -83,7 +83,7 @@
       <button type="button" id="syncBtn">Sync now</button>
       <button type="button" id="accountBtn">Account</button>
     </div>
-    <p class="note">Controls: hold the remote sideways, top to the left. The D-pad moves: right arrow is up, down arrow is forward, left arrow is down, up arrow is back. Channel up is A, channel down is B. Tap OK for Start and pause. Tap Back to roll. Hold Back and press OK for Y, channel up for L, channel down for R. Double tap channel down to hold run on or off. Hold Back alone for half a second to leave a game. Or pair a Bluetooth gamepad. Quick save is 1, quick load is 2.</p>
+    <p class="note">Controls: hold the remote sideways, top to the left. The D-pad moves: right arrow is up, down arrow is forward, left arrow is down, up arrow is back. Channel up is A, channel down is B. Tap OK for Start and pause. Tap Back to roll. Hold Back and press OK for Y, channel up for L, channel down for R. Double tap channel down to hold run on or off. PlayStation: channel up is Cross, channel down is Circle, tap Back is Triangle, hold Back and press OK for Square, channel up for L1, channel down for R1. Hold Back alone for half a second to leave a game. Or pair a Bluetooth gamepad. Quick save is 1, quick load is 2.</p>
     <p class="note">The games included here are free homebrew and public-domain games, released free by their authors. No commercial games are included.</p>
   </main>
 
@@ -147,7 +147,7 @@
       <button type="button" id="backBtn">Back to library</button>
     </div>
     <p id="nowPlaying" role="status"></p>
-    <p class="note">On TV hold the remote sideways, top to the left: right arrow is up, down arrow is forward, left arrow is down, up arrow is back. Channel up is A, channel down is B, tap OK for Start and pause, tap Back to roll, hold Back and press OK for Y, channel up for L, channel down for R, double tap channel down to hold run on or off, hold Back alone half a second to leave the game. Quick save is 1, quick load is 2.</p>
+    <p class="note">On TV hold the remote sideways, top to the left: right arrow is up, down arrow is forward, left arrow is down, up arrow is back. Channel up is A, channel down is B, tap OK for Start and pause, tap Back to roll, hold Back and press OK for Y, channel up for L, channel down for R, double tap channel down to hold run on or off, hold Back alone half a second to leave the game. PlayStation: channel up is Cross, channel down is Circle, tap Back is Triangle, hold Back and press OK for Square, channel up for L1, channel down for R1. Quick save is 1, quick load is 2.</p>
     <div id="game" role="region" aria-label="Game player"></div>
   </section>
 </div>
@@ -172,7 +172,8 @@
     { id: 'segaGG', label: 'Game Gear', core: 'segaGG' },
     { id: 'atari2600', label: 'Atari 2600', core: 'atari2600' },
     { id: 'n64', label: 'Nintendo 64', core: 'n64' },
-    { id: 'nds', label: 'Nintendo DS', core: 'nds' }
+    { id: 'nds', label: 'Nintendo DS', core: 'nds' },
+    { id: 'psx', label: 'PlayStation', core: 'psx' }
   ];
 
   function systemLabel(id) {
@@ -229,6 +230,9 @@
     }
     if (system === 'segaMD' || system === 'segaMS' || system === 'segaGG') {
       return base + 'Channel up is A, channel down is B, tap Back is C. Tap OK for Start. Hold Back alone for half a second to leave.';
+    }
+    if (system === 'psx') {
+      return base + 'Channel up is Cross, channel down is Circle. Tap OK for Start. Tap Back is Triangle. Hold Back and press OK for Square, channel up for L1, channel down for R1. Hold Back alone for half a second to leave.';
     }
     return base + 'Channel up is A, channel down is B. Tap OK for Start. Hold Back alone for half a second to leave. Double tap channel down to hold run on or off.';
   }
@@ -545,6 +549,50 @@
       window.EJS_language = 'en-US';
       window.EJS_disableAutoLang = true;
       window.EJS_startOnLoaded = true;
+      if (game.system === 'psx') {
+        // Pin the keyboard map for PlayStation so the remote's injected
+        // keys land on the right buttons (EmulatorJS defaults vary by
+        // version). Channel up = Cross, channel down = Circle, Back
+        // tap = Triangle, Back+OK = Square, Back+channel up = L1,
+        // Back+channel down = R1, OK = Start, mute = Select.
+        window.EJS_defaultControls = {
+          0: {
+            0: { value: 'x', value2: 'BUTTON_2' },
+            1: { value: 'a', value2: 'BUTTON_4' },
+            2: { value: 'shift', value2: 'SELECT' },
+            3: { value: 'enter', value2: 'START' },
+            4: { value: 'up arrow', value2: 'DPAD_UP' },
+            5: { value: 'down arrow', value2: 'DPAD_DOWN' },
+            6: { value: 'left arrow', value2: 'DPAD_LEFT' },
+            7: { value: 'right arrow', value2: 'DPAD_RIGHT' },
+            8: { value: 'z', value2: 'BUTTON_1' },
+            9: { value: 's', value2: 'BUTTON_3' },
+            10: { value: 'q', value2: 'LEFT_TOP_SHOULDER' },
+            11: { value: 'w', value2: 'RIGHT_TOP_SHOULDER' },
+            12: { value: 'tab', value2: 'LEFT_BOTTOM_SHOULDER' },
+            13: { value: 'r', value2: 'RIGHT_BOTTOM_SHOULDER' },
+            14: { value: '', value2: 'LEFT_STICK' },
+            15: { value: '', value2: 'RIGHT_STICK' },
+            16: { value: 'h', value2: 'LEFT_STICK_X:+1' },
+            17: { value: 'f', value2: 'LEFT_STICK_X:-1' },
+            18: { value: 'g', value2: 'LEFT_STICK_Y:+1' },
+            19: { value: 't', value2: 'LEFT_STICK_Y:-1' },
+            20: { value: 'l', value2: 'RIGHT_STICK_X:+1' },
+            21: { value: 'j', value2: 'RIGHT_STICK_X:-1' },
+            22: { value: 'k', value2: 'RIGHT_STICK_Y:+1' },
+            23: { value: 'i', value2: 'RIGHT_STICK_Y:-1' },
+            24: { value: '1' },
+            25: { value: '2' },
+            26: { value: '3' },
+            27: { value: 'add' },
+            28: { value: 'space' },
+            29: { value: 'subtract' }
+          },
+          1: {},
+          2: {},
+          3: {}
+        };
+      }
       var s = document.createElement('script');
       s.src = 'assets/emulatorjs/data/loader.js';
       s.onerror = function () {
