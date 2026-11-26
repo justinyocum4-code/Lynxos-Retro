@@ -668,7 +668,10 @@
       showScreen('player');
       setPlayingBridge(true);
       $('nowPlaying').textContent = 'Now playing: ' + game.title + ' (' + systemLabel(game.system) + ')';
-      announce('Now playing ' + game.title + ', ' + systemLabel(game.system) + '. ' + controlSummary(game.system));
+      var speedNote = '';
+      if (game.system === 'n64') speedNote = ' Running at native resolution for smoother play.';
+      if (game.system === 'psx') speedNote = ' Frameskip is on auto for smoother play.';
+      announce('Now playing ' + game.title + ', ' + systemLabel(game.system) + '.' + speedNote + ' ' + controlSummary(game.system));
       window.EJS_player = '#game';
       window.EJS_core = game.core || systemCore(game.system);
       window.EJS_gameUrl = url;
@@ -681,9 +684,31 @@
       // No smoothing: the game's own pixels, not a blurred upscale.
       // The bundled emulator already defaults video_smooth to false;
       // this sets it through the documented EJS_defaultOptions so it
-      // stays off even if that default changes. There is no supported
-      // EJS setting for native resolution, so nothing else is set here.
+      // stays off even if that default changes. The emulator writes
+      // each EJS_defaultOptions entry as a key = value line into the
+      // core settings file, so core options go here too — but only
+      // IDs verified in the bundled core itself (see below).
       window.EJS_defaultOptions = { video_smooth: false };
+      if (game.system === 'n64') {
+        // N64 renders at its own native size (320x240 for 4:3,
+        // 640x360 for 16:9) instead of the TV's resolution — the
+        // biggest speed win on this box. IDs and values verified in
+        // the bundled mupen64plus_next wasm
+        // (mupen64plus-43screensize, mupen64plus-169screensize).
+        window.EJS_defaultOptions['mupen64plus-43screensize'] = '320x240';
+        window.EJS_defaultOptions['mupen64plus-169screensize'] = '640x360';
+      }
+      if (game.system === 'psx') {
+        // PlayStation: frameskip on auto — the core skips a frame only
+        // when the audio buffer runs low, so heavy 3D games keep their
+        // speed instead of crackling. ID verified in the bundled
+        // pcsx_rearmed wasm; values/default verified in the core's own
+        // option definitions (disabled by default; auto is the mild,
+        // self-regulating choice). No resolution or enhanced-resolution
+        // option exists in this build (no NEON GPU), so PS1 already
+        // renders at native resolution — nothing to set there.
+        window.EJS_defaultOptions['pcsx_rearmed_frameskip_type'] = 'auto';
+      }
       if (game.system === 'psx') {
         // Pin the keyboard map for PlayStation so the remote's injected
         // keys land on the right buttons (EmulatorJS defaults vary by
