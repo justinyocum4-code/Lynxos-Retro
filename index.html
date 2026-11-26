@@ -107,6 +107,7 @@
     <p class="note">Or pick a game file from this device:</p>
     <label for="addFile">Game file</label>
     <input type="file" id="addFile">
+    <p class="note" id="addChdHint" hidden></p>
     <p class="note" id="addSyncNote"></p>
     <div class="actions">
       <button type="button" id="addSaveBtn">Add game</button>
@@ -253,6 +254,20 @@
     if (m.indexOf('too large') !== -1 || m.indexOf('payload') !== -1 || m.indexOf('413') !== -1) return 'The file is too big for the cloud. Try a smaller file or a zip.';
     if (m.indexOf('row-level security') !== -1 || m.indexOf('permission') !== -1 || m.indexOf('unauthorized') !== -1 || m.indexOf('401') !== -1 || m.indexOf('403') !== -1) return 'The cloud would not let you upload. Try signing out and back in.';
     if (m.indexOf('already exists') !== -1 || m.indexOf('duplicate') !== -1) return 'That file is already in the cloud. It may have uploaded already, check your library.';
+    return msg;
+  }
+
+  // Translate a raw download error into plain words, never just
+  // "unknown error". Download wording — not the upload wording above.
+  function plainDownloadReason(err) {
+    var msg = (err && err.message) ? err.message : '';
+    var m = msg.toLowerCase();
+    if (!msg) return 'Something went wrong, but the app did not say what. Check your connection and try again.';
+    if (m.indexOf('failed to fetch') !== -1 || m.indexOf('network') !== -1) return 'The connection dropped. Check your Wi-Fi and try again.';
+    if (m.indexOf('timeout') !== -1 || m.indexOf('timed out') !== -1 || m.indexOf('stuck') !== -1) return 'The download timed out. Your connection may be slow, try again.';
+    if (m.indexOf('not found') !== -1 || m.indexOf('404') !== -1) return 'The game file is no longer in the cloud. It may have been deleted.';
+    if (m.indexOf('row-level security') !== -1 || m.indexOf('permission') !== -1 || m.indexOf('unauthorized') !== -1 || m.indexOf('401') !== -1 || m.indexOf('403') !== -1) return 'The cloud would not let you download this game. Try signing out and back in.';
+    if (m.indexOf('not signed in') !== -1) return 'You are not signed in. Sign in and try again.';
     return msg;
   }
 
@@ -634,7 +649,18 @@
   // ---------- Player ----------
 
   function playGame(game) {
-    resolveGameUrl(game).then(function (url) {
+    var isCloud = !!game.storagePath;
+    if (isCloud) {
+      // Show the player screen now so the download has somewhere
+      // visible to report to; the spoken progress comes from the
+      // download itself. "Loading" on purpose: a cached game says
+      // nothing about downloading, it just starts.
+      showScreen('player');
+      $('nowPlaying').textContent = 'Loading ' + game.title + '…';
+    }
+    resolveGameUrl(game, function (percent) {
+      $('nowPlaying').textContent = 'Downloading ' + game.title + ', ' + percent + ' percent.';
+    }).then(function (url) {
       if (!url) {
         announce('Could not load ' + game.title + '.');
         return;
@@ -652,6 +678,12 @@
       window.EJS_language = 'en-US';
       window.EJS_disableAutoLang = true;
       window.EJS_startOnLoaded = true;
+      // No smoothing: the game's own pixels, not a blurred upscale.
+      // The bundled emulator already defaults video_smooth to false;
+      // this sets it through the documented EJS_defaultOptions so it
+      // stays off even if that default changes. There is no supported
+      // EJS setting for native resolution, so nothing else is set here.
+      window.EJS_defaultOptions = { video_smooth: false };
       if (game.system === 'psx') {
         // Pin the keyboard map for PlayStation so the remote's injected
         // keys land on the right buttons (EmulatorJS defaults vary by
@@ -704,21 +736,41 @@
       };
       document.head.appendChild(s);
     }).catch(function (err) {
-      announce('Could not load ' + game.title + ': ' + (err && err.message ? err.message : 'unknown error'));
+      var reason = plainDownloadReason(err);
+      var text = 'Could not load ' + game.title + '. ' + reason;
+      announce(text);
+      announceUrgent(text);
       showScreen('library');
     });
   }
 
+  // Cloud games are cached on this device (IndexedDB, keyed by their
+  // cloud path) so a game you already played does not download again.
+  // The cache key is the storage path itself, so if the file ever
+  // changes the key changes too and the new file downloads. Cached
+  // files are removed when the game is deleted. No size cap is
+  // enforced here: cloud files are at most 50 MB each, and the TV
+  // has 32 GB of storage — if the cache ever grows too big, the next
+  // step is an eviction pass, not a settings screen.
+  function cloudCacheKey(storagePath) { return 'cloud:' + storagePath; }
+
   // Returns a playable URL for a game: a bundled file path, a remote
   // link, a downloaded cloud file, or a locally stored file.
-  function resolveGameUrl(game) {
+  function resolveGameUrl(game, onProgress) {
     if (game.file) return Promise.resolve(game.file);
     if (game.romUrl) return Promise.resolve(game.romUrl);
     if (game.storagePath) {
       if (!supabaseClient) return Promise.reject(new Error('Not signed in.'));
-      return supabaseClient.storage.from('roms').download(game.storagePath).then(function (res) {
-        if (res.error) throw res.error;
-        return URL.createObjectURL(res.data);
+      var key = cloudCacheKey(game.storagePath);
+      // A cache-read failure must never stop play: it just means
+      // download instead. A download failure still reaches playGame.
+      return idbGet(key).catch(function () { return null; }).then(function (blob) {
+        if (blob) return URL.createObjectURL(blob);
+        return downloadWithProgress(game.storagePath, game.title, onProgress || function () {}).then(function (downloaded) {
+          // Cache it for next time; a cache failure must never stop play.
+          idbPut(key, downloaded).catch(function () {});
+          return URL.createObjectURL(downloaded);
+        });
       });
     }
     if (game.idbKey) {
@@ -1066,12 +1118,88 @@
     });
   }
 
+  // Download a cloud game file with real progress, so a big game says
+  // how far along it is instead of sitting silent. GETs the Storage
+  // API directly (the supabase .download() call reports no progress).
+  // onProgress gets 0-100. Fails loudly if nothing moves for 60 s.
+  function downloadWithProgress(path, title, onProgress) {
+    return supabaseClient.auth.getSession().then(function (sess) {
+      var token = (sess && sess.data && sess.data.session) ? sess.data.session.access_token : window.SUPABASE_ANON_KEY;
+      return new Promise(function (resolve, reject) {
+        var url = window.SUPABASE_URL + '/storage/v1/object/roms/' +
+          path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+        var xhr = new XMLHttpRequest();
+        xhr.responseType = 'blob';
+        var lastMove = Date.now();
+        var lastMilestone = 0;
+        var stallTimer = setInterval(function () {
+          if (Date.now() - lastMove > 60000) {
+            clearInterval(stallTimer);
+            try { xhr.abort(); } catch (e) {}
+            reject(new Error('Download seems stuck: nothing came down for a minute. Check your connection and try again.'));
+          }
+        }, 5000);
+        xhr.open('GET', url);
+        xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+        xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
+        xhr.onprogress = function (e) {
+          lastMove = Date.now();
+          if (!e.lengthComputable) return;
+          var percent = Math.min(100, Math.round(e.loaded * 100 / e.total));
+          onProgress(percent);
+          var milestone = Math.floor(percent / 25) * 25;
+          if (milestone > lastMilestone && milestone < 100) {
+            lastMilestone = milestone;
+            announce('Downloading ' + title + ', ' + milestone + ' percent.');
+          }
+        };
+        xhr.onload = function () {
+          clearInterval(stallTimer);
+          if (xhr.status >= 200 && xhr.status < 300) {
+            onProgress(100);
+            announce('Downloaded ' + title + '.');
+            resolve(xhr.response);
+          } else {
+            var detail = '';
+            try { var body = JSON.parse(xhr.responseText || '{}'); detail = body.message || body.error || ''; } catch (e) {}
+            reject(new Error(detail || ('Cloud download failed, status ' + xhr.status + '.')));
+          }
+        };
+        xhr.onerror = function () {
+          clearInterval(stallTimer);
+          reject(new Error('Network error while downloading. Check your connection and try again.'));
+        };
+        xhr.ontimeout = function () {
+          clearInterval(stallTimer);
+          reject(new Error('Download timed out. Check your connection and try again.'));
+        };
+        xhr.timeout = 0; // No overall cap: a slow download can take as
+        // long as it needs while it is moving. The 60-second stall
+        // check above is what catches a dead connection, so a stuck
+        // download still fails loudly instead of hanging forever.
+        announce('Downloading ' + title + ', 0 percent.');
+        xhr.send();
+      });
+    });
+  }
+
   function addGame() {
     var title = $('addTitle').value.trim();
     var system = $('addSystem').value;
     var url = $('addUrl').value.trim();
     var file = $('addFile').files && $('addFile').files[0];
     var status = $('addStatus');
+    // PlayStation tip, hint only: .chd files load faster and use less
+    // of the TV's memory. Any format still works — this never blocks.
+    var chdHint = $('addChdHint');
+    var showChdHint = system === 'psx' && !!file && !/\.chd$/i.test(file.name);
+    if (chdHint) {
+      chdHint.hidden = !showChdHint;
+      if (showChdHint) {
+        chdHint.textContent = "Tip: PlayStation games load faster and use less of the TV's memory as .chd files. This file will still work.";
+        announce(chdHint.textContent);
+      }
+    }
     if (!url && !file) {
       setStatus(status, 'Add a game file or paste a game link first.', 'error');
       announce('Add a game file or paste a game link first.');
@@ -1267,6 +1395,9 @@
         return;
       }
       var rowId = String(game.id).replace(/^sync-/, '');
+      // Drop this game's downloaded copy too, so the cache does not
+      // keep files for games that are gone.
+      if (game.storagePath) idbDelete('cloud:' + game.storagePath).catch(function () {});
       var removeFile = game.storagePath
         ? supabaseClient.storage.from('roms').remove([game.storagePath])
         : Promise.resolve();
@@ -1303,6 +1434,7 @@
 
     $('addGameBtn').addEventListener('click', function () {
       setStatus($('addStatus'), '', '');
+      $('addChdHint').hidden = true;
       updateSyncStatus();
       showScreen('add');
       $('addTitle').focus();
