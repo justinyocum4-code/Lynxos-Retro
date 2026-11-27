@@ -210,6 +210,17 @@ jobs:
                   }
               }
               ndkVersion "27.2.12479018"
+              /* v1.4.9: keep the bridge's debug info — AGP strips
+                 native .so files in release builds by default, and
+                 the crash recorder's backtrace offsets are only
+                 resolvable with addr2line while the symbols are
+                 there. Only the bridge .so is exempt; the prebuilt
+                 cores stay stripped (they ship that way). */
+              packagingOptions {
+                  jniLibs {
+                      doNotStrip += "*/arm64-v8a/liblynxos_n64_jni.so"
+                  }
+              }
           }
           dependencies {
               implementation 'dev.kotlinds:libretro-kmp:0.1.2'
@@ -330,8 +341,10 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import java.io.BufferedReader;
           import java.io.File;
           import java.io.FileOutputStream;
+          import java.io.FileReader;
           import java.text.SimpleDateFormat;
           import java.util.Date;
           import java.util.Locale;
@@ -397,6 +410,11 @@ jobs:
               private int closedProbeToken = 0;
               private boolean closedProbeOutstanding = false;
               private TextToSpeech closedTts = null;
+              /* Crash recorder (v1.4.9): its own TTS — the crash
+                 summary must not cut off the closed-outcome voice
+                 (or vice versa) by sharing one instance. */
+              private TextToSpeech crashTts = null;
+              private boolean crashReportSpoken = false;
               private final Runnable closedOutcomeWatchdog = new Runnable() {
                   @Override public void run() {
                       if (!closedOutcomePending || closedOutcomeDelivered) return;
@@ -447,6 +465,14 @@ jobs:
               private static final String PLAYER_STAGE_KEY = "playerLoadStage";
               private static final String PLAYER_BRIDGE_STEP_KEY = "playerBridgeStep";
               private static final String LAST_CLOSE_KEY = "lastPlayerClose";
+              /* Crash recorder (v1.4.9): the native bridge writes a
+                 crash report to filesDir/n64-crash.txt when the N64
+                 player dies in native code. The file is never
+                 deleted on read — dismissal is a fingerprint
+                 (length + last-modified) in prefs, so a NEW crash
+                 shows and speaks again. */
+              private static final String N64_CRASH_FILE = "n64-crash.txt";
+              private static final String CRASH_DISMISSED_KEY = "n64CrashDismissed";
               private static final long PLAYER_MARKER_MAX_AGE_MS = 10L * 60L * 1000L;
               /* F3 (v1.4.8): the marker carries the core too, so the
                  Last-game line can name it ("parallel" / "mupen";
@@ -549,6 +575,32 @@ jobs:
                   public void clearLastPlayerClose() {
                       try {
                           MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit().remove(LAST_CLOSE_KEY).apply();
+                      } catch (Exception ignored) {}
+                  }
+                  /* Crash recorder (v1.4.9): the page shows the last
+                     native crash report on the library screen, next
+                     to the Last-game line but never overwriting it.
+                     The file itself is never deleted — dismissing
+                     only records its fingerprint, so a new crash
+                     shows again. */
+                  @JavascriptInterface
+                  public String getLastN64Crash() {
+                      try {
+                          File f = new File(getFilesDir(), N64_CRASH_FILE);
+                          if (!f.exists() || f.length() == 0) return "";
+                          String fp = f.length() + "|" + f.lastModified();
+                          String dismissed = MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).getString(CRASH_DISMISSED_KEY, "");
+                          if (fp.equals(dismissed)) return "";
+                          return MainActivity.this.formatCrashSummary(f);
+                      } catch (Exception ignored) { return ""; }
+                  }
+                  @JavascriptInterface
+                  public void clearLastN64Crash() {
+                      try {
+                          File f = new File(getFilesDir(), N64_CRASH_FILE);
+                          if (!f.exists()) return;
+                          String fp = f.length() + "|" + f.lastModified();
+                          MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit().putString(CRASH_DISMISSED_KEY, fp).apply();
                       } catch (Exception ignored) {}
                   }
 
@@ -1022,6 +1074,13 @@ jobs:
                      landing back at the library in silence. Markers
                      older than 10 minutes are dropped: the app was
                      probably just killed while backgrounded. */
+                  /* Crash recorder (v1.4.9): a native crash report
+                     from the last N64 run speaks first — it is the
+                     cause the silent-death path would only guess
+                     at. checkN64CrashReport sets crashReportSpoken,
+                     and startClosedOutcome skips its own voice when
+                     that is set, so Justin hears one message. */
+                  checkN64CrashReport();
                   checkSilentPlayerDeath();
               }
 
@@ -1090,6 +1149,159 @@ jobs:
                   startClosedOutcome(system, fullReason);
               }
 
+              /* Crash recorder (v1.4.9): if the native bridge wrote a
+                 crash report (filesDir/n64-crash.txt), speak a short
+                 summary and set crashReportSpoken so the
+                 silent-death path does not speak a second, vaguer
+                 message over it. The file is never deleted here —
+                 the page shows the details, and dismissing only
+                 records its fingerprint. Runs on every onResume, so
+                 a crash from the previous process is reported on
+                 the next launch. */
+              private void checkN64CrashReport() {
+                  crashReportSpoken = false;
+                  try {
+                      File f = new File(getFilesDir(), N64_CRASH_FILE);
+                      if (!f.exists() || f.length() == 0) return;
+                      String fp = f.length() + "|" + f.lastModified();
+                      String dismissed = getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).getString(CRASH_DISMISSED_KEY, "");
+                      if (fp.equals(dismissed)) return;
+                      String core = readCrashField(f, "core ");
+                      int sig = readCrashSignal(f);
+                      /* The recorder is armed only by the N64
+                         player, but if no N64 core was loaded when
+                         the crash hit, don't name the wrong player. */
+                      String text;
+                      if (core != null && !core.isEmpty() && !"(none)".equals(core) && !"(unknown)".equals(core)) {
+                          text = "Nintendo 64 closed because of a crash in the game code, signal " + sig + ".";
+                      } else {
+                          text = "The game closed because of a crash in the game code, signal " + sig + ".";
+                      }
+                      speakCrashSummary(text);
+                      crashReportSpoken = true;
+                  } catch (Exception ignored) {}
+              }
+
+              /* First "signal N" line of a crash report, or 0. */
+              private int readCrashSignal(File f) {
+                  BufferedReader r = null;
+                  try {
+                      r = new BufferedReader(new FileReader(f));
+                      String line;
+                      while ((line = r.readLine()) != null) {
+                          if (line.startsWith("signal ")) {
+                              try { return Integer.parseInt(line.substring(7).trim()); }
+                              catch (Exception ignored) { return 0; }
+                          }
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      try { if (r != null) r.close(); } catch (Exception ignored) {}
+                  }
+                  return 0;
+              }
+
+              /* First line starting with the given prefix, or null. */
+              private String readCrashField(File f, String prefix) {
+                  BufferedReader r = null;
+                  try {
+                      r = new BufferedReader(new FileReader(f));
+                      String line;
+                      while ((line = r.readLine()) != null) {
+                          if (line.startsWith(prefix)) return line.substring(prefix.length()).trim();
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      try { if (r != null) r.close(); } catch (Exception ignored) {}
+                  }
+                  return null;
+              }
+
+              /* One display line for the crash report: signal, fault
+                 address, core, last bridge step, and the top 3
+                 backtrace frames. The page shows it as the "Last
+                 crash" line; the raw file stays on the device for
+                 the full diagnosis. */
+              private String formatCrashSummary(File f) {
+                  String sig = "", fault = "", core = "", step = "";
+                  java.util.ArrayList<String> trace = new java.util.ArrayList<String>();
+                  BufferedReader r = null;
+                  try {
+                      r = new BufferedReader(new FileReader(f));
+                      String line;
+                      boolean inTrace = false;
+                      while ((line = r.readLine()) != null) {
+                          if (line.startsWith("signal ")) sig = line.substring(7).trim();
+                          else if (line.startsWith("fault ")) fault = line.substring(6).trim();
+                          else if (line.startsWith("core ")) core = line.substring(5).trim();
+                          else if (line.startsWith("step ")) step = line.substring(5).trim();
+                          else if (line.equals("trace:")) inTrace = true;
+                          else if (inTrace && trace.size() < 3) trace.add(line.trim());
+                      }
+                  } catch (Exception ignored) {
+                  } finally {
+                      try { if (r != null) r.close(); } catch (Exception ignored) {}
+                  }
+                  StringBuilder sb = new StringBuilder();
+                  if (!sig.isEmpty()) sb.append("signal ").append(sig);
+                  if (!fault.isEmpty()) { if (sb.length() > 0) sb.append(", "); sb.append("fault ").append(fault); }
+                  if (!core.isEmpty() && !"(none)".equals(core)) { if (sb.length() > 0) sb.append(", "); sb.append("core ").append(core); }
+                  if (!step.isEmpty() && !"(none)".equals(step)) { if (sb.length() > 0) sb.append(", "); sb.append("step ").append(step); }
+                  if (!trace.isEmpty()) {
+                      if (sb.length() > 0) sb.append(", ");
+                      sb.append("trace ").append(android.text.TextUtils.join(" ", trace));
+                  }
+                  return sb.toString();
+              }
+
+              /* Crash summary voice (v1.4.9): mirrors
+                 speakClosedOutcome — a Toast with the full text plus
+                 a short-lived TextToSpeech, shut down after the
+                 utterance (or after 15 s as a safety net). Own TTS
+                 instance so it cannot cut off, or be cut off by,
+                 the closed-outcome voice. */
+              private void speakCrashSummary(final String text) {
+                  try {
+                      Toast.makeText(this, text, Toast.LENGTH_LONG).show();
+                  } catch (Exception ignored) {}
+                  try {
+                      if (crashTts != null) {
+                          try { crashTts.stop(); } catch (Exception ignored) {}
+                          try { crashTts.shutdown(); } catch (Exception ignored) {}
+                          crashTts = null;
+                      }
+                      final TextToSpeech[] holder = new TextToSpeech[1];
+                      final TextToSpeech tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+                          @Override public void onInit(int status) {
+                              TextToSpeech self = holder[0];
+                              if (status == TextToSpeech.SUCCESS && self != null) {
+                                  try { self.speak(text, TextToSpeech.QUEUE_FLUSH, null, "crash-report"); }
+                                  catch (Exception ignored) {}
+                              }
+                          }
+                      });
+                      holder[0] = tts;
+                      crashTts = tts;
+                      tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                          @Override public void onStart(String utteranceId) {}
+                          @Override public void onDone(String utteranceId) { shutdownCrashTts(tts); }
+                          @Override public void onError(String utteranceId) { shutdownCrashTts(tts); }
+                      });
+                      final TextToSpeech t = tts;
+                      mainHandler.postDelayed(new Runnable() {
+                          @Override public void run() { shutdownCrashTts(t); }
+                      }, 15000);
+                  } catch (Exception ignored) {}
+              }
+
+              private void shutdownCrashTts(TextToSpeech tts) {
+                  try {
+                      if (crashTts == tts) crashTts = null;
+                      tts.stop();
+                      tts.shutdown();
+                  } catch (Exception ignored) {}
+              }
+
               /* F1/F2 (v1.4.7): start a closed-outcome delivery. The
                  spoken announcement and Toast fire immediately — the
                  page live region alone is silent after a process
@@ -1105,7 +1317,11 @@ jobs:
                   closedOutcomePending = true;
                   closedProbeToken++; /* invalidate any stale probe callback */
                   closedProbeOutstanding = false;
-                  speakClosedOutcome(system, reason);
+                  /* v1.4.9: if the crash recorder already spoke
+                     the cause, don't speak a second, vaguer
+                     message over it. The page delivery below still
+                     runs, so the Last-game line still appears. */
+                  if (!crashReportSpoken) speakClosedOutcome(system, reason);
                   deliverClosedOutcome(system, reason);
                   scheduleClosedWatchdog();
               }
@@ -1573,6 +1789,7 @@ jobs:
                   if (instance == this) instance = null;
                   try { mainHandler.removeCallbacks(closedOutcomeWatchdog); } catch (Exception ignored) {}
                   try { if (closedTts != null) { closedTts.stop(); closedTts.shutdown(); closedTts = null; } } catch (Exception ignored) {}
+                  try { if (crashTts != null) { crashTts.stop(); crashTts.shutdown(); crashTts = null; } } catch (Exception ignored) {}
                   try { if (webView != null) webView.destroy(); } catch (Exception ignored) {}
                   super.onDestroy();
               }
