@@ -342,6 +342,13 @@ jobs:
               private long nativeTotal = 0;
               private long nativeWritten = 0;
               private boolean nativePlayerLaunched = false;
+              /* Extract-once cache (v1.4.4): finished native exports
+                 live in filesDir/extracted-games/<key>/ — filesDir,
+                 not cacheDir, so the OS never evicts them. The key
+                 is the sanitised title + "__" + system. main.txt
+                 in the folder names the play file and is only
+                 written by nativeEnd after its byte-count checks
+                 pass, so its presence means a complete export. */
               /* Which system the export in progress is for ("psx" or
                  "n64") and, for N64, which core the page picked
                  ("parallel" or "mupen"). nativeEnd uses both to pick
@@ -363,6 +370,29 @@ jobs:
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
               private static MainActivity instance;
 
+              /* Player outcome reporting (v1.4.4): the native
+                 players' own speech may be silent on the TV, so a
+                 player that fails, stops, hangs or draws no picture
+                 reports its outcome here; onResume hands it to the
+                 page, which announces it through TalkBack. Soft
+                 outcomes (no picture while running) only stick when
+                 nothing is set yet; hard ones (failure, stop, hang)
+                 overwrite. */
+              private static String pendingOutcomeSystem = null;
+              private static String pendingOutcomeKind = null;
+              private static String pendingOutcomeReason = null;
+              public static synchronized void reportPlayerOutcome(String system, String kind, String reason, boolean hard) {
+                  if (hard || pendingOutcomeKind == null) {
+                      pendingOutcomeSystem = system;
+                      pendingOutcomeKind = kind;
+                      pendingOutcomeReason = reason;
+                  }
+              }
+              private static String escapeJs(String s) {
+                  if (s == null) return "";
+                  return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", " ");
+              }
+
               /* Bridge the page calls: the page tells us when a game is
                  playing (so the rocker keys become game buttons) and asks
                  whether this is a TV (so it can use the big layout). */
@@ -380,7 +410,11 @@ jobs:
                   public String nativeBegin(String title, String system, long totalBytes) {
                       try {
                           nativeCancel();
-                          File dir = new File(getCacheDir(), "native-games");
+                          /* Single-file exports land straight in the
+                             extract-once cache (filesDir, not
+                             cacheDir): after nativeEnd writes
+                             main.txt, later launches skip the send. */
+                          File dir = extractCacheDir(title, system);
                           dir.mkdirs();
                           String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
                           if (safe.isEmpty()) safe = "game";
@@ -422,7 +456,11 @@ jobs:
                                   nativeCancel();
                                   return "error: no main game file";
                               }
+                              /* Complete export: record the play file
+                                 so later launches can use the cache. */
+                              writeMainFile(nativeMultiDir, nativeMainFile.getName());
                               launchNativePlayer(nativeMainFile);
+                              clearExportState();
                               return "ok";
                           }
                           if (nativeOut == null) return "error: no export in progress";
@@ -432,11 +470,28 @@ jobs:
                               nativeCancel();
                               return "error: incomplete file";
                           }
+                          /* Complete export: record the play file so
+                             later launches can use the cache. */
+                          writeMainFile(nativeGameFile.getParentFile(), nativeGameFile.getName());
                           launchNativePlayer(nativeGameFile);
+                          clearExportState();
                           return "ok";
                       } catch (Exception e) {
                           return "error: " + e.getMessage();
                       }
+                  }
+
+                  /* After a successful launch the export is done:
+                     drop the file references WITHOUT deleting the
+                     files — they are the extract-once cache now, and
+                     a later nativeCancel must not wipe them. */
+                  private void clearExportState() {
+                      nativeGameFile = null;
+                      nativeMultiDir = null;
+                      nativeMainFile = null;
+                      nativeMulti = false;
+                      nativeWritten = 0;
+                      nativeTotal = 0;
                   }
 
                   /* Shared by both export paths: start the player
@@ -509,8 +564,14 @@ jobs:
                           nativeCancel();
                           String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
                           if (safe.isEmpty()) safe = "game";
-                          File dir = new File(getCacheDir(), "native-games");
-                          nativeMultiDir = new File(dir, safe);
+                          /* Multi-file exports land straight in the
+                             extract-once cache: a re-extract wipes
+                             the old cache for this game first (it is
+                             stale by definition), and nativeEnd
+                             writes main.txt once every file checks
+                             out, so later launches skip the extract
+                             and the send entirely. */
+                          nativeMultiDir = extractCacheDir(title, system);
                           deleteRecursive(nativeMultiDir);
                           nativeMultiDir.mkdirs();
                           nativeTitle = title;
@@ -579,6 +640,95 @@ jobs:
                       if (slash >= 0) base = base.substring(slash + 1);
                       base = base.replaceAll("[^A-Za-z0-9._-]", "_");
                       return base;
+                  }
+
+                  /* Extract-once cache key: sanitised title + system.
+                     The page never computes this — the bridge owns it,
+                     so the two sides cannot disagree. */
+                  private String cacheKey(String title, String system) {
+                      String safe = title == null ? "" : title.replaceAll("[^A-Za-z0-9._-]", "_");
+                      if (safe.isEmpty()) safe = "game";
+                      return safe + "__" + (system == null ? "" : system);
+                  }
+                  private File extractCacheDir(String title, String system) {
+                      File root = new File(getFilesDir(), "extracted-games");
+                      return new File(root, cacheKey(title, system));
+                  }
+                  /* Record the play file after a complete export.
+                     Only nativeEnd calls this, after its byte-count
+                     checks — so main.txt means "complete". */
+                  private void writeMainFile(File dir, String name) {
+                      try {
+                          FileOutputStream out = new FileOutputStream(new File(dir, "main.txt"));
+                          try { out.write(name.getBytes("UTF-8")); } finally { out.close(); }
+                      } catch (Exception ignored) {}
+                  }
+                  private String readMainFile(File dir) {
+                      try {
+                          java.io.FileInputStream in = new java.io.FileInputStream(new File(dir, "main.txt"));
+                          try {
+                              byte[] buf = new byte[512];
+                              int n = in.read(buf);
+                              if (n <= 0) return "";
+                              return new String(buf, 0, n, "UTF-8").trim();
+                          } finally { in.close(); }
+                      } catch (Exception e) { return ""; }
+                  }
+
+                  /* Extract-once cache: returns the play file name
+                     when this game has a complete cached extraction,
+                     else "". The page launches from the cache instead
+                     of re-extracting and re-sending. */
+                  @JavascriptInterface
+                  public String nativeCachedMainFile(String title, String system) {
+                      try {
+                          File dir = extractCacheDir(title, system);
+                          String main = readMainFile(dir);
+                          if (main.isEmpty()) return "";
+                          File f = new File(dir, main);
+                          return f.exists() ? main : "";
+                      } catch (Exception e) {
+                          return "";
+                      }
+                  }
+                  /* Launch the player straight from a cached
+                     extraction — no re-extract, no re-send. Returns
+                     "ok" or "error: ..."; the page falls back to the
+                     normal export on any error. */
+                  @JavascriptInterface
+                  public String nativeLaunchCached(String title, String system, String core) {
+                      try {
+                          File dir = extractCacheDir(title, system);
+                          String main = readMainFile(dir);
+                          if (main.isEmpty()) return "error: no cached game";
+                          File f = new File(dir, main);
+                          if (!f.exists()) return "error: cached game file is missing";
+                          nativeTitle = title;
+                          nativeSystem = system;
+                          nativeCore = core == null ? "" : core;
+                          /* No export is in progress: clear any stale
+                             file references without deleting anything,
+                             so a later nativeCancel cannot wipe this
+                             cache. (A failed export's partial files
+                             were already removed by nativeCancel in
+                             the page's error path.) */
+                          try { if (nativeOut != null) nativeOut.close(); } catch (Exception ignored) {}
+                          nativeGameFile = null;
+                          nativeMultiDir = null;
+                          nativeMainFile = null;
+                          nativeMulti = false;
+                          nativeOut = null;
+                          launchNativePlayer(f);
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  /* Drop one game's extracted cache (called when the
+                     game is deleted from the library). Best effort. */
+                  @JavascriptInterface
+                  public void nativeDeleteCache(String title, String system) {
+                      try { deleteRecursive(extractCacheDir(title, system)); } catch (Exception ignored) {}
                   }
               }
 
@@ -680,6 +830,26 @@ jobs:
                       if (webView != null) {
                           webView.post(new Runnable() {
                               @Override public void run() {
+                                  /* A player outcome to announce: the
+                                     player's own speech may be silent
+                                     on the TV, so the page says it
+                                     through TalkBack when we return. */
+                                  String oSystem, oKind, oReason;
+                                  synchronized (MainActivity.class) {
+                                      oSystem = pendingOutcomeSystem;
+                                      oKind = pendingOutcomeKind;
+                                      oReason = pendingOutcomeReason;
+                                      pendingOutcomeSystem = null;
+                                      pendingOutcomeKind = null;
+                                      pendingOutcomeReason = null;
+                                  }
+                                  if (oKind != null) {
+                                      webView.evaluateJavascript(
+                                          "try{if(window.handlePlayerOutcome)window.handlePlayerOutcome('" +
+                                          escapeJs(oSystem) + "','" + escapeJs(oKind) + "','" +
+                                          escapeJs(oReason) + "');}catch(e){}",
+                                          null);
+                                  }
                                   webView.evaluateJavascript(
                                       "try{showScreen('library');setPlayingBridge(false);}catch(e){}",
                                       null);
