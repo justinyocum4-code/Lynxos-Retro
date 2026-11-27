@@ -63,6 +63,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val CORE_MUPEN_NAME = "mupen64plus_next_gles3_libretro_android.so"
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
+        private const val START_WATCHDOG_MS = 30_000L
         private const val Z_TAP_MS = 100L
         private const val STICK_MAX = 32767
         private const val STICK_DEAD_ZONE = 0.15f
@@ -117,6 +118,25 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     private val exitRunnable = Runnable {
         if (backHeld && !backChordUsed) finishPlayer()
+    }
+
+    // Start watchdog: if the frame loop has not started 30 s after
+    // the core thread starts, the core thread is hung inside a
+    // blocking JNI call (nativeInit / nativeLoadCore / nativeLoadGame
+    // — a hang is not an exception, so the try/catch never fires).
+    // The UI thread is not blocked by that hang, so this still fires.
+    // The finish is delayed 5 s after the spoken warning and guarded
+    // on running still being false: finishPlayer stops and shuts
+    // down TTS, so finishing immediately would cut the warning off
+    // before it is heard, and a game that starts in those 5 s must
+    // not be killed.
+    private val startWatchdog = Runnable {
+        if (!running.get()) {
+            speak("The Nintendo 64 game is taking too long to start.")
+            mainHandler.postDelayed({
+                if (!running.get()) finishPlayer()
+            }, 5000L)
+        }
     }
 
     // ----- JNI bridge (lynxos_n64_jni.c) -----
@@ -219,6 +239,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 runOnUiThread { startAudio(sampleRate) }
                 speak("Now playing $gameTitle, Nintendo 64. " + controlSummary())
                 running.set(true)
+                mainHandler.removeCallbacks(startWatchdog)
                 val frameNanos = (1_000_000_000.0 / fps).toLong()
                 while (running.get()) {
                     val t0 = System.nanoTime()
@@ -260,6 +281,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         coreThread?.start()
+        mainHandler.postDelayed(startWatchdog, START_WATCHDOG_MS)
     }
 
     private fun lastErrorOr(fallback: String): String {
@@ -532,6 +554,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         if (closed.getAndSet(true)) return
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
+        mainHandler.removeCallbacks(startWatchdog)
         try {
             coreThread?.join(1000)
         } catch (e: Exception) {
