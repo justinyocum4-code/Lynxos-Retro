@@ -687,22 +687,47 @@
       if (game.system === 'n64') {
         // N64 renders at its own native size (320x240 for 4:3,
         // 640x360 for 16:9) instead of the TV's resolution — the
-        // biggest speed win on this box. IDs and values verified in
-        // the bundled mupen64plus_next wasm
-        // (mupen64plus-43screensize, mupen64plus-169screensize).
+        // biggest speed win on this box. v1.2.3 adds the low-end
+        // speed set: framebuffer emulation OFF (the single biggest
+        // extra win on weak GPUs; a few games may show a wrong-looking
+        // effect), threaded renderer ON (spreads GLideN64 across the
+        // box's cores), bilinear mode 3point (the real N64's own
+        // filtering, cheaper than standard), and frame duplication ON
+        // (re-shows the last frame instead of juddering when the box
+        // falls behind). All IDs verified in the bundled
+        // mupen64plus_next wasm; values/defaults from the core's own
+        // libretro_core_options.h (FBEmu default True, threaded
+        // renderer default False, bilinear default standard, frame
+        // duping default False).
         window.EJS_defaultOptions['mupen64plus-43screensize'] = '320x240';
         window.EJS_defaultOptions['mupen64plus-169screensize'] = '640x360';
+        window.EJS_defaultOptions['mupen64plus-EnableFBEmulation'] = 'False';
+        window.EJS_defaultOptions['mupen64plus-ThreadedRenderer'] = 'True';
+        window.EJS_defaultOptions['mupen64plus-BilinearMode'] = '3point';
+        window.EJS_defaultOptions['mupen64plus-FrameDuping'] = 'True';
       }
       if (game.system === 'psx') {
-        // PlayStation: frameskip on auto — the core skips a frame only
-        // when the audio buffer runs low, so heavy 3D games keep their
-        // speed instead of crackling. ID verified in the bundled
-        // pcsx_rearmed wasm; values/default verified in the core's own
-        // option definitions (disabled by default; auto is the mild,
-        // self-regulating choice). No resolution or enhanced-resolution
-        // option exists in this build (no NEON GPU), so PS1 already
-        // renders at native resolution — nothing to set there.
-        window.EJS_defaultOptions['pcsx_rearmed_frameskip_type'] = 'auto';
+        // PlayStation: frameskip on auto_threshold — the core watches
+        // its own audio buffer and drops a frame whenever the buffer
+        // falls below 45% full, so heavy 3D games keep full game
+        // speed instead of slowing down and crackling. The old 'auto'
+        // mode waited for the browser frontend to report trouble,
+        // which a web frontend may never do, so it may have been
+        // doing nothing. Interval 3 caps any run of skipped frames.
+        // Instruction cache emulation OFF: it costs speed and barely
+        // does anything while the dynamic recompiler is on (only the
+        // three Formula One games need it). IDs verified in the
+        // bundled pcsx_rearmed wasm; values/defaults from the core's
+        // own option definitions. No resolution, enhanced-resolution,
+        // or threaded GPU/SPU option exists in this build (no NEON
+        // GPU), so PS1 already renders at native resolution — nothing
+        // to set there. Sound interpolation stays at 'simple' on
+        // purpose: 'off' would be faster but the audio would sound
+        // noticeably worse.
+        window.EJS_defaultOptions['pcsx_rearmed_frameskip_type'] = 'auto_threshold';
+        window.EJS_defaultOptions['pcsx_rearmed_frameskip_threshold'] = '45';
+        window.EJS_defaultOptions['pcsx_rearmed_frameskip_interval'] = '3';
+        window.EJS_defaultOptions['pcsx_rearmed_icache_emulation'] = 'disabled';
       }
       if (game.system === 'psx') {
         // Pin the keyboard map for PlayStation so the remote's injected
