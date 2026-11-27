@@ -644,6 +644,31 @@ static void crash_capture_bases(void) {
         }
     }
     fclose(f);
+
+    /* Bridge base via dladdr (v1.4.12): this .so is mapped straight
+     * from base.apk, so its /proc/self/maps path ends in "base.apk"
+     * and the basename scan above never sees it. dladdr on a
+     * function in this file gives the load base directly. The end
+     * is left 0 rather than guessed — the bases line still shows
+     * the start, so a bridge PC can be attributed by hand
+     * (pc - start). Only add the entry when the scan did not find
+     * one: a device that extracts the .so to a real path already
+     * has a real start AND end. */
+    {
+        Dl_info info;
+        if (dladdr((const void *)crash_capture_bases, &info) && info.dli_fbase) {
+            int found = 0;
+            for (int j = 0; j < g_crash_lib_count; j++) {
+                if (g_crash_libs[j].name == names[0]) { found = 1; break; }
+            }
+            if (!found && g_crash_lib_count < CRASH_MAX_LIBS) {
+                int idx = g_crash_lib_count++;
+                g_crash_libs[idx].name = names[0];
+                g_crash_libs[idx].start = (uintptr_t)info.dli_fbase;
+                g_crash_libs[idx].end = 0;
+            }
+        }
+    }
 }
 
 /* Resolve the crash file path and capture the .so bases at init.
@@ -1317,6 +1342,11 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadCore(JNIEnv *env, job
         set_error("The Nintendo 64 game core could not be loaded.");
         goto out;
     }
+    /* Crash recorder (v1.4.12): the core .so is only mapped now, so
+     * re-capture the .so bases — the init-time scan ran before any
+     * core was loaded and could not see it. Without this, the trace
+     * frames in a core crash cannot be attributed to the core. */
+    crash_capture_bases();
 #define LOAD_SYM(name) do { \
         g_##name = dlsym(g_core_handle, #name); \
         if (!g_##name) { \
