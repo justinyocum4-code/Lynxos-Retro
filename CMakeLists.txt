@@ -9,6 +9,12 @@ set(CMAKE_C_STANDARD 11)
 
 add_library(lynxos_n64_jni SHARED lynxos_n64_jni.c)
 
+# v1.4.9: keep debug info in the bridge .so so the crash recorder's
+# backtrace offsets resolve with addr2line. AGP would otherwise strip
+# it in the release build (see doNotStrip in the workflow's
+# build.gradle). The prebuilt cores ship stripped and stay that way.
+target_compile_options(lynxos_n64_jni PRIVATE -g)
+
 find_library(log-lib log)
 find_library(android-lib android)
 find_library(egl-lib EGL)
