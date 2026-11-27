@@ -928,6 +928,7 @@
     }
     var body = 'grant_type=refresh_token' +
       '&client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID) +
+      '&client_secret=' + encodeURIComponent(window.DRIVE_CLIENT_SECRET || '') +
       '&refresh_token=' + encodeURIComponent(driveRefreshToken);
     return driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/token', body, 'application/x-www-form-urlencoded')
       .then(function (res) {
@@ -1054,7 +1055,8 @@
     drivePollTimer = setInterval(function () {
       var body = 'grant_type=urn:ietf:params:oauth:grant-type:device_code' +
         '&device_code=' + encodeURIComponent(driveDeviceCode) +
-        '&client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID);
+        '&client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID) +
+        '&client_secret=' + encodeURIComponent(window.DRIVE_CLIENT_SECRET || '');
       driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/token', body, 'application/x-www-form-urlencoded')
         .then(function (res) {
           var data = {};
