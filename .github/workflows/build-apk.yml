@@ -41,12 +41,33 @@ jobs:
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Install Android NDK
+        run: |
+          export ANDROID_HOME="${ANDROID_HOME:-/usr/local/lib/android/sdk}"
+          if ! command -v sdkmanager >/dev/null 2>&1; then
+            export PATH="$PATH:$ANDROID_HOME/cmdline-tools/latest/bin"
+          fi
+          sdkmanager "ndk;27.2.12479018"
+
       - name: Fetch native PS1 core
         run: |
           mkdir -p app/src/main/assets/native
           curl -sL -o /tmp/pcsx_rearmed.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/pcsx_rearmed_libretro_android.so.zip"
           echo "102e22c7bd62b03758880b1b5be2c11381f8159d1233c54991b9af21a0c32b3b  /tmp/pcsx_rearmed.zip" | sha256sum -c -
           unzip -o -j /tmp/pcsx_rearmed.zip -d app/src/main/assets/native
+          ls -la app/src/main/assets/native
+
+      - name: Fetch native N64 cores
+        run: |
+          mkdir -p app/src/main/assets/native
+          curl -sL -o /tmp/parallel_n64.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/parallel_n64_libretro_android.so.zip"
+          echo "74b18a551d9194ff4869ec0cf77b8b9c944bb9570a4d0dde255da0019a767028  /tmp/parallel_n64.zip" | sha256sum -c -
+          curl -sL -o /tmp/mupen64plus_next_gles3.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip"
+          echo "b929f56492bab821862785e045d65c7ca435f7d2ff1c8d8621f22a0763b92ce4  /tmp/mupen64plus_next_gles3.zip" | sha256sum -c -
+          unzip -o -j /tmp/parallel_n64.zip -d app/src/main/assets/native
+          unzip -o -j /tmp/mupen64plus_next_gles3.zip -d app/src/main/assets/native
+          echo "38f14a287256b1938a0fc0435cb8893535c6ddead33d235e617f470a60066368  app/src/main/assets/native/parallel_n64_libretro_android.so" | sha256sum -c -
+          echo "41e3733bab6c5cda6e6d883c7599635f2e05285572d6a7e68d8b3f95c5df2815  app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so" | sha256sum -c -
           ls -la app/src/main/assets/native
 
       - name: Scaffold Android project
@@ -85,6 +106,22 @@ jobs:
             exit 1
           fi
           cp NativePlayerActivity.kt app/src/main/java/com/lynxosretro/app/NativePlayerActivity.kt
+          if [ ! -f "NativeN64PlayerActivity.kt" ]; then
+            echo "ERROR: NativeN64PlayerActivity.kt is missing (native N64 player source)."
+            exit 1
+          fi
+          cp NativeN64PlayerActivity.kt app/src/main/java/com/lynxosretro/app/NativeN64PlayerActivity.kt
+          if [ ! -f "lynxos_n64_jni.c" ]; then
+            echo "ERROR: lynxos_n64_jni.c is missing (native N64 bridge source)."
+            exit 1
+          fi
+          mkdir -p app/src/main/cpp
+          cp lynxos_n64_jni.c app/src/main/cpp/lynxos_n64_jni.c
+          if [ ! -f "CMakeLists.txt" ]; then
+            echo "ERROR: CMakeLists.txt is missing (native N64 build)."
+            exit 1
+          fi
+          cp CMakeLists.txt app/src/main/cpp/CMakeLists.txt
           echo "App files copied into assets/www:"
           du -sh app/src/main/assets/www
 
@@ -162,6 +199,12 @@ jobs:
               kotlinOptions {
                   jvmTarget = '17'
               }
+              externalNativeBuild {
+                  cmake {
+                      path "src/main/cpp/CMakeLists.txt"
+                  }
+              }
+              ndkVersion "27.2.12479018"
           }
           dependencies {
               implementation 'dev.kotlinds:libretro-kmp:0.1.2'
@@ -205,6 +248,13 @@ jobs:
                        from the library for PS1 games only. -->
                   <activity
                       android:name="com.lynxosretro.app.NativePlayerActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout" />
+                  <!-- Native Nintendo 64 player: real ARM code with a
+                       custom EGL bridge, launched from the library for
+                       N64 games only. -->
+                  <activity
+                      android:name="com.lynxosretro.app.NativeN64PlayerActivity"
                       android:exported="false"
                       android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout" />
                   <!-- Remote key service: sees the remote's app
@@ -292,6 +342,12 @@ jobs:
               private long nativeTotal = 0;
               private long nativeWritten = 0;
               private boolean nativePlayerLaunched = false;
+              /* Which system the export in progress is for ("psx" or
+                 "n64") and, for N64, which core the page picked
+                 ("parallel" or "mupen"). nativeEnd uses both to pick
+                 the player Activity. */
+              private String nativeSystem = "";
+              private String nativeCore = "";
               private long backDownTime = 0;
               private boolean backHeld = false;
               private boolean backChordUsed = false;
@@ -322,6 +378,8 @@ jobs:
                           String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
                           if (safe.isEmpty()) safe = "game";
                           nativeTitle = title;
+                          nativeSystem = system;
+                          nativeCore = "";
                           nativeGameFile = new File(dir, safe + ".bin");
                           nativeOut = new FileOutputStream(nativeGameFile);
                           nativeTotal = totalBytes;
@@ -353,7 +411,13 @@ jobs:
                               nativeCancel();
                               return "error: incomplete file";
                           }
-                          Intent i = new Intent(MainActivity.this, NativePlayerActivity.class);
+                          Intent i;
+                          if ("n64".equals(nativeSystem)) {
+                              i = new Intent(MainActivity.this, NativeN64PlayerActivity.class);
+                              i.putExtra("core", "mupen".equals(nativeCore) ? "mupen" : "parallel");
+                          } else {
+                              i = new Intent(MainActivity.this, NativePlayerActivity.class);
+                          }
                           i.putExtra("gamePath", nativeGameFile.getAbsolutePath());
                           i.putExtra("gameTitle", nativeTitle);
                           startActivity(i);
@@ -372,6 +436,16 @@ jobs:
                       if (nativeGameFile != null) { nativeGameFile.delete(); nativeGameFile = null; }
                       nativeWritten = 0;
                       nativeTotal = 0;
+                      nativeSystem = "";
+                      nativeCore = "";
+                  }
+                  /* Native N64 player: which core the page picked
+                     ("parallel" or "mupen"). Called right after
+                     nativeBegin for N64 games; nativeEnd uses it to
+                     pick the player Activity. */
+                  @JavascriptInterface
+                  public void nativeSetCore(String core) {
+                      nativeCore = core == null ? "" : core;
                   }
               }
 
@@ -924,6 +998,9 @@ jobs:
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: 8.7
+
+      - name: Build native N64 bridge (CMake)
+        run: gradle :app:buildCMakeRelease
 
       - name: Build release APK (unsigned)
         run: gradle :app:assembleRelease
