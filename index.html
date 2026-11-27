@@ -131,8 +131,8 @@
     <div id="editCoreWrap" hidden>
       <label for="editCore">Core (Nintendo 64 only)</label>
       <select id="editCore">
-        <option value="mupen64plus_next">Mupen64Plus-Next (default)</option>
-        <option value="parallel_n64">Parallel N64 (try if the game is slow)</option>
+        <option value="parallel_n64">Parallel N64 (default)</option>
+        <option value="mupen64plus_next">Mupen64Plus-Next (try if the game is slow)</option>
       </select>
       <p class="note">Two different Nintendo 64 engines. If a game is slow or glitchy on one, try the other. In-game saves carry over.</p>
     </div>
@@ -314,6 +314,9 @@
     }
     if (system === 'psx') {
       return base + 'Channel up is Cross, channel down is Circle. Tap OK for Start. Tap Back is Triangle. Hold Back and press OK for Square, channel up for L1, channel down for R1. Hold Back alone for half a second to leave.';
+    }
+    if (system === 'n64') {
+      return base + 'The D-pad is the control stick, channel up is A, channel down is B. Tap OK for Start. Tap Back for Z. Hold Back and press the D-pad for the C buttons, channel up for L, channel down for R. Hold Back alone for half a second to leave.';
     }
     return base + 'Channel up is A, channel down is B. Tap OK for Start. Hold Back alone for half a second to leave. Double tap channel down to hold run on or off.';
   }
@@ -672,6 +675,25 @@
       });
       return;
     }
+    // Nintendo 64 runs on the native player (real ARM code with a
+    // graphics bridge, not the browser): export the game file to the
+    // app and hand it over, with the core picked on the game's
+    // Options screen (Parallel N64 by default).
+    if (game.system === 'n64') {
+      showScreen('player');
+      setPlayingBridge(true);
+      $('nowPlaying').textContent = 'Loading ' + game.title + '…';
+      announce('Loading ' + game.title + ' on the native player. ' + controlSummary('n64'));
+      exportGameForNative(game).then(function () {
+        // The native player Activity is now in front.
+      }).catch(function (err) {
+        setPlayingBridge(false);
+        $('nowPlaying').textContent = 'Could not start ' + game.title + '.';
+        announce('Could not start ' + game.title + '. ' + (err && err.message ? err.message : ''));
+        try { if (window.LynxosRetro && window.LynxosRetro.nativeCancel) window.LynxosRetro.nativeCancel(); } catch (e) {}
+      });
+      return;
+    }
     var isCloud = !!game.storagePath;
     if (isCloud) {
       // Show the player screen now so the download has somewhere
@@ -692,7 +714,6 @@
       setPlayingBridge(true);
       $('nowPlaying').textContent = 'Now playing: ' + game.title + ' (' + systemLabel(game.system) + ')';
       var speedNote = '';
-      if (game.system === 'n64') speedNote = ' Running at native resolution for smoother play.';
       if (game.system === 'psx') speedNote = ' Frameskip is on auto for smoother play.';
       announce('Now playing ' + game.title + ', ' + systemLabel(game.system) + '.' + speedNote + ' ' + controlSummary(game.system));
       window.EJS_player = '#game';
@@ -712,55 +733,6 @@
       // core settings file, so core options go here too — but only
       // IDs verified in the bundled core itself (see below).
       window.EJS_defaultOptions = { video_smooth: false };
-      if (game.system === 'n64') {
-        var n64Core = game.core || systemCore(game.system);
-        if (n64Core === 'parallel_n64') {
-          // Parallel N64 (v1.2.4): the other N64 engine, picked per
-          // game on its Options screen. Its build has NO GLideN64 —
-          // its video plugins are the older, lighter Glide64, glN64
-          // and Rice — so Glide64 is set here on purpose, at its
-          // fastest accuracy. Left alone the core would default to
-          // its heavy ParaLLEl renderer, which is slower than the
-          // current core. IDs verified in the bundled parallel_n64
-          // wasm; values/defaults from the core's own
-          // libretro_core_options.h (accuracy default medium on
-          // Android; RSP left on auto, which picks HLE).
-          window.EJS_defaultOptions['parallel-n64-gfxplugin'] = 'glide64';
-          window.EJS_defaultOptions['parallel-n64-gfxplugin-accuracy'] = 'low';
-        } else {
-          // N64 renders at its own native size (320x240 for 4:3,
-          // 640x360 for 16:9) instead of the TV's resolution — the
-          // biggest speed win on this box. v1.2.3 adds the low-end
-          // speed set: framebuffer emulation OFF (the single biggest
-          // extra win on weak GPUs; a few games may show a wrong-looking
-          // effect), threaded renderer ON (spreads GLideN64 across the
-          // box's cores), bilinear mode 3point (the real N64's own
-          // filtering, cheaper than standard), and frame duplication ON
-          // (re-shows the last frame instead of juddering when the box
-          // falls behind). v1.2.4 adds the last untried settings:
-          // detail (LOD) calculation OFF, color and depth buffer
-          // copies OFF (both trade some effects for speed), and the
-          // timing counter at 1 (the fastest value, what the core's
-          // Fullspeed mode enforces — it can break timing in some
-          // games). All IDs verified in the bundled
-          // mupen64plus_next wasm; values/defaults from the core's own
-          // libretro_core_options.h (FBEmu default True, threaded
-          // renderer default False, bilinear default standard, frame
-          // duping default False, LOD default True, color copy
-          // default TripleBuffer, depth copy default Software,
-          // CountPerOp default 0).
-          window.EJS_defaultOptions['mupen64plus-43screensize'] = '320x240';
-          window.EJS_defaultOptions['mupen64plus-169screensize'] = '640x360';
-          window.EJS_defaultOptions['mupen64plus-EnableFBEmulation'] = 'False';
-          window.EJS_defaultOptions['mupen64plus-ThreadedRenderer'] = 'True';
-          window.EJS_defaultOptions['mupen64plus-BilinearMode'] = '3point';
-          window.EJS_defaultOptions['mupen64plus-FrameDuping'] = 'True';
-          window.EJS_defaultOptions['mupen64plus-EnableLODEmulation'] = 'False';
-          window.EJS_defaultOptions['mupen64plus-EnableCopyColorToRDRAM'] = 'Off';
-          window.EJS_defaultOptions['mupen64plus-EnableCopyDepthToRDRAM'] = 'Off';
-          window.EJS_defaultOptions['mupen64plus-CountPerOp'] = '1';
-        }
-      }
       if (game.system === 'psx') {
         // PlayStation: frameskip on auto_threshold — the core watches
         // its own audio buffer and drops a frame whenever the buffer
@@ -927,9 +899,11 @@
     });
   }
 
-  // Sends a PlayStation game to the native player, 1 MB at a time
-  // through the bridge, with spoken progress. The bridge launches the
-  // player when the last chunk lands.
+  // Sends a PlayStation or Nintendo 64 game to the native player,
+  // 1 MB at a time through the bridge, with spoken progress. The
+  // bridge launches the player when the last chunk lands. For N64
+  // the game's Options-screen core choice goes along too (Parallel
+  // N64 unless Mupen was picked).
   function exportGameForNative(game) {
     var CHUNK = 1024 * 1024;
     var announced = { 25: false, 50: false, 75: false };
@@ -951,6 +925,9 @@
       if (!blob) throw new Error('Could not load ' + game.title + '.');
       var begin = window.LynxosRetro.nativeBegin(game.title, game.system, blob.size);
       if (begin !== 'ok') throw new Error(begin);
+      if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
+        window.LynxosRetro.nativeSetCore(game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+      }
       var offset = 0;
       function next() {
         if (offset >= blob.size) {
@@ -2216,7 +2193,7 @@
     $('editSystem').value = game.system;
     if (game.system === 'n64') {
       $('editCoreWrap').hidden = false;
-      $('editCore').value = (game.core === 'parallel_n64') ? 'parallel_n64' : 'mupen64plus_next';
+      $('editCore').value = (game.core === 'mupen64plus_next') ? 'mupen64plus_next' : 'parallel_n64';
     } else {
       $('editCoreWrap').hidden = true;
     }
@@ -2237,8 +2214,9 @@
       return;
     }
     var core = systemCore(system);
-    if (system === 'n64' && $('editCore').value === 'parallel_n64') {
-      core = 'parallel_n64';
+    if (system === 'n64') {
+      // Parallel N64 is the default; Mupen is the per-game alternative.
+      core = ($('editCore').value === 'mupen64plus_next') ? 'mupen64plus_next' : 'parallel_n64';
     }
     if (game.source === 'local') {
       var found = null;
