@@ -105,6 +105,15 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private lateinit var surfaceView: SurfaceView
+    private lateinit var rootLayout: FrameLayout
+
+    // The game's picture shape (width / height), from the core's AV
+    // geometry once the game is loaded. Starts at 4:3 — the shape of
+    // nearly every N64 game — so the first fit (before the core
+    // loads) is already right in practice. Written on the core
+    // thread, read on the UI thread.
+    @Volatile
+    private var gameAspect = 4f / 3f
     private var audioTrack: AudioTrack? = null
     private var coreThread: Thread? = null
     private val running = AtomicBoolean(false)
@@ -272,6 +281,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeRunFrame(): Boolean
     private external fun nativeGetFps(): Double
     private external fun nativeGetSampleRate(): Double
+    private external fun nativeGetAspectRatio(): Float
     private external fun nativeSetButton(id: Int, pressed: Boolean)
     private external fun nativeSetAnalog(index: Int, x: Int, y: Int)
     private external fun nativeGetLastError(): String
@@ -296,10 +306,50 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+        // The screen size changed (rotation / resize): re-fit the
+        // game surface to the screen. The EGL window surface tracks
+        // the SurfaceView's size, so no context recreation is needed.
+        fitGameSurface()
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
         nativeSetSurface(null)
+    }
+
+    /** Size the game SurfaceView to the game's picture shape, fitted
+     * inside the screen and centered (v1.4.10). The core draws its
+     * own 4:3 frame bottom-anchored into whatever window it is
+     * given, so a full-screen portrait window left the picture at
+     * the bottom with black above it. A window already shaped to
+     * the picture fills completely, and centering it puts the black
+     * bars evenly around it instead of all on one side. The fit
+     * runs early (before the core loads) so the EGL surface is
+     * already the right size when the core's GL init runs; it runs
+     * again when the game loads (real aspect from AV geometry) and
+     * on every surface size change. The touch overlay is positioned
+     * against the full screen and is untouched by this — only the
+     * SurfaceView moves. */
+    private fun fitGameSurface() {
+        if (!::rootLayout.isInitialized || !::surfaceView.isInitialized) return
+        val sw = rootLayout.width
+        val sh = rootLayout.height
+        if (sw <= 0 || sh <= 0) return
+        val aspect = if (gameAspect > 0) gameAspect else 4f / 3f
+        // Fit inside the screen: width-limited when the screen is
+        // narrower than the picture shape, height-limited otherwise.
+        val w: Int
+        val h: Int
+        if (sw.toFloat() / sh.toFloat() > aspect) {
+            h = sh
+            w = (sh * aspect).toInt()
+        } else {
+            w = sw
+            h = (sw / aspect).toInt()
+        }
+        val lp = surfaceView.layoutParams as? FrameLayout.LayoutParams
+        if (lp != null && lp.width == w && lp.height == h) return
+        surfaceView.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
+        Log.i(TAG, "fit game surface ${w}x$h in ${sw}x$sh (aspect $aspect)")
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -320,6 +370,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         }
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         val root = FrameLayout(this)
+        rootLayout = root
         root.setBackgroundColor(Color.BLACK)
         surfaceView = SurfaceView(this)
         // NO background on the SurfaceView itself: an opaque
@@ -334,6 +385,11 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         setContentView(root)
         addTouchOverlay(root)
+        // First fit, as soon as the screen is measured: the core's
+        // GL init runs during load, so the surface must already be
+        // the right size by then. surfaceChanged re-fits as well,
+        // so a not-yet-measured root here is harmless.
+        root.post { fitGameSurface() }
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -374,6 +430,17 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 if (!nativeLoadGame(gamePath, gameTitle)) {
                     throw IllegalStateException(lastErrorOr("The game could not be loaded."))
                 }
+                // The game's real picture shape is known now (AV
+                // geometry); re-fit the screen to it. Most games are
+                // 4:3, the default used for the first fit, so this
+                // usually changes nothing.
+                try {
+                    val aspect = nativeGetAspectRatio()
+                    if (aspect > 0) gameAspect = aspect
+                } catch (e: Exception) {
+                    Log.w(TAG, "aspect read failed", e)
+                }
+                runOnUiThread { fitGameSurface() }
                 val fps = nativeGetFps().let { if (it > 0) it else 60.0 }
                 val sampleRate = nativeGetSampleRate().let { if (it > 0) it.toInt() else 44100 }
                 runOnUiThread { startAudio(sampleRate) }
