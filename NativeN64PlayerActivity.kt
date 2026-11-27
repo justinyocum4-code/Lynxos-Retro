@@ -31,6 +31,7 @@ import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Native Nintendo 64 player (milestone M1 of the native-player project).
@@ -75,6 +76,11 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val START_WATCHDOG_MS = 30_000L
         private const val VIDEO_CHECK_MS = 5_000L
+        // Audio queue cap (v1.4.11): the speaker should never fall
+        // behind the core (the core is the slow side), so 8 batches
+        // is far more than enough; if it ever fills, the oldest
+        // batch is dropped instead of growing latency without bound.
+        private const val AUDIO_QUEUE_MAX_BATCHES = 8
         private const val Z_TAP_MS = 100L
         // A TalkBack double-tap (click) cannot hold a button, so it
         // does a short timed tap instead of a hold.
@@ -115,6 +121,30 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     @Volatile
     private var gameAspect = 4f / 3f
     private var audioTrack: AudioTrack? = null
+    // Audio queue (v1.4.11): the core thread OFFERS batches here and
+    // never blocks on the speaker; a dedicated audio thread drains
+    // them. The old code wrote with WRITE_BLOCKING on the core
+    // thread, so a full speaker buffer stalled the next frame and
+    // turned a small speed deficit into constant static. The JNI
+    // bridge allocates a fresh ShortArray per batch, so holding the
+    // reference in the queue is safe — no array is ever reused.
+    private val audioLock = Object()
+    private val audioQueue = ArrayDeque<ShortArray>()
+    private var audioThread: Thread? = null
+    private val audioRunning = AtomicBoolean(false)
+    // The sample rate the current track was built at. Written on the
+    // UI thread (startAudio), read on the core thread (rate check).
+    @Volatile
+    private var currentAudioRate = 0
+    // Audio diagnostics (v1.4.11): counted on the core/audio
+    // threads, sampled once a second for the page's audio line.
+    private val audioBatchesReceived = AtomicLong(0)
+    private val audioFramesReceived = AtomicLong(0)
+    private var audioUnderrunsTotal = 0L
+    private var audioLastUnderrunCount = 0
+    private var diagFramesRun = 0L
+    private var diagWindowStartNanos = 0L
+    private var audioRateCheckUntilNanos = 0L
     private var coreThread: Thread? = null
     private val running = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
@@ -289,12 +319,77 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeGetFramesPresented(): Long
     private external fun nativeClose()
 
-    /** Called from the native bridge on the core thread with one audio batch. */
+    /** Called from the native bridge on the core thread with one audio batch.
+     * Offers the batch into the queue and returns immediately — the
+     * core thread must never block on the speaker (v1.4.11). */
     fun onAudioBatch(samples: ShortArray, frames: Int) {
+        audioBatchesReceived.incrementAndGet()
+        audioFramesReceived.addAndGet(frames.toLong())
+        synchronized(audioLock) {
+            while (audioQueue.size >= AUDIO_QUEUE_MAX_BATCHES) audioQueue.removeFirst()
+            audioQueue.addLast(samples)
+            audioLock.notifyAll()
+        }
+    }
+
+    /** The audio drain thread (v1.4.11): takes batches off the queue
+     * and writes them to the speaker. This is the only place a
+     * blocking AudioTrack write happens, on a thread raised to audio
+     * priority — never on the core thread. */
+    private fun startAudioDrain() {
+        // Capture the track: a later rate reopen builds a new one,
+        // and this thread must keep writing only to the track it
+        // started with (a write on a released track just errors).
+        val track = audioTrack
+        audioRunning.set(true)
+        val t = Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+            while (audioRunning.get()) {
+                val batch: ShortArray? = synchronized(audioLock) {
+                    while (audioQueue.isEmpty() && audioRunning.get()) {
+                        try {
+                            audioLock.wait(100)
+                        } catch (e: InterruptedException) {
+                        }
+                    }
+                    if (audioQueue.isNotEmpty()) audioQueue.removeFirst() else null
+                }
+                if (batch != null) {
+                    try {
+                        track?.write(batch, 0, batch.size, AudioTrack.WRITE_BLOCKING)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "audio write failed", e)
+                    }
+                }
+            }
+        }, "lynxos-n64-audio")
+        audioThread = t
+        t.start()
+    }
+
+    private fun stopAudioDrain() {
+        audioRunning.set(false)
+        val t = audioThread
+        audioThread = null
+        if (t != null) {
+            t.interrupt()
+            synchronized(audioLock) { audioLock.notifyAll() }
+            try {
+                t.join(500)
+            } catch (e: Exception) {
+            }
+        }
+        synchronized(audioLock) { audioQueue.clear() }
+    }
+
+    /** Forwards one audio-diagnostics line to the page (same
+     * prefs-backed pattern as the Last-game line); MainActivity owns
+     * the storage, this just forwards. */
+    private fun reportAudioDiag(text: String) {
         try {
-            audioTrack?.write(samples, 0, frames * 2, AudioTrack.WRITE_BLOCKING)
+            MainActivity.reportN64AudioDiag(text)
         } catch (e: Exception) {
-            Log.w(TAG, "audio write failed", e)
+            Log.w(TAG, "report audio diag failed", e)
         }
     }
 
@@ -449,6 +544,12 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 setLoadStage("running")
                 mainHandler.removeCallbacks(startWatchdog)
                 mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
+                // Audio diagnostics window (v1.4.11): the frame
+                // count in each 1-second window is the real
+                // emulation speed; the rate check runs for the
+                // first 5 seconds only.
+                diagWindowStartNanos = System.nanoTime()
+                audioRateCheckUntilNanos = diagWindowStartNanos + 5_000_000_000L
                 val frameNanos = (1_000_000_000.0 / fps).toLong()
                 while (running.get()) {
                     val t0 = System.nanoTime()
@@ -463,6 +564,57 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                             finishPlayerDelayed()
                         }
                         break
+                    }
+                    // Diagnostics once a second (v1.4.11): actual
+                    // frame rate, underrun count, average batch
+                    // size — the numbers that prove whether the
+                    // static is the core running slow. The line
+                    // goes to the page (and logcat), never spoken.
+                    diagFramesRun++
+                    val nowNanos = System.nanoTime()
+                    if (nowNanos - diagWindowStartNanos >= 1_000_000_000L) {
+                        val elapsedSec = (nowNanos - diagWindowStartNanos) / 1_000_000_000.0
+                        val actualFps = (diagFramesRun / elapsedSec).toInt()
+                        // Underruns are cumulative since the track
+                        // was built; keep a running total so a rate
+                        // reopen (new track, counter reset) cannot
+                        // make the number drop.
+                        try {
+                            val cur = audioTrack?.underrunCount ?: 0
+                            if (cur > audioLastUnderrunCount) audioUnderrunsTotal += (cur - audioLastUnderrunCount).toLong()
+                            audioLastUnderrunCount = cur
+                        } catch (e: Exception) {
+                        }
+                        val batches = audioBatchesReceived.get()
+                        val frames = audioFramesReceived.get()
+                        val avgBatch = if (batches > 0) (frames / batches).toInt() else 0
+                        val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz"
+                        Log.i(TAG, "audio diag: $diag")
+                        reportAudioDiag(diag)
+                        diagFramesRun = 0
+                        diagWindowStartNanos = nowNanos
+                        // Rate renegotiation (v1.4.11): the rate is
+                        // read once at load, before the game has
+                        // programmed its DAC rate. Re-read for the
+                        // first 5 seconds and reopen the track ONLY
+                        // when the change is real (>1%): Mario 64's
+                        // 32040 -> 32000 is noise, not a new rate,
+                        // but a game programming 44100 or 22050
+                        // would otherwise play at the wrong pitch
+                        // with chronic underrun.
+                        if (nowNanos < audioRateCheckUntilNanos) {
+                            try {
+                                val rate = nativeGetSampleRate().toInt()
+                                if (rate in 8000..192000 && currentAudioRate > 0 &&
+                                    Math.abs(rate - currentAudioRate) > currentAudioRate / 100
+                                ) {
+                                    Log.i(TAG, "audio rate changed $currentAudioRate -> $rate, reopening track")
+                                    runOnUiThread { startAudio(rate) }
+                                }
+                            } catch (e: Exception) {
+                                Log.w(TAG, "audio rate re-read failed", e)
+                            }
+                        }
                     }
                     val spent = System.nanoTime() - t0
                     val sleepNanos = frameNanos - spent
@@ -578,7 +730,24 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun startAudio(sampleRate: Int) {
+        // The start is posted to the UI thread; if the player
+        // already finished (load failed, early exit), there is no
+        // track to build — a late start must not resurrect one.
+        if (closed.get()) return
         try {
+            // A restart (rate renegotiation) shuts the old drain
+            // down and releases the old track first: old-rate
+            // samples must never play at the new rate.
+            stopAudioDrain()
+            try {
+                audioTrack?.stop()
+            } catch (e: Exception) {
+            }
+            try {
+                audioTrack?.release()
+            } catch (e: Exception) {
+            }
+            audioTrack = null
             val minBuf = AudioTrack.getMinBufferSize(
                 sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
             audioTrack = AudioTrack.Builder()
@@ -599,7 +768,16 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 .setBufferSizeInBytes(Math.max(minBuf * 8, sampleRate * 4 / 5))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+            currentAudioRate = sampleRate
+            // Pre-fill ~100 ms of silence before play(): the first
+            // real batches arrive while the track spins up, and
+            // without this the track underruns on the very first
+            // sound. The write returns at once (the buffer is
+            // empty), so this does not stall the UI thread.
+            val silence = ShortArray(sampleRate / 10 * 2)
+            audioTrack?.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
             audioTrack?.play()
+            startAudioDrain()
         } catch (e: Exception) {
             Log.w(TAG, "Could not start audio", e)
         }
@@ -1045,6 +1223,10 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
             coreThread?.join(1000)
         } catch (e: Exception) {
         }
+        // Stop the audio drain first (v1.4.11): it is the only other
+        // thread touching the track, and it must be gone before the
+        // track is released.
+        stopAudioDrain()
         try {
             audioTrack?.stop()
         } catch (e: Exception) {
