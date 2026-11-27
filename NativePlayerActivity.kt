@@ -192,9 +192,13 @@ class NativePlayerActivity : Activity() {
                 startLoop(fps)
             } catch (e: Exception) {
                 Log.e(TAG, "Could not start $gameTitle", e)
+                // Speak the reason, like the N64 player does: a bare
+                // "Could not start" leaves Justin guessing. libretro-kmp
+                // throws with the load failure as its message.
+                val reason = e.message?.takeIf { it.isNotBlank() } ?: "The game could not be started."
                 runOnUiThread {
                     Toast.makeText(this, "Could not start $gameTitle.", Toast.LENGTH_LONG).show()
-                    speak("Could not start $gameTitle.")
+                    speak("Could not start $gameTitle. $reason")
                     finish()
                 }
             }

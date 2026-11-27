@@ -669,9 +669,17 @@
         // The native player Activity is now in front.
       }).catch(function (err) {
         setPlayingBridge(false);
+        // Same failure pattern as the download path: visible text,
+        // spoken through BOTH live regions (the assertive one is
+        // read right away — the polite one alone was missed), then
+        // back to the library instead of sitting on the blank
+        // player screen.
+        var text = 'Could not start ' + game.title + '. ' + (err && err.message ? err.message : '');
         $('nowPlaying').textContent = 'Could not start ' + game.title + '.';
-        announce('Could not start ' + game.title + '. ' + (err && err.message ? err.message : ''));
+        announce(text);
+        announceUrgent(text);
         try { if (window.LynxosRetro && window.LynxosRetro.nativeCancel) window.LynxosRetro.nativeCancel(); } catch (e) {}
+        showScreen('library');
       });
       return;
     }
@@ -688,9 +696,17 @@
         // The native player Activity is now in front.
       }).catch(function (err) {
         setPlayingBridge(false);
+        // Same failure pattern as the download path: visible text,
+        // spoken through BOTH live regions (the assertive one is
+        // read right away — the polite one alone was missed), then
+        // back to the library instead of sitting on the blank
+        // player screen.
+        var text = 'Could not start ' + game.title + '. ' + (err && err.message ? err.message : '');
         $('nowPlaying').textContent = 'Could not start ' + game.title + '.';
-        announce('Could not start ' + game.title + '. ' + (err && err.message ? err.message : ''));
+        announce(text);
+        announceUrgent(text);
         try { if (window.LynxosRetro && window.LynxosRetro.nativeCancel) window.LynxosRetro.nativeCancel(); } catch (e) {}
+        showScreen('library');
       });
       return;
     }
@@ -944,9 +960,10 @@
   // player unpacks archives itself; for the native path the page
   // unpacks first, with the very same extractor scripts EmulatorJS
   // ships (assets/emulatorjs/data/compression/) and the same worker
-  // protocol it uses: fetch the worker script as text, run it in a
-  // Worker, post the archive bytes, collect the t:2 file messages
-  // until t:1. No new dependency. RAR needs the wrapper EmulatorJS
+  // protocol it uses: load the worker script as text (XMLHttpRequest
+  // — fetch() for file:// assets is unproven in this WebView), run
+  // it in a Worker, post the archive bytes, collect the t:2 file
+  // messages until t:1. No new dependency. RAR needs the wrapper EmulatorJS
   // builds around libunrar.js (see extractArchive); 7z and zip run
   // their scripts as-is, exactly as EmulatorJS posts to them.
   function archiveTypeOf(head) {
@@ -996,10 +1013,37 @@
     });
   }
 
-  function fetchText(url) {
-    return fetch(url).then(function (r) {
-      if (!r.ok) throw new Error('Could not load ' + url + '.');
-      return r.text();
+  // Load a bundled local file with XMLHttpRequest, not fetch():
+  // fetch() for file:// assets is unproven in this WebView, while
+  // XHR from a file:// page is the mechanism that has always worked
+  // here. Same failure contract as the old loader: reject with a
+  // plain-language error naming the file that could not be loaded.
+  // file:// loads report status 0 on success, so 0 counts as OK.
+  function xhrText(url) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'text';
+      xhr.onload = function () {
+        if (xhr.status === 200 || xhr.status === 0) resolve(xhr.responseText);
+        else reject(new Error('Could not load ' + url + '.'));
+      };
+      xhr.onerror = function () { reject(new Error('Could not load ' + url + '.')); };
+      xhr.send();
+    });
+  }
+
+  function xhrArrayBuffer(url, errorMessage) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      xhr.responseType = 'arraybuffer';
+      xhr.onload = function () {
+        if (xhr.status === 200 || xhr.status === 0) resolve(xhr.response);
+        else reject(new Error(errorMessage || ('Could not load ' + url + '.')));
+      };
+      xhr.onerror = function () { reject(new Error(errorMessage || ('Could not load ' + url + '.'))); };
+      xhr.send();
     });
   }
 
@@ -1010,9 +1054,9 @@
     var base = 'assets/emulatorjs/data/compression/';
     var scriptPromise;
     if (type === '7z') {
-      scriptPromise = fetchText(base + 'extract7z.js');
+      scriptPromise = xhrText(base + 'extract7z.js');
     } else if (type === 'zip') {
-      scriptPromise = fetchText(base + 'extractzip.js');
+      scriptPromise = xhrText(base + 'extractzip.js');
     } else {
       // RAR: EmulatorJS's wrapper around libunrar.js. The wrapper
       // sets Module (monitorRunDependencies runs unrar once the
@@ -1021,11 +1065,8 @@
       // the archive tree posting t:2 per file and t:1 at the end,
       // and an onmessage that collects the posted archive bytes.
       scriptPromise = Promise.all([
-        fetchText(base + 'libunrar.js'),
-        fetch(base + 'libunrar.wasm').then(function (r) {
-          if (!r.ok) throw new Error('Could not load libunrar.wasm.');
-          return r.arrayBuffer();
-        })
+        xhrText(base + 'libunrar.js'),
+        xhrArrayBuffer(base + 'libunrar.wasm', 'Could not load libunrar.wasm.')
       ]).then(function (parts) {
         var wasmUrl = URL.createObjectURL(new Blob([parts[1]], { type: 'application/wasm' }));
         return 'let dataToPass = [];\n' +
@@ -1308,7 +1349,17 @@
       $('nowPlaying').textContent = 'Extracting ' + game.title + ', ' + percent + ' percent.';
     }).then(function (files) {
       var picked = pickNativeFiles(game.system, files);
-      if (!picked) throw new Error('No playable game file inside ' + (game.fileName || game.title) + '.');
+      if (!picked) {
+        // Name what the archive actually holds, so the failure is
+        // diagnosable instead of a bare "no playable file": a disc
+        // set with an odd extension, or a readme-only archive, shows
+        // up in the reason instead of guessing.
+        var names = Object.keys(files);
+        var listed = names.slice(0, 5).join(', ');
+        if (names.length > 5) listed += ', and ' + (names.length - 5) + ' more.';
+        throw new Error('No playable game file inside ' + (game.fileName || game.title) +
+          '. It contains: ' + (listed || 'nothing') + '.');
+      }
       var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
       if (begin !== 'ok') throw new Error(begin);
       if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
