@@ -887,15 +887,52 @@
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
       reader.onload = function () {
-        var bytes = new Uint8Array(reader.result);
-        var CH = 32768, out = '';
-        for (var i = 0; i < bytes.length; i += CH) {
-          out += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+        // A throw in here (btoa on a bad chunk, say) used to escape
+        // the promise entirely: an uncaught exception in a FileReader
+        // callback leaves the promise unsettled forever and the send
+        // loop silent. Reject instead, so the caller can speak it.
+        try {
+          var bytes = new Uint8Array(reader.result);
+          var CH = 32768, out = '';
+          for (var i = 0; i < bytes.length; i += CH) {
+            out += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+          }
+          resolve(btoa(out));
+        } catch (e) {
+          reject(e);
         }
-        resolve(btoa(out));
       };
       reader.onerror = function () { reject(reader.error); };
       reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  // One chunk's FileReader read, with a stall timer. A read that
+  // neither resolves nor rejects in 30 s is stuck (a 1 MB read takes
+  // well under a second on a working device), and the send loop
+  // would otherwise sit on "Preparing... 75 percent" forever saying
+  // nothing. NOTE: this only covers the async FileReader step. A
+  // hang inside the synchronous nativeChunk bridge call blocks the
+  // JS thread itself, so no timer can fire for that.
+  function blobToBase64Timed(blob, timeoutMs, stallError) {
+    return new Promise(function (resolve, reject) {
+      var settled = false;
+      var timer = setTimeout(function () {
+        if (settled) return;
+        settled = true;
+        reject(stallError);
+      }, timeoutMs);
+      blobToBase64(blob).then(function (b64) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(b64);
+      }, function (err) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      });
     });
   }
 
@@ -932,7 +969,13 @@
   function readBlobHead(blob) {
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
-      reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+      reader.onload = function () {
+        try {
+          resolve(new Uint8Array(reader.result));
+        } catch (e) {
+          reject(e);
+        }
+      };
       reader.onerror = function () { reject(reader.error); };
       reader.readAsArrayBuffer(blob.slice(0, 10));
     });
@@ -941,7 +984,13 @@
   function blobToBytes(blob) {
     return new Promise(function (resolve, reject) {
       var reader = new FileReader();
-      reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+      reader.onload = function () {
+        try {
+          resolve(new Uint8Array(reader.result));
+        } catch (e) {
+          reject(e);
+        }
+      };
       reader.onerror = function () { reject(reader.error); };
       reader.readAsArrayBuffer(blob);
     });
@@ -1031,13 +1080,26 @@
           return;
         }
         var done = false;
+        var stallTimer = null;
+        // Extraction stall watchdog: if the worker posts nothing
+        // (no file, no progress, no done) for 60 s, it is stuck
+        // and the player must say so instead of sitting on
+        // "Extracting..." forever. Any message resets the timer.
+        function armStallTimer() {
+          if (stallTimer !== null) clearTimeout(stallTimer);
+          stallTimer = setTimeout(function () {
+            finish(new Error('Extracting ' + title + ' stalled.'));
+          }, 60000);
+        }
         function finish(err, result) {
           if (done) return;
           done = true;
+          if (stallTimer !== null) clearTimeout(stallTimer);
           try { worker.terminate(); } catch (e) {}
           if (err) reject(err); else resolve(result);
         }
         worker.onmessage = function (e) {
+          armStallTimer();
           var d = e.data;
           if (!d) return;
           if (d.t === 4) {
@@ -1053,6 +1115,7 @@
         worker.onerror = function () {
           finish(new Error('Could not unpack ' + title + '.'));
         };
+        armStallTimer();
         worker.postMessage(bytes);
       });
     });
@@ -1205,12 +1268,20 @@
     var offset = 0;
     function next() {
       if (offset >= blob.size) {
+        // The send is done; the player takes it from here. Say so
+        // out loud: if Justin hears this and then silence, the hang
+        // is in the player; if he never hears it, the hang was in
+        // the send loop above. Without this line the two layers are
+        // indistinguishable — both look like "Preparing... 75%".
+        $('nowPlaying').textContent = 'Sending done, starting ' + game.title + '.';
+        announce('Sending done, starting ' + game.title + '.');
         var end = window.LynxosRetro.nativeEnd();
         if (end !== 'ok') throw new Error(end);
         return Promise.resolve();
       }
       var slice = blob.slice(offset, offset + CHUNK);
-      return blobToBase64(slice).then(function (b64) {
+      return blobToBase64Timed(slice, 30000,
+          new Error('Preparing ' + game.title + ' stalled while sending.')).then(function (b64) {
         var r = window.LynxosRetro.nativeChunk(b64);
         if (r !== 'ok') throw new Error(r);
         offset += slice.size;
@@ -1272,7 +1343,8 @@
             return Promise.resolve();
           }
           var slice = fileBlob.slice(offset, offset + CHUNK);
-          return blobToBase64(slice).then(function (b64) {
+          return blobToBase64Timed(slice, 30000,
+              new Error('Sending ' + name + ' stalled.')).then(function (b64) {
             var r = window.LynxosRetro.nativeChunk(b64);
             if (r !== 'ok') throw new Error(r);
             offset += slice.size;
@@ -1291,6 +1363,10 @@
       return chain.then(function () {
         var m = window.LynxosRetro.nativeSetMainFile(picked.main);
         if (m !== 'ok') throw new Error(m);
+        // Same handoff line as the single-file path: heard, the
+        // hang is in the player; never heard, it was in the send.
+        $('nowPlaying').textContent = 'Sending done, starting ' + game.title + '.';
+        announce('Sending done, starting ' + game.title + '.');
         var end = window.LynxosRetro.nativeEnd();
         if (end !== 'ok') throw new Error(end);
       });
