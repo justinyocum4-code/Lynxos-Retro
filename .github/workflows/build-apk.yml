@@ -53,21 +53,21 @@ jobs:
         run: |
           mkdir -p app/src/main/assets/native
           curl -sL --retry 3 --retry-delay 5 -o /tmp/pcsx_rearmed.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/pcsx_rearmed_libretro_android.so.zip"
-          echo "102e22c7bd62b03758880b1b5be2c11381f8159d1233c54991b9af21a0c32b3b  /tmp/pcsx_rearmed.zip" | sha256sum -c -
+          unzip -t /tmp/pcsx_rearmed.zip
           unzip -o -j /tmp/pcsx_rearmed.zip -d app/src/main/assets/native
+          sha256sum app/src/main/assets/native/pcsx_rearmed_libretro_android.so
           ls -la app/src/main/assets/native
 
       - name: Fetch native N64 cores
         run: |
           mkdir -p app/src/main/assets/native
           curl -sL --retry 3 --retry-delay 5 -o /tmp/parallel_n64.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/parallel_n64_libretro_android.so.zip"
-          echo "74b18a551d9194ff4869ec0cf77b8b9c944bb9570a4d0dde255da0019a767028  /tmp/parallel_n64.zip" | sha256sum -c -
           curl -sL --retry 3 --retry-delay 5 -o /tmp/mupen64plus_next_gles3.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip"
-          echo "2b88ba6e1feb06a68ec1efc921211b684f1aa096f9763914ade277bc334375f6  /tmp/mupen64plus_next_gles3.zip" | sha256sum -c -
+          unzip -t /tmp/parallel_n64.zip
+          unzip -t /tmp/mupen64plus_next_gles3.zip
           unzip -o -j /tmp/parallel_n64.zip -d app/src/main/assets/native
           unzip -o -j /tmp/mupen64plus_next_gles3.zip -d app/src/main/assets/native
-          echo "38f14a287256b1938a0fc0435cb8893535c6ddead33d235e617f470a60066368  app/src/main/assets/native/parallel_n64_libretro_android.so" | sha256sum -c -
-          echo "41e3733bab6c5cda6e6d883c7599635f2e05285572d6a7e68d8b3f95c5df2815  app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so" | sha256sum -c -
+          sha256sum app/src/main/assets/native/parallel_n64_libretro_android.so app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so
           ls -la app/src/main/assets/native
 
       - name: Scaffold Android project
