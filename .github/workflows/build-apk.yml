@@ -448,6 +448,22 @@ jobs:
                   }
               }
 
+              /* Audio diagnostics (v1.4.11): the N64 player reports
+                 once a second — actual frame rate, underrun count,
+                 average batch size, sample rate. Static here on
+                 MainActivity (not on the LynxosBridge inner class)
+                 so the Kotlin player can call it as
+                 MainActivity.reportN64AudioDiag. */
+              private static final String N64_AUDIO_DIAG_KEY = "lastN64AudioDiag";
+              public static void reportN64AudioDiag(String text) {
+                  try {
+                      MainActivity a = instance;
+                      if (a == null || text == null) return;
+                      a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                          .putString(N64_AUDIO_DIAG_KEY, text).apply();
+                  } catch (Exception ignored) {}
+              }
+
               /* Silent-death marker (v1.4.5): the player Activity
                  sets this when it launches; a clean exit or a
                  reported outcome clears it. If MainActivity comes
@@ -605,22 +621,14 @@ jobs:
                   }
 
                   /* Audio diagnostics (v1.4.11): the N64 player
-                     reports once a second — actual frame rate,
-                     underrun count, average batch size, sample
-                     rate. Same prefs-backed pattern as the
-                     Last-game line: the page shows the latest line
-                     on the library screen (it names the game, so a
-                     line from the previous session is still
-                     readable), and Dismiss clears it. */
-                  private static final String N64_AUDIO_DIAG_KEY = "lastN64AudioDiag";
-                  public static void reportN64AudioDiag(String text) {
-                      try {
-                          MainActivity a = instance;
-                          if (a == null || text == null) return;
-                          a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
-                              .putString(N64_AUDIO_DIAG_KEY, text).apply();
-                      } catch (Exception ignored) {}
-                  }
+                     reports once a second via
+                     MainActivity.reportN64AudioDiag (static, on
+                     MainActivity so the Kotlin player can call
+                     it); the page reads it here. Same prefs-backed
+                     pattern as the Last-game line: the page shows
+                     the latest line on the library screen (it names
+                     the game, so a line from the previous session
+                     is still readable), and Dismiss clears it. */
                   @JavascriptInterface
                   public String getLastN64AudioDiag() {
                       try {
