@@ -199,6 +199,8 @@ static char g_last_error[512] = "";
 static char g_system_dir[PATH_MAX] = "";
 static char g_save_dir[PATH_MAX] = "";
 static char g_game_path[PATH_MAX] = "";
+static void *g_game_data = NULL;   /* ROM bytes: kept until nativeClose (libretro contract) */
+static size_t g_game_size = 0;
 static char g_title[256] = "";
 
 static void set_error(const char *msg) {
@@ -959,10 +961,43 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadGame(JNIEnv *env, job
     const char *title = (*env)->GetStringUTFChars(env, jtitle, NULL);
     if (path) snprintf(g_game_path, sizeof g_game_path, "%s", path);
     if (title) snprintf(g_title, sizeof g_title, "%s", title);
+    /* The cores need the ROM itself, not just its path. Mupen
+     * declares need_fullpath=false, so it reads game->data: the
+     * NULL/0 we passed before gave it a 0-byte ROM, and its ROM
+     * parser runs on a buffer it assumes holds a header. Parallel
+     * declares need_fullpath=true and reads the file itself, so
+     * the path stays set too. The buffer lives until nativeClose:
+     * the libretro contract keeps game->data valid until unload. */
+    free(g_game_data);
+    g_game_data = NULL;
+    g_game_size = 0;
+    FILE *rom = fopen(g_game_path, "rb");
+    long rom_size = -1;
+    if (rom) {
+        if (fseek(rom, 0, SEEK_END) == 0) rom_size = ftell(rom);
+        if (rom_size > 0) {
+            fseek(rom, 0, SEEK_SET);
+            g_game_data = malloc((size_t)rom_size);
+            if (g_game_data && fread(g_game_data, 1, (size_t)rom_size, rom) != (size_t)rom_size) {
+                free(g_game_data);
+                g_game_data = NULL;
+            }
+        }
+        fclose(rom);
+    }
+    if (!g_game_data || rom_size <= 0) {
+        free(g_game_data);
+        g_game_data = NULL;
+        set_error(rom_size == 0 ? "The game file is empty." : "The game file could not be read.");
+        if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
+        if (title) (*env)->ReleaseStringUTFChars(env, jtitle, title);
+        return JNI_FALSE;
+    }
+    g_game_size = (size_t)rom_size;
     struct retro_game_info info;
     info.path = g_game_path;
-    info.data = NULL;
-    info.size = 0;
+    info.data = g_game_data;
+    info.size = g_game_size;
     info.meta = NULL;
     bool ok = g_retro_load_game(&info);
     if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
@@ -1147,6 +1182,9 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeClose(JNIEnv *env, jobjec
         dlclose(g_core_handle);
         g_core_handle = NULL;
     }
+    free(g_game_data);
+    g_game_data = NULL;
+    g_game_size = 0;
     if (g_activity_global) {
         (*env)->DeleteGlobalRef(env, g_activity_global);
         g_activity_global = NULL;

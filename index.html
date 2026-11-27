@@ -249,9 +249,13 @@
   // Called by MainActivity when a native player reports an outcome
   // on its way out. The player's own speech may be silent on the TV,
   // so the page says it through TalkBack instead. kind: 'failed',
-  // 'stopped', 'hang', 'novideo'. Players only report failures,
+  // 'stopped', 'hang', 'novideo', 'closed'. Players only report failures,
   // stops, hangs and no-picture warnings — a normal exit reports
   // nothing, so this is never called for a game that played fine.
+  // 'closed' is different: MainActivity sends it when the player
+  // died without reporting at all — no reason was ever recorded,
+  // so none is invented; the reason, when present, is the load
+  // stage it died in.
   window.handlePlayerOutcome = function (system, kind, reason) {
     var name = system === 'n64' ? 'Nintendo 64' : 'PlayStation';
     var text = '';
@@ -259,6 +263,7 @@
     else if (kind === 'stopped') text = 'The ' + name + ' game stopped. ' + (reason || '');
     else if (kind === 'hang') text = 'The ' + name + ' game took too long to start. ' + (reason || '');
     else if (kind === 'novideo') text = 'The ' + name + ' game was running but no picture was drawn. ' + (reason || '');
+    else if (kind === 'closed') text = 'The ' + name + ' game closed unexpectedly. ' + (reason || '');
     if (!text) return;
     if (kind === 'failed' || kind === 'hang') $('nowPlaying').textContent = text;
     announce(text);

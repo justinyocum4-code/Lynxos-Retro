@@ -1,7 +1,9 @@
 package com.lynxosretro.app
 
 import android.app.Activity
+import android.content.pm.PackageManager
 import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
 import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
@@ -11,13 +13,17 @@ import android.os.Handler
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.util.Log
+import android.view.Gravity
 import android.view.InputDevice
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
+import android.widget.Button
 import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.RelativeLayout
 import android.widget.Toast
 import java.io.File
 import java.io.FileOutputStream
@@ -44,7 +50,11 @@ import java.util.concurrent.atomic.AtomicBoolean
  * becomes the C buttons and channel-up/channel-down become L/R; holding
  * Back alone for half a second leaves the game. A standard gamepad
  * (Switch controller) works with its own buttons, no rotation: left
- * stick is the stick, right stick is the C buttons, L2 is Z.
+ * stick is the stick, right stick is the C buttons, L2 is Z. On a
+ * touchscreen device (the tablet) there is also an on-screen touch
+ * controller: D-pad bottom-left (stick + D-pad), A and B bottom-right,
+ * C buttons above them, Start bottom-centre, L, Z and R across the
+ * top. It is hidden on the TV, which has no touchscreen.
  *
  * In-game saves are stored as <title>.srm next to the PS1 saves, so
  * switching cores keeps them. The game pauses when the screen goes
@@ -66,6 +76,9 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val START_WATCHDOG_MS = 30_000L
         private const val VIDEO_CHECK_MS = 5_000L
         private const val Z_TAP_MS = 100L
+        // A TalkBack double-tap (click) cannot hold a button, so it
+        // does a short timed tap instead of a hold.
+        private const val TOUCH_TAP_MS = 150L
         private const val STICK_MAX = 32767
         private const val STICK_DEAD_ZONE = 0.15f
 
@@ -105,6 +118,17 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     // Remote D-pad keyCodes currently held. The D-pad drives the stick
     // (and, while Back is held, the C buttons) through refreshDpad().
     private val remoteDpadHeld = mutableSetOf<Int>()
+    // Touch D-pad directions currently held, as the same
+    // KEYCODE_DPAD_* tokens refreshDpad reads. The tablet is held
+    // upright, so the top touch button feeds the token for game Up
+    // (KEYCODE_DPAD_RIGHT in the sideways remote map). The union
+    // with remoteDpadHeld means holding the same direction on both
+    // inputs keeps it held until both let go.
+    private val touchDpadHeld = mutableSetOf<Int>()
+    // C buttons currently held by touch, and the ones the core
+    // already has pressed, so refreshTouchC releases exactly those.
+    private val touchCHeld = mutableSetOf<Int>()
+    private val touchCActive = mutableSetOf<Int>()
     // RetroPad buttons currently pressed by the D-pad, so refreshDpad
     // can release exactly those without touching gamepad buttons.
     private val dpadButtons = mutableSetOf<Int>()
@@ -124,6 +148,21 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     // read on the main thread by the watchdog.
     @Volatile
     private var loadStage = "starting the player"
+
+    // Load-stage breadcrumb that survives a process death: the
+    // in-memory loadStage dies with the process, so each stage is
+    // also written to SharedPreferences. If the player dies
+    // silently, MainActivity reads it back and the "closed"
+    // announcement can name the stage it died in.
+    private fun setLoadStage(stage: String) {
+        loadStage = stage
+        Log.i(TAG, "load stage: $stage")
+        try {
+            getSharedPreferences("lynxos-retro", MODE_PRIVATE).edit()
+                .putString("playerLoadStage", stage).apply()
+        } catch (e: Exception) {
+        }
+    }
     private var videoCheckDone = false
 
     private val exitRunnable = Runnable {
@@ -271,6 +310,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         root.addView(surfaceView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         setContentView(root)
+        addTouchOverlay(root)
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
@@ -289,31 +329,25 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         // so a hang is diagnosable by stage, not just by silence.
         coreThread = Thread {
             try {
-                loadStage = "starting the player"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("starting the player")
                 if (!nativeInit(this)) {
                     throw IllegalStateException(lastErrorOr("The Nintendo 64 player could not start."))
                 }
-                loadStage = "waiting for the game screen"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("waiting for the game screen")
                 if (!surfaceReady.await(5, TimeUnit.SECONDS)) {
                     throw IllegalStateException("The game screen was not ready.")
                 }
-                loadStage = "copying the game core"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("copying the game core")
                 val coreFile = ensureCoreFile(coreChoice)
                 val systemDir = File(filesDir, "native-system").apply { mkdirs() }.absolutePath
                 val saveDir = File(filesDir, "native-saves").apply { mkdirs() }.absolutePath
-                loadStage = "loading the game core"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("loading the game core")
                 if (!nativeLoadCore(coreFile.absolutePath, systemDir, saveDir)) {
                     throw IllegalStateException(lastErrorOr("The Nintendo 64 game core could not be loaded."))
                 }
-                loadStage = "setting game options"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("setting game options")
                 applyCoreOptions(coreChoice)
-                loadStage = "loading the game"
-                Log.i(TAG, "load stage: $loadStage")
+                setLoadStage("loading the game")
                 if (!nativeLoadGame(gamePath, gameTitle)) {
                     throw IllegalStateException(lastErrorOr("The game could not be loaded."))
                 }
@@ -322,6 +356,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 runOnUiThread { startAudio(sampleRate) }
                 speak("Now playing $gameTitle, Nintendo 64. " + controlSummary())
                 running.set(true)
+                setLoadStage("running")
                 mainHandler.removeCallbacks(startWatchdog)
                 mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
                 val frameNanos = (1_000_000_000.0 / fps).toLong()
@@ -349,7 +384,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                         }
                     }
                 }
-            } catch (e: Exception) {
+            } catch (e: Throwable) {
                 Log.e(TAG, "Could not start $gameTitle", e)
                 val reason = lastErrorOr(e.message ?: "Could not start $gameTitle.")
                 // The reason also goes back to the page: the
@@ -383,11 +418,14 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun controlSummary(): String {
-        return "Hold the remote sideways, top to the left. " +
+        val base = "Hold the remote sideways, top to the left. " +
             "The D-pad is the control stick, channel up is A, channel down is B. " +
             "Tap OK for Start. Tap Back for Z. Hold Back and press the D-pad for the C buttons, " +
             "channel up for L, channel down for R. " +
             "Hold Back alone for half a second to leave."
+        return if (packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)) {
+            base + " On this tablet there are also touch buttons on the screen: D-pad bottom left, A and B bottom right, C buttons above them."
+        } else base
     }
 
     private fun speak(text: String) {
@@ -463,7 +501,12 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                     .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
                     .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
                     .build())
-                .setBufferSizeInBytes(minBuf * 4)
+                // A bigger buffer absorbs short dips when the core
+                // runs behind real time: the pitch still drops on a
+                // sustained slowdown (only a faster core fixes that),
+                // but brief stutters stop starving the track. The
+                // 200 ms floor covers low sample rates.
+                .setBufferSizeInBytes(Math.max(minBuf * 8, sampleRate * 4 / 5))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
             audioTrack?.play()
@@ -528,7 +571,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         var sy = 0
         var cx = 0
         var cy = 0
-        for (code in remoteDpadHeld) {
+        for (code in remoteDpadHeld + touchDpadHeld) {
             if (backHeld) {
                 when (code) {
                     KeyEvent.KEYCODE_DPAD_UP -> { dpadButtons.add(JP_L); cx = -STICK_MAX }
@@ -547,6 +590,29 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         }
         for (id in dpadButtons) nativeSetButton(id, true)
         nativeSetAnalog(0, sx, sy)
+        nativeSetAnalog(1, cx, cy)
+    }
+
+    /** Recomputes the touch C buttons and the right stick (analog
+     * 1) from touchCHeld, mirroring refreshDpad's Back-held branch:
+     * C-Up is JP_X, C-Down JP_A, C-Left JP_L, C-Right JP_R. The
+     * right stick is shared with the remote's Back-held D-pad, so
+     * the last writer wins there, as with the gamepad sticks. */
+    private fun refreshTouchC() {
+        for (id in touchCActive) nativeSetButton(id, false)
+        touchCActive.clear()
+        var cx = 0
+        var cy = 0
+        for (id in touchCHeld) {
+            touchCActive.add(id)
+            when (id) {
+                JP_X -> cy = -STICK_MAX
+                JP_A -> cy = STICK_MAX
+                JP_L -> cx = -STICK_MAX
+                JP_R -> cx = STICK_MAX
+            }
+        }
+        for (id in touchCActive) nativeSetButton(id, true)
         nativeSetAnalog(1, cx, cy)
     }
 
@@ -639,8 +705,247 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         return super.dispatchKeyEvent(event)
     }
 
+    // ---------- On-screen touch controls (tablet) ----------
+
+    private fun dp(v: Int): Int = (v * resources.displayMetrics.density + 0.5f).toInt()
+
+    private fun touchButtonBackground(pressed: Boolean): GradientDrawable {
+        val d = GradientDrawable()
+        d.cornerRadius = dp(12).toFloat()
+        if (pressed) {
+            d.setColor(Color.parseColor("#FFD700"))
+            d.setStroke(dp(2), Color.BLACK)
+        } else {
+            d.setColor(Color.argb(140, 24, 24, 24))
+            d.setStroke(dp(2), Color.parseColor("#FFD700"))
+        }
+        return d
+    }
+
+    private fun setTouchButtonVisual(b: Button, pressed: Boolean) {
+        b.background = touchButtonBackground(pressed)
+        b.setTextColor(if (pressed) Color.BLACK else Color.parseColor("#FFD700"))
+    }
+
+    /** A game button for the touch overlay. Direct touch holds the
+     * button down (ACTION_DOWN presses, ACTION_UP / ACTION_CANCEL
+     * releases, so holding works); a TalkBack double-tap is a
+     * click, which cannot hold, so it does a short timed tap
+     * instead. The touch listener consumes the gesture, so a
+     * direct tap never also fires the click listener. */
+    private fun touchButton(
+        text: String,
+        description: String,
+        textSizeSp: Float = 20f,
+        onPress: (Boolean) -> Unit
+    ): Button {
+        val b = Button(this)
+        b.text = text
+        b.textSize = textSizeSp
+        b.contentDescription = description
+        b.isFocusable = true
+        b.isClickable = true
+        setTouchButtonVisual(b, false)
+        b.setOnTouchListener { _, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    onPress(true)
+                    setTouchButtonVisual(b, true)
+                    true
+                }
+                MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                    onPress(false)
+                    setTouchButtonVisual(b, false)
+                    true
+                }
+                else -> true
+            }
+        }
+        b.setOnClickListener {
+            onPress(true)
+            setTouchButtonVisual(b, true)
+            mainHandler.postDelayed({
+                if (!closed.get()) onPress(false)
+                setTouchButtonVisual(b, false)
+            }, TOUCH_TAP_MS)
+        }
+        return b
+    }
+
+    /** Adds the overlay to the root, but only on a device with a
+     * touchscreen — the Onn TV has none, so it stays clean there.
+     * Buttons sit at the screen edges and never cover the middle
+     * of the picture. Fixed positions, same every time, so the
+     * layout can be learned by feel. No speech per press. */
+    private fun addTouchOverlay(root: FrameLayout) {
+        if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)) return
+
+        // D-pad, bottom-left: drives the stick AND the D-pad
+        // buttons through refreshDpad, exactly like the remote.
+        // The tablet is held upright, so the top button feeds the
+        // token for game Up (KEYCODE_DPAD_RIGHT in the sideways
+        // remote map); the other three follow the same rotation.
+        val dpad = RelativeLayout(this)
+        dpad.layoutParams = FrameLayout.LayoutParams(dp(232), dp(232),
+            Gravity.BOTTOM or Gravity.START).apply {
+            leftMargin = dp(16)
+            bottomMargin = dp(16)
+        }
+        val dpadUp = touchButton("▲", "D-pad up") { down ->
+            if (down) touchDpadHeld.add(KeyEvent.KEYCODE_DPAD_RIGHT)
+            else touchDpadHeld.remove(KeyEvent.KEYCODE_DPAD_RIGHT)
+            refreshDpad()
+        }
+        dpadUp.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
+            addRule(RelativeLayout.CENTER_HORIZONTAL)
+            addRule(RelativeLayout.ALIGN_PARENT_TOP)
+        }
+        val dpadDown = touchButton("▼", "D-pad down") { down ->
+            if (down) touchDpadHeld.add(KeyEvent.KEYCODE_DPAD_LEFT)
+            else touchDpadHeld.remove(KeyEvent.KEYCODE_DPAD_LEFT)
+            refreshDpad()
+        }
+        dpadDown.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
+            addRule(RelativeLayout.CENTER_HORIZONTAL)
+            addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
+        }
+        val dpadLeft = touchButton("◀", "D-pad left") { down ->
+            if (down) touchDpadHeld.add(KeyEvent.KEYCODE_DPAD_UP)
+            else touchDpadHeld.remove(KeyEvent.KEYCODE_DPAD_UP)
+            refreshDpad()
+        }
+        dpadLeft.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
+            addRule(RelativeLayout.CENTER_VERTICAL)
+            addRule(RelativeLayout.ALIGN_PARENT_START)
+        }
+        val dpadRight = touchButton("▶", "D-pad right") { down ->
+            if (down) touchDpadHeld.add(KeyEvent.KEYCODE_DPAD_DOWN)
+            else touchDpadHeld.remove(KeyEvent.KEYCODE_DPAD_DOWN)
+            refreshDpad()
+        }
+        dpadRight.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
+            addRule(RelativeLayout.CENTER_VERTICAL)
+            addRule(RelativeLayout.ALIGN_PARENT_END)
+        }
+        dpad.addView(dpadUp)
+        dpad.addView(dpadDown)
+        dpad.addView(dpadLeft)
+        dpad.addView(dpadRight)
+        root.addView(dpad)
+
+        // C buttons, bottom-right above the A/B row: a small
+        // cross. Each feeds its C button id and the right stick
+        // (analog 1) through refreshTouchC, like the remote's
+        // Back-held D-pad.
+        val cpad = RelativeLayout(this)
+        cpad.layoutParams = FrameLayout.LayoutParams(dp(176), dp(176),
+            Gravity.BOTTOM or Gravity.END).apply {
+            rightMargin = dp(16)
+            bottomMargin = dp(104)
+        }
+        val cUp = touchButton("▲", "C up", 16f) { down ->
+            if (down) touchCHeld.add(JP_X) else touchCHeld.remove(JP_X)
+            refreshTouchC()
+        }
+        cUp.layoutParams = RelativeLayout.LayoutParams(dp(48), dp(48)).apply {
+            addRule(RelativeLayout.CENTER_HORIZONTAL)
+            addRule(RelativeLayout.ALIGN_PARENT_TOP)
+        }
+        val cDown = touchButton("▼", "C down", 16f) { down ->
+            if (down) touchCHeld.add(JP_A) else touchCHeld.remove(JP_A)
+            refreshTouchC()
+        }
+        cDown.layoutParams = RelativeLayout.LayoutParams(dp(48), dp(48)).apply {
+            addRule(RelativeLayout.CENTER_HORIZONTAL)
+            addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
+        }
+        val cLeft = touchButton("◀", "C left", 16f) { down ->
+            if (down) touchCHeld.add(JP_L) else touchCHeld.remove(JP_L)
+            refreshTouchC()
+        }
+        cLeft.layoutParams = RelativeLayout.LayoutParams(dp(48), dp(48)).apply {
+            addRule(RelativeLayout.CENTER_VERTICAL)
+            addRule(RelativeLayout.ALIGN_PARENT_START)
+        }
+        val cRight = touchButton("▶", "C right", 16f) { down ->
+            if (down) touchCHeld.add(JP_R) else touchCHeld.remove(JP_R)
+            refreshTouchC()
+        }
+        cRight.layoutParams = RelativeLayout.LayoutParams(dp(48), dp(48)).apply {
+            addRule(RelativeLayout.CENTER_VERTICAL)
+            addRule(RelativeLayout.ALIGN_PARENT_END)
+        }
+        cpad.addView(cUp)
+        cpad.addView(cDown)
+        cpad.addView(cLeft)
+        cpad.addView(cRight)
+        root.addView(cpad)
+
+        // A / B, bottom-right: B left, A right (A is the big one).
+        val abRow = LinearLayout(this)
+        abRow.orientation = LinearLayout.HORIZONTAL
+        abRow.layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            FrameLayout.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM or Gravity.END).apply {
+            rightMargin = dp(16)
+            bottomMargin = dp(16)
+        }
+        val bBtn = touchButton("B", "B button") { down -> nativeSetButton(JP_Y, down) }
+        bBtn.layoutParams = LinearLayout.LayoutParams(dp(72), dp(72)).apply {
+            rightMargin = dp(12)
+        }
+        val aBtn = touchButton("A", "A button") { down -> nativeSetButton(JP_B, down) }
+        aBtn.layoutParams = LinearLayout.LayoutParams(dp(88), dp(72))
+        abRow.addView(bBtn)
+        abRow.addView(aBtn)
+        root.addView(abRow)
+
+        // Start, bottom-centre.
+        val startBtn = touchButton("Start", "Start button", 16f) { down ->
+            nativeSetButton(JP_START, down)
+        }
+        startBtn.layoutParams = FrameLayout.LayoutParams(dp(72), dp(48),
+            Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL).apply {
+            bottomMargin = dp(16)
+        }
+        root.addView(startBtn)
+
+        // Shoulders across the top: L left, Z centre, R right.
+        val lBtn = touchButton("L", "L button", 16f) { down ->
+            nativeSetButton(JP_SELECT, down)
+        }
+        lBtn.layoutParams = FrameLayout.LayoutParams(dp(96), dp(48),
+            Gravity.TOP or Gravity.START).apply {
+            leftMargin = dp(16)
+            topMargin = dp(16)
+        }
+        root.addView(lBtn)
+        val zBtn = touchButton("Z", "Z button", 16f) { down ->
+            nativeSetButton(JP_L2, down)
+        }
+        zBtn.layoutParams = FrameLayout.LayoutParams(dp(96), dp(48),
+            Gravity.TOP or Gravity.CENTER_HORIZONTAL).apply {
+            topMargin = dp(16)
+        }
+        root.addView(zBtn)
+        val rBtn = touchButton("R", "R button", 16f) { down ->
+            nativeSetButton(JP_R2, down)
+        }
+        rBtn.layoutParams = FrameLayout.LayoutParams(dp(96), dp(48),
+            Gravity.TOP or Gravity.END).apply {
+            rightMargin = dp(16)
+            topMargin = dp(16)
+        }
+        root.addView(rBtn)
+    }
+
     private fun finishPlayer() {
         if (closed.getAndSet(true)) return
+        // A deliberate exit (or a reported failure, whose outcome is
+        // already recorded): clear the launch marker so MainActivity
+        // does not announce this return as a silent crash.
+        try { MainActivity.clearPlayerLaunchMarker() } catch (e: Exception) { }
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
         mainHandler.removeCallbacks(startWatchdog)
