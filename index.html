@@ -655,6 +655,23 @@
   // ---------- Player ----------
 
   function playGame(game) {
+    // PlayStation runs on the native player (real ARM code, not the
+    // browser): export the game file to the app and hand it over.
+    if (game.system === 'psx') {
+      showScreen('player');
+      setPlayingBridge(true);
+      $('nowPlaying').textContent = 'Loading ' + game.title + '…';
+      announce('Loading ' + game.title + ' on the native player. ' + controlSummary('psx'));
+      exportGameForNative(game).then(function () {
+        // The native player Activity is now in front.
+      }).catch(function (err) {
+        setPlayingBridge(false);
+        $('nowPlaying').textContent = 'Could not start ' + game.title + '.';
+        announce('Could not start ' + game.title + '. ' + (err && err.message ? err.message : ''));
+        try { if (window.LynxosRetro && window.LynxosRetro.nativeCancel) window.LynxosRetro.nativeCancel(); } catch (e) {}
+      });
+      return;
+    }
     var isCloud = !!game.storagePath;
     if (isCloud) {
       // Show the player screen now so the download has somewhere
@@ -864,6 +881,94 @@
       });
     }
     return Promise.resolve(null);
+  }
+
+  // Same sources as resolveGameUrl, but returns the file itself so the
+  // native player can be handed a real file path.
+  function resolveGameBlob(game, onProgress) {
+    if (game.file) return fetch(game.file).then(function (r) { return r.blob(); });
+    if (game.romUrl) return fetch(game.romUrl).then(function (r) {
+      if (!r.ok) throw new Error('Download failed.');
+      return r.blob();
+    });
+    if (game.storagePath) {
+      if (!currentUser) return Promise.reject(new Error('Not signed in.'));
+      var key = cloudCacheKey(game.storagePath);
+      return idbGet(key).catch(function () { return null; }).then(function (blob) {
+        if (blob) return blob;
+        return downloadWithProgress(game.storagePath, game.title, onProgress || function () {}).then(function (downloaded) {
+          idbPut(key, downloaded).catch(function () {});
+          return downloaded;
+        });
+      });
+    }
+    if (game.idbKey) {
+      return idbGet(game.idbKey).then(function (blob) {
+        if (!blob) throw new Error('File not found on this device.');
+        return blob;
+      });
+    }
+    return Promise.resolve(null);
+  }
+
+  function blobToBase64(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        var bytes = new Uint8Array(reader.result);
+        var CH = 32768, out = '';
+        for (var i = 0; i < bytes.length; i += CH) {
+          out += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+        }
+        resolve(btoa(out));
+      };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  // Sends a PlayStation game to the native player, 1 MB at a time
+  // through the bridge, with spoken progress. The bridge launches the
+  // player when the last chunk lands.
+  function exportGameForNative(game) {
+    var CHUNK = 1024 * 1024;
+    var announced = { 25: false, 50: false, 75: false };
+    function announceAt(percent) {
+      [25, 50, 75].forEach(function (mark) {
+        if (percent >= mark && !announced[mark]) {
+          announced[mark] = true;
+          $('nowPlaying').textContent = 'Preparing ' + game.title + ', ' + mark + ' percent.';
+          announce('Preparing ' + game.title + ', ' + mark + ' percent.');
+        }
+      });
+    }
+    if (!window.LynxosRetro || !window.LynxosRetro.nativeBegin) {
+      return Promise.reject(new Error('This version cannot start the native player.'));
+    }
+    return resolveGameBlob(game, function (percent) {
+      $('nowPlaying').textContent = 'Downloading ' + game.title + ', ' + percent + ' percent.';
+    }).then(function (blob) {
+      if (!blob) throw new Error('Could not load ' + game.title + '.');
+      var begin = window.LynxosRetro.nativeBegin(game.title, game.system, blob.size);
+      if (begin !== 'ok') throw new Error(begin);
+      var offset = 0;
+      function next() {
+        if (offset >= blob.size) {
+          var end = window.LynxosRetro.nativeEnd();
+          if (end !== 'ok') throw new Error(end);
+          return Promise.resolve();
+        }
+        var slice = blob.slice(offset, offset + CHUNK);
+        return blobToBase64(slice).then(function (b64) {
+          var r = window.LynxosRetro.nativeChunk(b64);
+          if (r !== 'ok') throw new Error(r);
+          offset += slice.size;
+          announceAt(Math.floor(offset / blob.size * 100));
+          return next();
+        });
+      }
+      return next();
+    });
   }
 
   // TV remote Back: leave the player, otherwise exit the app.
