@@ -40,6 +40,7 @@ import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * Native PlayStation player (milestone 1 of the native-player project).
@@ -71,6 +72,12 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val START_WATCHDOG_MS = 30_000L
         private const val VIDEO_CHECK_MS = 5_000L
         private const val TRIANGLE_TAP_MS = 100L
+        // Audio queue cap (v1.4.12): batches wait here only briefly
+        // — the drain thread runs just behind the core (the core is
+        // the slow side), so 8 batches is far more than enough; if
+        // it ever fills, the oldest batch is dropped instead of
+        // growing latency without bound.
+        private const val AUDIO_QUEUE_MAX_BATCHES = 8
         // A TalkBack double-tap (click) cannot hold a button, so it
         // does a short timed tap instead of a hold.
         private const val TOUCH_TAP_MS = 150L
@@ -79,6 +86,32 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private lateinit var surfaceView: SurfaceView
     private var core: LibretroCore? = null
     private var audioTrack: AudioTrack? = null
+    // Audio queue (v1.4.12): the emulation thread OFFERS batches
+    // here and never blocks on the speaker; a dedicated audio
+    // thread drains them. The old code wrote with WRITE_BLOCKING
+    // on the emulation thread (inside libretro-kmp's run()), so a
+    // full speaker buffer stalled the next frame and turned a
+    // small speed deficit into constant static — the same shape
+    // v1.4.11 fixed on N64. libretro-kmp may reuse the ShortArray
+    // it hands to onAudio, so each batch is COPIED into a fresh
+    // array before queueing; the queue only ever holds arrays
+    // this player owns.
+    private val audioLock = Object()
+    private val audioQueue = ArrayDeque<ShortArray>()
+    private var audioThread: Thread? = null
+    private val audioRunning = AtomicBoolean(false)
+    // The sample rate the current track was built at. Written on
+    // the UI thread (startAudio).
+    @Volatile
+    private var currentAudioRate = 0
+    // Audio diagnostics (v1.4.12): counted on the emulation/audio
+    // threads, sampled once a second for the page's audio line.
+    private val audioBatchesReceived = AtomicLong(0)
+    private val audioFramesReceived = AtomicLong(0)
+    private var audioUnderrunsTotal = 0L
+    private var audioLastUnderrunCount = 0
+    private var diagFramesRun = 0L
+    private var diagWindowStartNanos = 0L
     private var loopThread: Thread? = null
     private val running = AtomicBoolean(false)
     private val closed = AtomicBoolean(false)
@@ -239,10 +272,23 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         }
 
         override fun onAudio(samples: ShortArray, frames: Int) {
+            // Offer a copy into the queue and return at once — the
+            // emulation thread must never block on the speaker
+            // (v1.4.12). The copy is defensive: libretro-kmp may
+            // reuse the array it passes, and the queue only holds
+            // arrays this player owns. Copy exactly frames*2
+            // elements, the length the old write used.
             try {
-                audioTrack?.write(samples, 0, frames * 2, AudioTrack.WRITE_BLOCKING)
+                audioBatchesReceived.incrementAndGet()
+                audioFramesReceived.addAndGet(frames.toLong())
+                val copy = samples.copyOf(frames * 2)
+                synchronized(audioLock) {
+                    while (audioQueue.size >= AUDIO_QUEUE_MAX_BATCHES) audioQueue.removeFirst()
+                    audioQueue.addLast(copy)
+                    audioLock.notifyAll()
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "audio write failed", e)
+                Log.w(TAG, "audio offer failed", e)
             }
         }
 
@@ -253,6 +299,67 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
 
         override fun onLog(level: LogLevel, message: String) {
             Log.i(TAG, "core [$level] $message")
+        }
+    }
+
+    /** The audio drain thread (v1.4.12): takes batches off the queue
+     * and writes them to the speaker. This is the only place a
+     * blocking AudioTrack write happens, on a thread raised to audio
+     * priority — never on the emulation thread. */
+    private fun startAudioDrain() {
+        // Capture the track: a later restart builds a new one, and
+        // this thread must keep writing only to the track it started
+        // with (a write on a released track just errors).
+        val track = audioTrack
+        audioRunning.set(true)
+        val t = Thread({
+            android.os.Process.setThreadPriority(android.os.Process.THREAD_PRIORITY_AUDIO)
+            while (audioRunning.get()) {
+                val batch: ShortArray? = synchronized(audioLock) {
+                    while (audioQueue.isEmpty() && audioRunning.get()) {
+                        try {
+                            audioLock.wait(100)
+                        } catch (e: InterruptedException) {
+                        }
+                    }
+                    if (audioQueue.isNotEmpty()) audioQueue.removeFirst() else null
+                }
+                if (batch != null) {
+                    try {
+                        track?.write(batch, 0, batch.size, AudioTrack.WRITE_BLOCKING)
+                    } catch (e: Exception) {
+                        Log.w(TAG, "audio write failed", e)
+                    }
+                }
+            }
+        }, "lynxos-ps1-audio")
+        audioThread = t
+        t.start()
+    }
+
+    private fun stopAudioDrain() {
+        audioRunning.set(false)
+        val t = audioThread
+        audioThread = null
+        if (t != null) {
+            t.interrupt()
+            synchronized(audioLock) { audioLock.notifyAll() }
+            try {
+                t.join(500)
+            } catch (e: Exception) {
+            }
+        }
+        synchronized(audioLock) { audioQueue.clear() }
+    }
+
+    /** Forwards one audio-diagnostics line to the page (same
+     * prefs-backed pattern as the Last-game line); MainActivity owns
+     * the storage, this just forwards. */
+    private fun reportAudioDiag(text: String) {
+        try {
+            MainActivity.reportPS1AudioDiag(text)
+        } catch (e: Exception) {
+            Log.w(TAG, "report audio diag failed", e)
         }
     }
 
@@ -369,7 +476,24 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun startAudio(sampleRate: Int) {
+        // The start is posted to the UI thread; if the player
+        // already finished (load failed, early exit), there is no
+        // track to build — a late start must not resurrect one.
+        if (closed.get()) return
         try {
+            // A restart shuts the old drain down and releases the
+            // old track first: old-rate samples must never play at
+            // the new rate.
+            stopAudioDrain()
+            try {
+                audioTrack?.stop()
+            } catch (e: Exception) {
+            }
+            try {
+                audioTrack?.release()
+            } catch (e: Exception) {
+            }
+            audioTrack = null
             val minBuf = AudioTrack.getMinBufferSize(
                 sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
             audioTrack = AudioTrack.Builder()
@@ -390,7 +514,16 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                 .setBufferSizeInBytes(Math.max(minBuf * 8, sampleRate * 4 / 5))
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build()
+            currentAudioRate = sampleRate
+            // Pre-fill ~100 ms of silence before play(): the first
+            // real batches arrive while the track spins up, and
+            // without this the track underruns on the very first
+            // sound. The write returns at once (the buffer is
+            // empty), so this does not stall the UI thread.
+            val silence = ShortArray(sampleRate / 10 * 2)
+            audioTrack?.write(silence, 0, silence.size, AudioTrack.WRITE_BLOCKING)
             audioTrack?.play()
+            startAudioDrain()
         } catch (e: Exception) {
             Log.w(TAG, "Could not start audio", e)
         }
@@ -401,6 +534,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         setLoadStage("running")
         mainHandler.removeCallbacks(startWatchdog)
         mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
+        // Audio diagnostics window (v1.4.12): the frame count in
+        // each 1-second window is the real emulation speed.
+        diagWindowStartNanos = System.nanoTime()
         val frameNanos = (1_000_000_000.0 / fps).toLong()
         loopThread = Thread {
             val c = core ?: return@Thread
@@ -418,6 +554,37 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                         finishPlayerDelayed()
                     }
                     return@Thread
+                }
+                // Diagnostics once a second (v1.4.12): actual frame
+                // rate, underrun count, average batch size — the
+                // numbers that prove whether the static is the core
+                // running slow. The line goes to the page (and
+                // logcat), never spoken. The PS1 rate is fixed
+                // (44100), so unlike N64 there is no rate
+                // renegotiation to do here.
+                diagFramesRun++
+                val nowNanos = System.nanoTime()
+                if (nowNanos - diagWindowStartNanos >= 1_000_000_000L) {
+                    val elapsedSec = (nowNanos - diagWindowStartNanos) / 1_000_000_000.0
+                    val actualFps = (diagFramesRun / elapsedSec).toInt()
+                    // Underruns are cumulative since the track was
+                    // built; keep a running total so a restart (new
+                    // track, counter reset) cannot make the number
+                    // drop.
+                    try {
+                        val cur = audioTrack?.underrunCount ?: 0
+                        if (cur > audioLastUnderrunCount) audioUnderrunsTotal += (cur - audioLastUnderrunCount).toLong()
+                        audioLastUnderrunCount = cur
+                    } catch (e: Exception) {
+                    }
+                    val batches = audioBatchesReceived.get()
+                    val frames = audioFramesReceived.get()
+                    val avgBatch = if (batches > 0) (frames / batches).toInt() else 0
+                    val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz"
+                    Log.i(TAG, "audio diag: $diag")
+                    reportAudioDiag(diag)
+                    diagFramesRun = 0
+                    diagWindowStartNanos = nowNanos
                 }
                 val spent = System.nanoTime() - t0
                 val sleepNanos = frameNanos - spent
@@ -769,6 +936,10 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         try { loopThread?.join(1000) } catch (e: Exception) { }
         try { core?.close() } catch (e: Exception) { Log.w(TAG, "core close failed", e) }
         core = null
+        // Stop the audio drain first (v1.4.12): it is the only other
+        // thread touching the track, and it must be gone before the
+        // track is released.
+        stopAudioDrain()
         try { audioTrack?.stop() } catch (e: Exception) { }
         try { audioTrack?.release() } catch (e: Exception) { }
         audioTrack = null
