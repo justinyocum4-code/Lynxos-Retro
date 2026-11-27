@@ -56,6 +56,7 @@ class NativePlayerActivity : Activity() {
         private const val CORE_NAME = "pcsx_rearmed_libretro_android.so"
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
+        private const val START_WATCHDOG_MS = 30_000L
         private const val TRIANGLE_TAP_MS = 100L
     }
 
@@ -85,6 +86,22 @@ class NativePlayerActivity : Activity() {
 
     private val exitRunnable = Runnable {
         if (backHeld && !backChordUsed) finishPlayer()
+    }
+
+    // Start watchdog, same shape as the N64 player: if the frame
+    // loop has not started 30 s after the core thread starts, the
+    // thread is hung inside a blocking loadGame call (a hang is not
+    // an exception, so the try/catch never fires). The finish is
+    // delayed 5 s after the spoken warning and guarded on running
+    // still being false: finishPlayer stops TTS, so finishing
+    // immediately would cut the warning off unheard.
+    private val startWatchdog = Runnable {
+        if (!running.get()) {
+            speak("The PlayStation game is taking too long to start.")
+            mainHandler.postDelayed({
+                if (!running.get()) finishPlayer()
+            }, 5000L)
+        }
     }
 
     private val frontend = object : LibretroFrontend {
@@ -182,6 +199,7 @@ class NativePlayerActivity : Activity() {
                 }
             }
         }.start()
+        mainHandler.postDelayed(startWatchdog, START_WATCHDOG_MS)
     }
 
     private fun controlSummary(): String {
@@ -246,6 +264,7 @@ class NativePlayerActivity : Activity() {
 
     private fun startLoop(fps: Double) {
         running.set(true)
+        mainHandler.removeCallbacks(startWatchdog)
         val frameNanos = (1_000_000_000.0 / fps).toLong()
         loopThread = Thread {
             val c = core ?: return@Thread
@@ -379,6 +398,7 @@ class NativePlayerActivity : Activity() {
         if (closed.getAndSet(true)) return
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
+        mainHandler.removeCallbacks(startWatchdog)
         try { loopThread?.join(1000) } catch (e: Exception) { }
         try { core?.close() } catch (e: Exception) { Log.w(TAG, "core close failed", e) }
         core = null
