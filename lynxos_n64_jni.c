@@ -412,15 +412,20 @@ static void record_bridge_step(const char *step) {
  * Java code can report it — the v1.4.7/1.4.8 silent deaths. A signal
  * handler writes the crash spot to filesDir/n64-crash.txt, and
  * MainActivity reads it on the next launch and reports it. The
- * handler uses ONLY async-signal-safe calls: a file descriptor opened
- * at init (open() is not signal-safe) plus write(). The backtrace
- * uses _Unwind_Backtrace into a fixed static buffer — not strictly
+ * handler uses ONLY async-signal-safe calls plus write(). The file
+ * is opened inside the handler, on the crash (open() is not
+ * signal-safe, but neither is the _Unwind_Backtrace below — the
+ * same pragmatic choice as v1.4.9). The backtrace uses
+ * _Unwind_Backtrace into a fixed static buffer — not strictly
  * async-signal-safe, but the standard pragmatic choice; it never
  * allocates on the common path. Library load bases are captured at
  * init by parsing /proc/self/maps, so the handler only subtracts.
- * After recording, the handler restores the default disposition and
- * re-raises, so the process still dies normally (Android writes its
- * tombstone too). */
+ * The file is NOT opened at init (v1.4.11): the old code truncated
+ * it on every launch, so testing one game wiped the previous crash
+ * record before anyone read it. A record now survives launches
+ * until a new crash replaces it. After recording, the handler
+ * restores the default disposition and re-raises, so the process
+ * still dies normally (Android writes its tombstone too). */
 
 #define CRASH_MAX_FRAMES 32
 #define CRASH_MAX_LIBS 6
@@ -504,6 +509,13 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext) {
         _exit(128 + sig);
     }
     g_crash_handling = 1;
+    /* Open the file here, on the crash — not at init (v1.4.11):
+     * the previous record survives launches until a new crash
+     * replaces it. If the open fails the write below is skipped
+     * (g_crash_fd stays -1) and the process still dies normally. */
+    if (g_crash_fd < 0 && g_crash_path[0]) {
+        g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    }
     if (g_crash_fd >= 0) {
         crash_write_str("signal ");
         crash_write_dec(sig);
@@ -634,11 +646,12 @@ static void crash_capture_bases(void) {
     fclose(f);
 }
 
-/* Open the crash file at init (never in the handler) and capture the
- * .so bases. If anything here fails the recorder simply stays off —
- * it must never break a launch. The file is truncated on every
- * player start, so a record only ever describes the most recent
- * run; MainActivity reads it before the next start truncates it. */
+/* Resolve the crash file path and capture the .so bases at init.
+ * The file itself is NOT opened here (v1.4.11): opening it with
+ * O_TRUNC on every launch wiped the previous crash record before
+ * anyone read it. The handler opens it (O_TRUNC) only when a crash
+ * actually happens. If anything here fails the recorder simply
+ * stays off — it must never break a launch. */
 static void crash_setup(JNIEnv *env, jobject activity) {
     if (g_crash_fd >= 0) {
         close(g_crash_fd);
@@ -673,13 +686,9 @@ static void crash_setup(JNIEnv *env, jobject activity) {
             }
         }
     }
-    if (g_crash_path[0]) {
-        g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (g_crash_fd < 0) LOGW("crash recorder: could not open %s", g_crash_path);
-    }
     crash_capture_bases();
     crash_install_handlers();
-    LOGI("crash recorder armed: %s (fd %d)", g_crash_path, g_crash_fd);
+    LOGI("crash recorder armed: %s (file opens on crash)", g_crash_path);
 }
 
 static void input_poll_cb(void) {
