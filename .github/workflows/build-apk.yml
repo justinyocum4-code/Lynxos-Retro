@@ -41,6 +41,14 @@ jobs:
           yes | sdkmanager --licenses > /dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-34" "build-tools;34.0.0"
 
+      - name: Fetch native PS1 core
+        run: |
+          mkdir -p app/src/main/assets/native
+          curl -sL -o /tmp/pcsx_rearmed.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/pcsx_rearmed_libretro_android.so.zip"
+          echo "102e22c7bd62b03758880b1b5be2c11381f8159d1233c54991b9af21a0c32b3b  /tmp/pcsx_rearmed.zip" | sha256sum -c -
+          unzip -o -j /tmp/pcsx_rearmed.zip -d app/src/main/assets/native
+          ls -la app/src/main/assets/native
+
       - name: Scaffold Android project
         env:
           APP_VERSION_NAME: ${{ inputs.version_name }}
@@ -72,6 +80,11 @@ jobs:
           cp supabase-config.js app/src/main/assets/www/supabase-config.js
           cp drive-config.js app/src/main/assets/www/drive-config.js
           cp -r assets app/src/main/assets/www/assets
+          if [ ! -f "NativePlayerActivity.kt" ]; then
+            echo "ERROR: NativePlayerActivity.kt is missing (native PS1 player source)."
+            exit 1
+          fi
+          cp NativePlayerActivity.kt app/src/main/java/com/lynxosretro/app/NativePlayerActivity.kt
           echo "App files copied into assets/www:"
           du -sh app/src/main/assets/www
 
@@ -120,12 +133,14 @@ jobs:
           cat > build.gradle <<'EOF'
           plugins {
               id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
           }
           EOF
 
           cat > app/build.gradle <<'EOF'
           plugins {
               id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
           }
           android {
               namespace 'com.lynxosretro.app'
@@ -137,6 +152,9 @@ jobs:
                   versionCode __APP_VERSION_CODE__
                   versionName '__APP_VERSION_NAME__'
               }
+          }
+          dependencies {
+              implementation 'dev.kotlinds:libretro-kmp:0.1.2'
           }
           EOF
           sed -i "s/__APP_VERSION_CODE__/$APP_VERSION_CODE/g; s/__APP_VERSION_NAME__/$APP_VERSION_NAME/g" app/build.gradle
@@ -173,6 +191,12 @@ jobs:
                           <data android:scheme="com.lynxosretro.app" android:host="auth-callback" />
                       </intent-filter>
                   </activity>
+                  <!-- Native PlayStation player: real ARM code, launched
+                       from the library for PS1 games only. -->
+                  <activity
+                      android:name="com.lynxosretro.app.NativePlayerActivity"
+                      android:exported="false"
+                      android:configChanges="orientation|screenSize|keyboardHidden|smallestScreenSize|screenLayout" />
                   <!-- Remote key service: sees the remote's app
                        buttons (YouTube, Netflix, ...) before the
                        system launches their apps. Only active while
@@ -229,6 +253,7 @@ jobs:
           import android.os.Handler;
           import android.os.Looper;
           import android.os.SystemClock;
+          import android.util.Base64;
           import android.view.KeyEvent;
           import android.view.InputDevice;
           import android.webkit.JavascriptInterface;
@@ -237,6 +262,8 @@ jobs:
           import android.webkit.WebSettings;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
+          import java.io.File;
+          import java.io.FileOutputStream;
 
           public class MainActivity extends Activity {
               private WebView webView;
@@ -247,6 +274,14 @@ jobs:
               private boolean pageReady = false;
               private boolean gamePlaying = false;
               private boolean isTV = false;
+              /* Native-player export state: the page sends a PS1 game
+                 1 MB at a time; nativeEnd launches the player. */
+              private File nativeGameFile;
+              private FileOutputStream nativeOut;
+              private String nativeTitle = "";
+              private long nativeTotal = 0;
+              private long nativeWritten = 0;
+              private boolean nativePlayerLaunched = false;
               private long backDownTime = 0;
               private boolean backHeld = false;
               private boolean backChordUsed = false;
@@ -263,6 +298,71 @@ jobs:
                   public void setPlaying(boolean p) { gamePlaying = p; }
                   @JavascriptInterface
                   public boolean isTV() { return isTV; }
+
+                  /* Native PS1 player: the page streams the game file
+                     here in base64 chunks; nativeEnd launches the
+                     player Activity with the finished file. Each call
+                     returns "ok" or "error: ...". */
+                  @JavascriptInterface
+                  public String nativeBegin(String title, String system, long totalBytes) {
+                      try {
+                          nativeCancel();
+                          File dir = new File(getCacheDir(), "native-games");
+                          dir.mkdirs();
+                          String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
+                          if (safe.isEmpty()) safe = "game";
+                          nativeTitle = title;
+                          nativeGameFile = new File(dir, safe + ".bin");
+                          nativeOut = new FileOutputStream(nativeGameFile);
+                          nativeTotal = totalBytes;
+                          nativeWritten = 0;
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public String nativeChunk(String base64) {
+                      try {
+                          if (nativeOut == null) return "error: no export in progress";
+                          byte[] bytes = Base64.decode(base64, Base64.DEFAULT);
+                          nativeOut.write(bytes);
+                          nativeWritten += bytes.length;
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public String nativeEnd() {
+                      try {
+                          if (nativeOut == null) return "error: no export in progress";
+                          nativeOut.close();
+                          nativeOut = null;
+                          if (nativeWritten != nativeTotal || nativeGameFile == null || !nativeGameFile.exists()) {
+                              nativeCancel();
+                              return "error: incomplete file";
+                          }
+                          Intent i = new Intent(MainActivity.this, NativePlayerActivity.class);
+                          i.putExtra("gamePath", nativeGameFile.getAbsolutePath());
+                          i.putExtra("gameTitle", nativeTitle);
+                          startActivity(i);
+                          gamePlaying = true;
+                          nativePlayerLaunched = true;
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public void nativeCancel() {
+                      try {
+                          if (nativeOut != null) { nativeOut.close(); nativeOut = null; }
+                      } catch (Exception ignored) {}
+                      if (nativeGameFile != null) { nativeGameFile.delete(); nativeGameFile = null; }
+                      nativeWritten = 0;
+                      nativeTotal = 0;
+                  }
               }
 
               /* Shared with RemoteKeyService (the accessibility
@@ -349,6 +449,27 @@ jobs:
                   webView.addJavascriptInterface(new LynxosBridge(), "LynxosRetro");
                   setContentView(webView);
                   webView.loadUrl("file:///android_asset/www/index.html");
+              }
+
+              /* Returning from the native player: the WebView still
+                 shows the player screen behind it, so bring the
+                 library back and hand the remote keys to the UI. */
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  if (nativePlayerLaunched) {
+                      nativePlayerLaunched = false;
+                      gamePlaying = false;
+                      if (webView != null) {
+                          webView.post(new Runnable() {
+                              @Override public void run() {
+                                  webView.evaluateJavascript(
+                                      "try{showScreen('library');setPlayingBridge(false);}catch(e){}",
+                                      null);
+                              }
+                          });
+                      }
+                  }
               }
 
               private void forwardAuth(final String url) {
