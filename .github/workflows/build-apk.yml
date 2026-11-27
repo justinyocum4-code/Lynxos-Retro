@@ -74,6 +74,7 @@ jobs:
         env:
           APP_VERSION_NAME: ${{ inputs.version_name }}
           APP_VERSION_CODE: ${{ inputs.version_code }}
+          DRIVE_CLIENT_SECRET: ${{ secrets.DRIVE_CLIENT_SECRET }}
         run: |
           echo "=== Files in repo ==="
           ls -la
@@ -100,6 +101,10 @@ jobs:
           cp "$HTML_FILE" app/src/main/assets/www/index.html
           cp supabase-config.js app/src/main/assets/www/supabase-config.js
           cp drive-config.js app/src/main/assets/www/drive-config.js
+          # Inject the real Drive client secret at build time (the repo copy holds only a placeholder).
+          if [ -z "$DRIVE_CLIENT_SECRET" ]; then echo "ERROR: DRIVE_CLIENT_SECRET repo secret is not set."; exit 1; fi
+          python3 -c "import os; p='app/src/main/assets/www/drive-config.js'; s=open(p).read(); s=s.replace('__DRIVE_CLIENT_SECRET__', os.environ['DRIVE_CLIENT_SECRET']); open(p,'w').write(s)"
+          if grep -q '__DRIVE_CLIENT_SECRET__' app/src/main/assets/www/drive-config.js; then echo "ERROR: Drive client secret was not injected."; exit 1; fi
           cp -r assets app/src/main/assets/www/assets
           if [ ! -f "NativePlayerActivity.kt" ]; then
             echo "ERROR: NativePlayerActivity.kt is missing (native PS1 player source)."
