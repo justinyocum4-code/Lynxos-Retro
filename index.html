@@ -65,6 +65,11 @@
   body.tv #playerScreen #nowPlaying { display: none; }
   body.tv #game { width: 100%; height: 100%; min-height: 0; margin: 0; border: 0; border-radius: 0; }
   body.tv #game canvas { max-width: 100%; max-height: 100%; }
+  /* The Google sign-in code: big gold letters, easy to read aloud. */
+  #driveCode { font-size: 48px; font-weight: bold; color: #F5C518; letter-spacing: 4px; margin: 8px 0; }
+  #driveCodeUrl { font-size: 24px; font-weight: bold; }
+  body.tv #driveCode { font-size: 72px; letter-spacing: 6px; }
+  body.tv #driveCodeUrl { font-size: 32px; }
 </style>
 </head>
 <body>
@@ -135,32 +140,22 @@
   <section id="accountScreen" hidden aria-label="Account and cloud sync">
     <h2>Account and cloud sync</h2>
     <p id="accountStatus" role="status"></p>
-    <p class="note">Sign in with email and password and your game library syncs between your tablet and your Google TV. A game added on the tablet shows up on the TV. When you sign up, we send a confirmation email — tap the link in it to finish signing up.</p>
-    <label for="authEmail">Email</label>
-    <input type="email" id="authEmail" autocomplete="email">
-    <label for="authPassword">Password</label>
-    <input type="password" id="authPassword" autocomplete="current-password">
+    <p class="note">Sign in with your Google account and your game library syncs between your tablet and your Google TV through Google Drive. A game added on the tablet shows up on the TV. Google Drive holds up to 15 GB free, and a single game file can be far bigger than the old 50 MB limit.</p>
+    <p id="driveSpace" class="note" role="status"></p>
     <div class="actions">
-      <button type="button" id="signInBtn">Sign in</button>
-      <button type="button" id="signUpBtn">Sign up</button>
-      <button type="button" id="signOutBtn">Sign out</button>
-      <button type="button" id="forgotBtn">Forgot password?</button>
+      <button type="button" id="driveSignInBtn">Sign in with Google</button>
+      <button type="button" id="driveSignOutBtn">Sign out</button>
       <button type="button" id="accountBackBtn">Back to library</button>
     </div>
-    <div id="resetSection" hidden>
-      <h2>Reset your password</h2>
-      <p class="note">Enter your email in the Email box above, then tap "Send reset email". You will get an email with a link. Tap the link and come back here to choose a new password.</p>
+    <div id="driveCodeWrap" hidden>
+      <h2>Your sign-in code</h2>
+      <p class="note">On your tablet, open the browser and go to:</p>
+      <p id="driveCodeUrl">google.com/device</p>
+      <p class="note">Then type in this code:</p>
+      <p id="driveCode" role="status"></p>
+      <p class="note">The code works for about 30 minutes. This page keeps checking — once you type the code in, you are signed in here.</p>
       <div class="actions">
-        <button type="button" id="sendResetBtn">Send reset email</button>
-      </div>
-      <div id="newPasswordForm" hidden>
-        <label for="newPassword">New password</label>
-        <input type="password" id="newPassword" autocomplete="new-password">
-        <label for="confirmPassword">Repeat the new password</label>
-        <input type="password" id="confirmPassword" autocomplete="new-password">
-        <div class="actions">
-          <button type="button" id="savePasswordBtn">Set a new password</button>
-        </div>
+        <button type="button" id="driveCancelBtn">Cancel sign-in</button>
       </div>
     </div>
   </section>
@@ -175,8 +170,8 @@
     <div id="game" role="region" aria-label="Game player"></div>
   </section>
 </div>
-<script src="assets/emulatorjs/supabase-js/supabase.js"></script>
 <script src="supabase-config.js"></script>
+<script src="drive-config.js"></script>
 <script>
 (function () {
   'use strict';
@@ -234,7 +229,7 @@
   // ---------- State ----------
 
   var currentTab = 'all';
-  var syncedGames = [];   // from Supabase game_library, newest first
+  var syncedGames = [];   // from the Google Drive library, newest first
   var localGames = loadLocalGames(); // from localStorage, newest first
 
   function $(id) { return document.getElementById(id); }
@@ -251,7 +246,7 @@
     if (!msg) return 'Something went wrong, but the app did not say what. Check your connection and try again.';
     if (m.indexOf('failed to fetch') !== -1 || m.indexOf('network') !== -1) return 'The connection dropped. Check your Wi-Fi and try again.';
     if (m.indexOf('timeout') !== -1 || m.indexOf('timed out') !== -1 || m.indexOf('stuck') !== -1) return 'The upload timed out. Your connection may be slow, try again.';
-    if (m.indexOf('too large') !== -1 || m.indexOf('payload') !== -1 || m.indexOf('413') !== -1) return 'The file is too big for the cloud. Try a smaller file or a zip.';
+    if (m.indexOf('too large') !== -1 || m.indexOf('payload') !== -1 || m.indexOf('413') !== -1) return 'The file is too big for the cloud. Google Drive takes very large files, so check your connection and try again.';
     if (m.indexOf('row-level security') !== -1 || m.indexOf('permission') !== -1 || m.indexOf('unauthorized') !== -1 || m.indexOf('401') !== -1 || m.indexOf('403') !== -1) return 'The cloud would not let you upload. Try signing out and back in.';
     if (m.indexOf('already exists') !== -1 || m.indexOf('duplicate') !== -1) return 'That file is already in the cloud. It may have uploaded already, check your library.';
     return msg;
@@ -770,13 +765,14 @@
   }
 
   // Cloud games are cached on this device (IndexedDB, keyed by their
-  // cloud path) so a game you already played does not download again.
-  // The cache key is the storage path itself, so if the file ever
+  // Drive file id) so a game you already played does not download
+  // again. The cache key is the file id itself, so if the file ever
   // changes the key changes too and the new file downloads. Cached
   // files are removed when the game is deleted. No size cap is
-  // enforced here: cloud files are at most 50 MB each, and the TV
-  // has 32 GB of storage — if the cache ever grows too big, the next
-  // step is an eviction pass, not a settings screen.
+  // enforced here: Drive files can be big (the 160 MB Yu-Gi-Oh! set
+  // is the largest so far), and the TV has 32 GB of storage — if the
+  // cache ever grows too big, the next step is an eviction pass, not
+  // a settings screen.
   function cloudCacheKey(storagePath) { return 'cloud:' + storagePath; }
 
   // Returns a playable URL for a game: a bundled file path, a remote
@@ -785,7 +781,7 @@
     if (game.file) return Promise.resolve(game.file);
     if (game.romUrl) return Promise.resolve(game.romUrl);
     if (game.storagePath) {
-      if (!supabaseClient) return Promise.reject(new Error('Not signed in.'));
+      if (!currentUser) return Promise.reject(new Error('Not signed in.'));
       var key = cloudCacheKey(game.storagePath);
       // A cache-read failure must never stop play: it just means
       // download instead. A download failure still reaches playGame.
@@ -816,32 +812,160 @@
     return 'exit';
   };
 
-  // ---------- Cloud sync (Supabase) ----------
+  // ---------- Cloud sync (Google Drive) ----------
 
-  var supabaseClient = null;
-  var currentUser = null;
+  // Sign-in is Google's device-code flow: the app shows a short code,
+  // Justin types it in at google.com/device on the tablet, and Google
+  // gives the app its own tokens. No password is ever typed in the app.
+  var DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.file';
+  var DRIVE_FOLDER_NAME = 'Lynxos Retro';
+  var DRIVE_LIBRARY_NAME = 'library.json';
+  var DRIVE_TOKENS_KEY = 'lr_drive_tokens';
+  var DRIVE_FOLDER_KEY = 'lr_drive_folder_id';
+  var DRIVE_LIBRARY_ID_KEY = 'lr_drive_library_id';
+  var DRIVE_MIGRATED_KEY = 'lr_drive_migrated';
+
+  var currentUser = null;   // { email } once signed in with Google
   var syncConfigured = false;
+  var driveAccessToken = null;
+  var driveRefreshToken = null;
+  var driveTokenExpiry = 0; // epoch ms
+  var driveFolderId = null;
+  var driveLibraryId = null;
+  var driveLibrary = [];    // library.json records, newest first
+  var drivePollTimer = null;
+  var driveDeviceCode = null;
+  var drivePollInterval = 5;
 
-  function initSupabase() {
-    var url = window.SUPABASE_URL;
-    var key = window.SUPABASE_ANON_KEY;
-    if (!url || !key || url.indexOf('YOUR_') === 0 || key.indexOf('YOUR_') === 0) {
+  function initDrive() {
+    var id = window.DRIVE_CLIENT_ID;
+    if (!id || id.indexOf('___') === 0 || id.indexOf('YOUR_') === 0) {
       syncConfigured = false;
       return;
     }
-    if (typeof window.supabase === 'undefined' || !window.supabase.createClient) {
-      syncConfigured = false;
-      return;
-    }
+    syncConfigured = true;
+    loadDriveTokens();
+    try { driveFolderId = localStorage.getItem(DRIVE_FOLDER_KEY) || null; } catch (e) {}
+    try { driveLibraryId = localStorage.getItem(DRIVE_LIBRARY_ID_KEY) || null; } catch (e) {}
+  }
+
+  function saveDriveTokens() {
     try {
-      supabaseClient = window.supabase.createClient(url, key, {
-        auth: { persistSession: true, autoRefreshToken: true }
-      });
-      syncConfigured = true;
-    } catch (e) {
-      syncConfigured = false;
-      supabaseClient = null;
+      localStorage.setItem(DRIVE_TOKENS_KEY, JSON.stringify({
+        access_token: driveAccessToken,
+        refresh_token: driveRefreshToken,
+        expiry: driveTokenExpiry,
+        email: currentUser ? currentUser.email : null
+      }));
+    } catch (e) {}
+  }
+  function loadDriveTokens() {
+    try {
+      var raw = localStorage.getItem(DRIVE_TOKENS_KEY);
+      if (!raw) return;
+      var t = JSON.parse(raw);
+      driveAccessToken = t.access_token || null;
+      driveRefreshToken = t.refresh_token || null;
+      driveTokenExpiry = t.expiry || 0;
+      if (t.email) currentUser = { email: t.email };
+    } catch (e) {}
+  }
+  function clearDriveTokens() {
+    driveAccessToken = null;
+    driveRefreshToken = null;
+    driveTokenExpiry = 0;
+    try { localStorage.removeItem(DRIVE_TOKENS_KEY); } catch (e) {}
+  }
+
+  // Plain request, no Google sign-in header (used for the device-code
+  // and token endpoints, which must not carry one).
+  function driveXhrNoAuth(method, url, body, contentType) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url);
+      if (contentType) xhr.setRequestHeader('Content-Type', contentType);
+      xhr.onload = function () { resolve({ status: xhr.status, text: xhr.responseText }); };
+      xhr.onerror = function () { reject(new Error('Network error. Check your Wi-Fi and try again.')); };
+      xhr.send(body || null);
+    });
+  }
+
+  // Request with the Google sign-in token. Resolves {status, text}.
+  function driveXhr(method, url, body, contentType) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url);
+      if (driveAccessToken) xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
+      if (contentType) xhr.setRequestHeader('Content-Type', contentType);
+      xhr.onload = function () { resolve({ status: xhr.status, text: xhr.responseText }); };
+      xhr.onerror = function () { reject(new Error('Network error. Check your Wi-Fi and try again.')); };
+      xhr.send(body || null);
+    });
+  }
+
+  // One Drive API call: makes sure the token is fresh first, and if
+  // Google answers 401 anyway, refreshes once and tries again.
+  function driveApi(method, url, body, contentType, retried) {
+    return ensureDriveToken().then(function () {
+      return driveXhr(method, url, body, contentType);
+    }).then(function (res) {
+      if (res.status === 401 && !retried) {
+        driveAccessToken = null;
+        driveTokenExpiry = 0;
+        return driveApi(method, url, body, contentType, true);
+      }
+      return res;
+    });
+  }
+
+  // Resolves once a usable access token is in hand, refreshing it
+  // first when it is expired. Rejects when there is no sign-in left
+  // to refresh (then the user signs in again).
+  function ensureDriveToken() {
+    if (driveAccessToken && driveTokenExpiry > Date.now() + 60000) return Promise.resolve();
+    if (!driveRefreshToken) {
+      return Promise.reject(new Error('You are not signed in. Sign in and try again.'));
     }
+    var body = 'grant_type=refresh_token' +
+      '&client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID) +
+      '&refresh_token=' + encodeURIComponent(driveRefreshToken);
+    return driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/token', body, 'application/x-www-form-urlencoded')
+      .then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400 || !data.access_token) {
+          clearDriveTokens();
+          currentUser = null;
+          throw new Error('Your Google sign-in expired. Sign in again.');
+        }
+        driveAccessToken = data.access_token;
+        if (data.refresh_token) driveRefreshToken = data.refresh_token;
+        driveTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+        saveDriveTokens();
+      });
+  }
+
+  // Who is signed in, and how much Drive space is free. Fills in
+  // currentUser and the free-space line on the Account screen.
+  function driveAbout() {
+    return driveApi('GET', 'https://www.googleapis.com/drive/v3/about?fields=user,storageQuota')
+      .then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400) throw new Error((data.error && data.error.message) || 'Could not reach Google Drive.');
+        if (data.user && data.user.emailAddress) currentUser = { email: data.user.emailAddress };
+        updateDriveSpace(data.storageQuota);
+        saveDriveTokens();
+      });
+  }
+
+  function updateDriveSpace(quota) {
+    var el = $('driveSpace');
+    if (!el) return;
+    if (!quota || !quota.limit) { el.textContent = ''; return; }
+    var free = Math.max(0, Number(quota.limit) - Number(quota.usage || 0));
+    var gb = (free / 1000000000).toFixed(1);
+    el.textContent = 'Google Drive: ' + gb + ' GB free.';
   }
 
   function updateSyncStatus() {
@@ -849,17 +973,17 @@
     if (!syncConfigured) {
       el.textContent = 'Cloud sync is not set up yet — the games included in the app work offline.';
     } else if (currentUser) {
-      el.textContent = 'Signed in as ' + currentUser.email + ' — your library syncs to the cloud.';
+      el.textContent = 'Signed in with Google as ' + currentUser.email + ' — your library syncs through Google Drive.';
     } else {
-      el.textContent = 'Not signed in — games you add stay on this device. Sign in to sync them to your TV.';
+      el.textContent = 'Not signed in — games you add stay on this device. Sign in with Google to sync them to your TV.';
     }
     var note = $('addSyncNote');
     if (note) {
       note.textContent = (!syncConfigured)
         ? 'Cloud sync is not set up yet, so this game will be added on this device only.'
         : (currentUser
-          ? 'Signed in — this game will be saved to your cloud library and show up on your TV.'
-          : 'Not signed in — this game will be added on this device only. Sign in to sync it.');
+          ? 'Signed in — this game will be saved to your Google Drive library and show up on your TV.'
+          : 'Not signed in — this game will be added on this device only. Sign in with Google to sync it.');
     }
   }
 
@@ -867,18 +991,15 @@
     var el = $('accountStatus');
     if (msg) setStatus(el, msg, kind);
     else if (!syncConfigured) setStatus(el, 'Cloud sync is not set up yet. The app works offline with the games included.', '');
-    else if (currentUser) setStatus(el, 'Signed in as ' + currentUser.email + '.', 'ok');
+    else if (currentUser) setStatus(el, 'Signed in with Google as ' + currentUser.email + '.', 'ok');
     else setStatus(el, 'Not signed in.', '');
   }
 
-  // ---------- Account: sign in, sign up, sign out, password reset ----------
+  // ---------- Account: sign in with Google (device-code flow) ----------
 
-  var recoveryMode = false;
-
-  function setAuthBusy(busy) {
-    $('signInBtn').disabled = busy;
-    $('signUpBtn').disabled = busy;
-    $('signOutBtn').disabled = busy;
+  function setDriveBusy(busy) {
+    $('driveSignInBtn').disabled = busy;
+    $('driveSignOutBtn').disabled = busy;
   }
 
   function authStatus(msg, kind) {
@@ -886,211 +1007,425 @@
     announce(msg);
   }
 
-  function readAuthFields() {
-    return {
-      email: $('authEmail').value.trim(),
-      password: $('authPassword').value
-    };
+  // "ABCD-EFGH" -> "A B C D, E F G H" so TalkBack reads every letter.
+  function spellCode(code) {
+    return code.split('-').map(function (part) {
+      return part.split('').join(' ');
+    }).join(', ');
   }
 
-  function signIn() {
-    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
-    var f = readAuthFields();
-    if (!f.email || !f.password) {
-      authStatus('Enter your email and password first.', 'error');
-      return;
-    }
-    setAuthBusy(true);
-    supabaseClient.auth.signInWithPassword({ email: f.email, password: f.password }).then(function (res) {
-      setAuthBusy(false);
-      if (res.error) { authStatus(res.error.message, 'error'); return; }
-      // Success: the onAuthStateChange handler updates the status.
-    }).catch(function (err) {
-      setAuthBusy(false);
-      authStatus(err && err.message ? err.message : 'Sign in did not work.', 'error');
-    });
-  }
-
-  function signUp() {
-    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
-    var f = readAuthFields();
-    if (!f.email || !f.password) {
-      authStatus('Enter your email and password first.', 'error');
-      return;
-    }
-    setAuthBusy(true);
-    supabaseClient.auth.signUp({
-      email: f.email,
-      password: f.password,
-      options: { emailRedirectTo: 'com.lynxosretro.app://auth-callback' }
-    }).then(function (res) {
-      setAuthBusy(false);
-      if (res.error) {
-        if (/already registered/i.test(res.error.message)) {
-          authStatus('That email already has an account — try Sign in, or use Forgot password.', 'error');
-        } else {
-          authStatus(res.error.message, 'error');
-        }
-        return;
-      }
-      var user = res.data && res.data.user;
-      // Supabase sometimes answers an existing email with no error
-      // and a user with no identities, instead of an error.
-      if (user && user.identities && user.identities.length === 0) {
-        authStatus('That email already has an account — try Sign in, or use Forgot password.', 'error');
-        return;
-      }
-      if (res.data && res.data.session) {
-        // Email confirmation is off: signed straight in.
-        // The onAuthStateChange handler updates the status.
-        return;
-      }
-      authStatus('Account created. Check your email and tap the confirmation link to finish signing up.', 'ok');
-    }).catch(function (err) {
-      setAuthBusy(false);
-      authStatus(err && err.message ? err.message : 'Sign up did not work.', 'error');
-    });
-  }
-
-  function signOut() {
-    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
-    setAuthBusy(true);
-    supabaseClient.auth.signOut().then(function () {
-      setAuthBusy(false);
-      // The onAuthStateChange handler clears the user and the status.
-    }).catch(function (err) {
-      setAuthBusy(false);
-      authStatus(err && err.message ? err.message : 'Sign out did not work.', 'error');
-    });
-  }
-
-  function showResetSection() {
-    $('resetSection').hidden = false;
-    $('newPasswordForm').hidden = !recoveryMode;
-  }
-
-  function sendResetEmail() {
-    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
-    var email = $('authEmail').value.trim();
-    if (!email) { authStatus('Enter your email first.', 'error'); return; }
-    $('sendResetBtn').disabled = true;
-    supabaseClient.auth.resetPasswordForEmail(email, {
-      redirectTo: 'com.lynxosretro.app://auth-callback'
-    }).then(function (res) {
-      $('sendResetBtn').disabled = false;
-      if (res.error) { authStatus(res.error.message, 'error'); return; }
-      authStatus('Reset email sent — check your inbox and tap the link.', 'ok');
-    }).catch(function (err) {
-      $('sendResetBtn').disabled = false;
-      authStatus(err && err.message ? err.message : 'Could not send the reset email.', 'error');
-    });
-  }
-
-  function saveNewPassword() {
-    if (!supabaseClient) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
-    var pw = $('newPassword').value;
-    var pw2 = $('confirmPassword').value;
-    if (pw !== pw2) { authStatus('Passwords do not match.', 'error'); return; }
-    if (pw.length < 6) { authStatus('Password must be at least 6 characters.', 'error'); return; }
-    $('savePasswordBtn').disabled = true;
-    supabaseClient.auth.updateUser({ password: pw }).then(function (res) {
-      $('savePasswordBtn').disabled = false;
-      if (res.error) { authStatus(res.error.message, 'error'); return; }
-      $('newPassword').value = '';
-      $('confirmPassword').value = '';
-      $('newPasswordForm').hidden = true;
-      recoveryMode = false;
-      authStatus('Password changed. You\'re signed in.', 'ok');
-    }).catch(function (err) {
-      $('savePasswordBtn').disabled = false;
-      authStatus(err && err.message ? err.message : 'Could not change the password.', 'error');
-    });
-  }
-
-  // Called by the Android app when an auth email link is tapped:
-  // com.lynxosretro.app://auth-callback#access_token=...&type=signup
-  // (or type=recovery for a password reset).
-  window.handleAuthCallback = function (url) {
-    if (!url || url.indexOf('#') === -1) return;
-    var frag = url.slice(url.indexOf('#') + 1);
-    var params = {};
-    frag.split('&').forEach(function (pair) {
-      var kv = pair.split('=');
-      if (kv.length === 2) params[decodeURIComponent(kv[0])] = decodeURIComponent(kv[1]);
-    });
-    if (!params.access_token) return;
-    if (!supabaseClient) return;
-    recoveryMode = params.type === 'recovery';
-    supabaseClient.auth.setSession({
-      access_token: params.access_token,
-      refresh_token: params.refresh_token || ''
-    }).then(function (res) {
-      if (res.error) { authStatus(res.error.message, 'error'); return; }
-      if (recoveryMode) {
-        showScreen('account');
-        showResetSection();
-        authStatus('Choose a new password.', '');
-        $('newPassword').focus();
-      } else {
-        authStatus('Signed in.', 'ok');
-      }
-    }).catch(function (err) {
-      authStatus(err && err.message ? err.message : 'Could not finish signing in.', 'error');
-    });
-  };
-
-  function syncLibrary() {
-    if (!supabaseClient || !currentUser) return Promise.resolve();
-    return supabaseClient
-      .from('game_library')
-      .select('*')
-      .order('added_at', { ascending: false })
+  function startDriveSignIn() {
+    if (!syncConfigured) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    setDriveBusy(true);
+    authStatus('Getting your sign-in code…', '');
+    var body = 'client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID) +
+      '&scope=' + encodeURIComponent(DRIVE_SCOPE);
+    driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/device/code', body, 'application/x-www-form-urlencoded')
       .then(function (res) {
-        if (res.error) {
-          announce('Sync did not work: ' + res.error.message);
-          return;
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400 || !data.device_code || !data.user_code) {
+          throw new Error((data && data.error_description) || 'Could not start Google sign-in.');
         }
-        syncedGames = (res.data || []).map(function (row) {
-          var isUpload = row.source === 'upload';
-          return {
-            id: 'sync-' + row.id,
-            title: row.title,
-            system: row.system,
-            core: row.core,
-            author: 'You',
-            source: 'synced',
-            romUrl: isUpload ? null : row.rom_url,
-            storagePath: isUpload ? row.rom_url : null,
-            addedAt: row.added_at
-          };
-        });
-        renderList();
-        announce('Library synced. ' + syncedGames.length + ' synced games.');
+        driveDeviceCode = data.device_code;
+        drivePollInterval = data.interval || 5;
+        showDriveCode(data.user_code, data.verification_url || 'https://www.google.com/device');
+        pollDriveCode();
+      }).catch(function (err) {
+        setDriveBusy(false);
+        authStatus(err && err.message ? err.message : 'Could not start Google sign-in.', 'error');
       });
   }
 
+  function showDriveCode(code, url) {
+    var wrap = $('driveCodeWrap');
+    if (wrap) wrap.hidden = false;
+    var codeEl = $('driveCode');
+    if (codeEl) codeEl.textContent = code;
+    var urlEl = $('driveCodeUrl');
+    if (urlEl) urlEl.textContent = url.replace(/^https:\/\//, '');
+    var msg = 'Your Google sign-in code is ' + spellCode(code) + '. On your tablet, go to google.com/device and type it in.';
+    authStatus(msg, '');
+    announceUrgent(msg);
+  }
+
+  function pollDriveCode() {
+    if (drivePollTimer) clearInterval(drivePollTimer);
+    drivePollTimer = setInterval(function () {
+      var body = 'grant_type=urn:ietf:params:oauth:grant-type:device_code' +
+        '&device_code=' + encodeURIComponent(driveDeviceCode) +
+        '&client_id=' + encodeURIComponent(window.DRIVE_CLIENT_ID);
+      driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/token', body, 'application/x-www-form-urlencoded')
+        .then(function (res) {
+          var data = {};
+          try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+          if (res.status === 200 && data.access_token) {
+            clearInterval(drivePollTimer);
+            drivePollTimer = null;
+            driveAccessToken = data.access_token;
+            driveRefreshToken = data.refresh_token || null;
+            driveTokenExpiry = Date.now() + (data.expires_in || 3600) * 1000;
+            var wrap = $('driveCodeWrap');
+            if (wrap) wrap.hidden = true;
+            setDriveBusy(false);
+            driveAbout().then(function () {
+              saveDriveTokens();
+              updateSyncStatus();
+              authStatus('Signed in with Google as ' + (currentUser ? currentUser.email : '') + '.', 'ok');
+              syncLibrary().then(function () { return migrateFromSupabase(); });
+            }).catch(function (err) {
+              authStatus(err && err.message ? err.message : 'Signed in, but Drive did not answer.', 'error');
+            });
+            return;
+          }
+          var errCode = data.error || '';
+          if (errCode === 'authorization_pending') return; // keep waiting
+          if (errCode === 'slow_down') {
+            drivePollInterval += 5;
+            clearInterval(drivePollTimer);
+            drivePollTimer = null;
+            pollDriveCode();
+            return;
+          }
+          clearInterval(drivePollTimer);
+          drivePollTimer = null;
+          setDriveBusy(false);
+          var wrap2 = $('driveCodeWrap');
+          if (wrap2) wrap2.hidden = true;
+          if (errCode === 'access_denied') authStatus('Sign-in was cancelled.', 'error');
+          else if (errCode === 'expired_token') authStatus('That code expired. Tap Sign in with Google to get a new one.', 'error');
+          else authStatus((data.error_description) || 'Google sign-in did not work.', 'error');
+        }).catch(function () {
+          // A network blip while polling: keep waiting; the next tick
+          // tries again. The code itself stays valid for ~30 minutes.
+        });
+    }, drivePollInterval * 1000);
+  }
+
+  function cancelDriveSignIn() {
+    if (drivePollTimer) { clearInterval(drivePollTimer); drivePollTimer = null; }
+    driveDeviceCode = null;
+    var wrap = $('driveCodeWrap');
+    if (wrap) wrap.hidden = true;
+    setDriveBusy(false);
+    authStatus('Sign-in cancelled.', '');
+  }
+
+  function signOutDrive() {
+    if (!syncConfigured) { authStatus('Cloud sync is not set up yet.', 'error'); return; }
+    setDriveBusy(true);
+    var token = driveRefreshToken || driveAccessToken;
+    var done = function () {
+      clearDriveTokens();
+      currentUser = null;
+      syncedGames = [];
+      driveLibrary = [];
+      renderList();
+      setDriveBusy(false);
+      updateSyncStatus();
+      authStatus('Signed out of Google Drive.', 'ok');
+    };
+    if (!token) { done(); return; }
+    // Revoke is best-effort: even if it fails, the tokens are gone here.
+    driveXhrNoAuth('POST', 'https://oauth2.googleapis.com/revoke', 'token=' + encodeURIComponent(token), 'application/x-www-form-urlencoded')
+      .then(done, done);
+  }
+
+  // ---------- Drive library (library.json in the Lynxos Retro folder) ----------
+
+  function ensureDriveFolder() {
+    if (driveFolderId) return Promise.resolve(driveFolderId);
+    var q = "mimeType = 'application/vnd.google-apps.folder' and name = '" + DRIVE_FOLDER_NAME + "' and trashed = false";
+    return driveApi('GET', 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) + '&fields=files(id,name)')
+      .then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400) throw new Error((data.error && data.error.message) || 'Could not reach Google Drive.');
+        if (data.files && data.files.length) {
+          driveFolderId = data.files[0].id;
+          try { localStorage.setItem(DRIVE_FOLDER_KEY, driveFolderId); } catch (e) {}
+          return driveFolderId;
+        }
+        return driveApi('POST', 'https://www.googleapis.com/drive/v3/files', JSON.stringify({ name: DRIVE_FOLDER_NAME, mimeType: 'application/vnd.google-apps.folder' }), 'application/json')
+          .then(function (res2) {
+            var d2 = {};
+            try { d2 = JSON.parse(res2.text || '{}'); } catch (e) {}
+            if (res2.status >= 400 || !d2.id) throw new Error((d2.error && d2.error.message) || 'Could not make the Lynxos Retro folder in Drive.');
+            driveFolderId = d2.id;
+            try { localStorage.setItem(DRIVE_FOLDER_KEY, driveFolderId); } catch (e) {}
+            return driveFolderId;
+          });
+      });
+  }
+
+  function readDriveLibrary() {
+    var q = "name = '" + DRIVE_LIBRARY_NAME + "' and '" + driveFolderId + "' in parents and trashed = false";
+    return driveApi('GET', 'https://www.googleapis.com/drive/v3/files?q=' + encodeURIComponent(q) + '&fields=files(id,name)')
+      .then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400) throw new Error((data.error && data.error.message) || 'Could not read your Drive library.');
+        if (!data.files || !data.files.length) { driveLibraryId = null; return []; }
+        driveLibraryId = data.files[0].id;
+        try { localStorage.setItem(DRIVE_LIBRARY_ID_KEY, driveLibraryId); } catch (e) {}
+        return driveApi('GET', 'https://www.googleapis.com/drive/v3/files/' + driveLibraryId + '?alt=media')
+          .then(function (res2) {
+            if (res2.status >= 400) throw new Error('Could not download your Drive library.');
+            var list = [];
+            try { list = JSON.parse(res2.text || '[]'); } catch (e) { list = []; }
+            return Array.isArray(list) ? list : [];
+          });
+      });
+  }
+
+  // Saves the whole library list back to library.json in Drive.
+  function writeDriveLibrary() {
+    var json = JSON.stringify(driveLibrary);
+    if (driveLibraryId) {
+      return driveApi('PATCH', 'https://www.googleapis.com/upload/drive/v3/files/' + driveLibraryId + '?uploadType=media', json, 'application/json')
+        .then(function (res) {
+          if (res.status >= 400) throw new Error('Could not save your Drive library.');
+        });
+    }
+    var boundary = 'lynxos-retro-' + Date.now();
+    var meta = JSON.stringify({ name: DRIVE_LIBRARY_NAME, parents: [driveFolderId] });
+    var body = '--' + boundary + '\r\n' +
+      'Content-Type: application/json; charset=UTF-8\r\n\r\n' + meta + '\r\n' +
+      '--' + boundary + '\r\n' +
+      'Content-Type: application/json\r\n\r\n' + json + '\r\n' +
+      '--' + boundary + '--';
+    return driveApi('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart', body, 'multipart/related; boundary=' + boundary)
+      .then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        if (res.status >= 400 || !data.id) throw new Error((data.error && data.error.message) || 'Could not save your Drive library.');
+        driveLibraryId = data.id;
+        try { localStorage.setItem(DRIVE_LIBRARY_ID_KEY, driveLibraryId); } catch (e) {}
+      });
+  }
+
+  function addDriveRecord(rec) {
+    rec.id = 'g' + Date.now().toString(36) + Math.floor(Math.random() * 1000);
+    rec.addedAt = rec.addedAt || new Date().toISOString();
+    driveLibrary.unshift(rec);
+    return writeDriveLibrary();
+  }
+
+  function driveDeleteFile(fileId) {
+    return driveApi('DELETE', 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId))
+      .then(function (res) {
+        if (res.status >= 400 && res.status !== 404) throw new Error('Could not delete the file from Drive.');
+      });
+  }
+
+  function driveRecordToGame(rec) {
+    return {
+      id: 'drive-' + rec.id,
+      title: rec.title,
+      system: rec.system,
+      core: rec.core,
+      author: 'You',
+      source: 'synced',
+      romUrl: rec.source === 'url' ? rec.romUrl : null,
+      storagePath: rec.source === 'upload' ? rec.fileId : null,
+      addedAt: rec.addedAt
+    };
+  }
+
+  function syncLibrary() {
+    if (!syncConfigured || !currentUser) return Promise.resolve();
+    return ensureDriveFolder().then(function () {
+      return readDriveLibrary();
+    }).then(function (records) {
+      driveLibrary = records || [];
+      syncedGames = driveLibrary.map(driveRecordToGame);
+      renderList();
+      announce('Library synced. ' + syncedGames.length + ' synced games.');
+    }).catch(function (err) {
+      announce('Sync did not work: ' + (err && err.message ? err.message : 'unknown error'));
+    });
+  }
+
   function refreshSession() {
-    if (!supabaseClient) return Promise.resolve();
-    return supabaseClient.auth.getSession().then(function (res) {
-      currentUser = res.data && res.data.session ? res.data.session.user : null;
+    if (!syncConfigured) return Promise.resolve();
+    if (!driveAccessToken && !driveRefreshToken) return Promise.resolve();
+    return ensureDriveToken().then(function () {
+      return driveAbout();
+    }).then(function () {
       updateSyncStatus();
       updateAccountStatus();
-      if (currentUser) return syncLibrary();
+      if (currentUser) return syncLibrary().then(function () { return migrateFromSupabase(); });
+    }).catch(function () {
+      // The saved sign-in is dead: stay signed out quietly. The user
+      // signs in again from the Account screen.
+      clearDriveTokens();
+      currentUser = null;
+      updateSyncStatus();
+      updateAccountStatus();
+    });
+  }
+
+  // ---------- One-time move from the old cloud (Supabase) ----------
+  // Runs once, the first time this version signs in with Google. It
+  // reads the games the old app saved in Supabase (using the sign-in
+  // the old app left on this device), downloads each file, uploads it
+  // to Drive, and writes the Drive library. A game already moved is
+  // never moved twice. Any failure is spoken plainly and the move is
+  // tried again next sign-in — it never blocks signing in or playing.
+  function migrateFromSupabase() {
+    try {
+      if (localStorage.getItem(DRIVE_MIGRATED_KEY)) return Promise.resolve();
+    } catch (e) { return Promise.resolve(); }
+    if (!window.SUPABASE_URL || !window.SUPABASE_ANON_KEY) {
+      try { localStorage.setItem(DRIVE_MIGRATED_KEY, '1'); } catch (e) {}
+      return Promise.resolve();
+    }
+    var sess = readOldSupabaseSession();
+    if (!sess || !sess.access_token || !sess.user || !sess.user.id) {
+      // Never signed in to the old cloud on this device: nothing to move.
+      try { localStorage.setItem(DRIVE_MIGRATED_KEY, '1'); } catch (e) {}
+      return Promise.resolve();
+    }
+    announce('Moving your games from the old cloud to Google Drive.');
+    return listOldSupabaseGames(sess).then(function (rows) {
+      if (!rows || !rows.length) {
+        try { localStorage.setItem(DRIVE_MIGRATED_KEY, '1'); } catch (e) {}
+        return;
+      }
+      var chain = Promise.resolve();
+      var moved = 0;
+      rows.forEach(function (row) {
+        chain = chain.then(function () {
+          return moveOneOldGame(sess, row).then(function (ok) { if (ok) moved++; });
+        });
+      });
+      return chain.then(function () {
+        if (moved === rows.length) {
+          try { localStorage.setItem(DRIVE_MIGRATED_KEY, '1'); } catch (e) {}
+        }
+        if (moved) {
+          announce('Moved ' + moved + (moved === 1 ? ' game' : ' games') + ' from the old cloud to Google Drive.');
+          return syncLibrary();
+        }
+        announce('The old cloud games could not be moved yet. They will be tried again next time you sign in.');
+      });
+    }).catch(function (err) {
+      announce('Could not move your old cloud games yet: ' + plainErrorReason(err) + ' They will be tried again next time you sign in.');
+    });
+  }
+
+  function readOldSupabaseSession() {
+    try {
+      for (var i = 0; i < localStorage.length; i++) {
+        var k = localStorage.key(i);
+        if (k && k.indexOf('sb-') === 0 && k.indexOf('-auth-token') !== -1) {
+          return JSON.parse(localStorage.getItem(k) || 'null');
+        }
+      }
+    } catch (e) {}
+    return null;
+  }
+
+  function oldSupabaseXhr(method, url, token, body, contentType, responseType) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open(method, url);
+      xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
+      xhr.setRequestHeader('Authorization', 'Bearer ' + token);
+      if (contentType) xhr.setRequestHeader('Content-Type', contentType);
+      if (responseType) xhr.responseType = responseType;
+      xhr.onload = function () { resolve({ status: xhr.status, text: xhr.responseText, blob: xhr.response }); };
+      xhr.onerror = function () { reject(new Error('Network error. Check your Wi-Fi and try again.')); };
+      xhr.send(body || null);
+    });
+  }
+
+  function refreshOldSupabaseToken(sess) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', window.SUPABASE_URL + '/auth/v1/token?grant_type=refresh_token');
+      xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
+      xhr.setRequestHeader('Content-Type', 'application/json');
+      xhr.onload = function () {
+        var data = {};
+        try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+        if (xhr.status >= 400 || !data.access_token) { reject(new Error('Your old cloud sign-in expired.')); return; }
+        sess.access_token = data.access_token;
+        if (data.refresh_token) sess.refresh_token = data.refresh_token;
+        resolve();
+      };
+      xhr.onerror = function () { reject(new Error('Network error. Check your Wi-Fi and try again.')); };
+      xhr.send(JSON.stringify({ refresh_token: sess.refresh_token }));
+    });
+  }
+
+  function listOldSupabaseGames(sess) {
+    var url = window.SUPABASE_URL + '/rest/v1/game_library?user_id=eq.' + encodeURIComponent(sess.user.id) +
+      '&order=added_at.desc&select=*';
+    function parseList(res) {
+      if (res.status >= 400) throw new Error('Could not read the old cloud library, status ' + res.status + '.');
+      try { return JSON.parse(res.text || '[]'); } catch (e) { return []; }
+    }
+    return oldSupabaseXhr('GET', url, sess.access_token).then(function (res) {
+      if (res.status === 401 && sess.refresh_token) {
+        return refreshOldSupabaseToken(sess).then(function () {
+          return oldSupabaseXhr('GET', url, sess.access_token);
+        }).then(parseList);
+      }
+      return parseList(res);
+    });
+  }
+
+  function moveOneOldGame(sess, row) {
+    // Already moved? Same title + system already in the Drive library.
+    for (var i = 0; i < driveLibrary.length; i++) {
+      if (driveLibrary[i].title === row.title && driveLibrary[i].system === row.system) return Promise.resolve(false);
+    }
+    if (row.source === 'url') {
+      return addDriveRecord({
+        title: row.title, system: row.system, core: row.core,
+        source: 'url', romUrl: row.rom_url, fileId: null, addedAt: row.added_at
+      }).then(function () { return true; }).catch(function () { return false; });
+    }
+    var path = row.rom_url;
+    var fileName = path.split('/').pop() || ('game-' + Date.now());
+    var url = window.SUPABASE_URL + '/storage/v1/object/roms/' +
+      path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+    return oldSupabaseXhr('GET', url, sess.access_token, null, null, 'blob').then(function (res) {
+      if (res.status >= 400 || !res.blob) throw new Error('Could not download ' + row.title + ' from the old cloud.');
+      return uploadWithProgress(fileName, res.blob, row.title, function () {});
+    }).then(function (fileId) {
+      return addDriveRecord({
+        title: row.title, system: row.system, core: row.core,
+        source: 'upload', romUrl: null, fileId: fileId, addedAt: row.added_at
+      });
+    }).then(function () { return true; }).catch(function (err) {
+      announce('Could not move ' + row.title + ': ' + plainErrorReason(err));
+      return false;
     });
   }
 
   // ---------- Add a game ----------
 
-  // Upload a file to the roms bucket with real progress. The Supabase
-  // storage upload call has no progress callback, so this posts the
-  // file directly to the Storage API, which reports upload progress.
-  // onProgress gets 0-100. Fails loudly if nothing moves for 60 s.
-  function uploadWithProgress(path, file, title, onProgress) {
-    return supabaseClient.auth.getSession().then(function (sess) {
-      var token = (sess && sess.data && sess.data.session) ? sess.data.session.access_token : window.SUPABASE_ANON_KEY;
+  // ---------- Upload / download a game file (Google Drive) ----------
+
+  // Upload a file to the Lynxos Retro folder in Drive with real
+  // progress. One multipart POST (Drive takes files up to 5 TB, so
+  // there is no size cap here any more). onProgress gets 0-100.
+  // Fails loudly if nothing moves for 60 s. Resolves the Drive file id.
+  function uploadWithProgress(fileName, file, title, onProgress) {
+    return ensureDriveFolder().then(function () {
+      return ensureDriveToken();
+    }).then(function () {
       return new Promise(function (resolve, reject) {
-        var url = window.SUPABASE_URL + '/storage/v1/object/roms/' +
-          path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
+        var boundary = 'lynxos-retro-' + Date.now();
+        var meta = JSON.stringify({ name: fileName, parents: [driveFolderId] });
+        var head = '--' + boundary + '\r\n' +
+          'Content-Type: application/json; charset=UTF-8\r\n\r\n' + meta + '\r\n' +
+          '--' + boundary + '\r\n' +
+          'Content-Type: ' + (file.type || 'application/octet-stream') + '\r\n\r\n';
+        var tail = '\r\n--' + boundary + '--';
+        var body = new Blob([head, file, tail], { type: 'multipart/related; boundary=' + boundary });
         var xhr = new XMLHttpRequest();
         var lastMove = Date.now();
         var lastMilestone = 0;
@@ -1101,11 +1436,9 @@
             reject(new Error('Upload seems stuck: nothing went up for a minute. Check your connection and try again.'));
           }
         }, 5000);
-        xhr.open('POST', url);
-        xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-        xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
-        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
-        xhr.setRequestHeader('x-upsert', 'false');
+        xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart');
+        xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
+        xhr.setRequestHeader('Content-Type', 'multipart/related; boundary=' + boundary);
         xhr.upload.onprogress = function (e) {
           lastMove = Date.now();
           if (!e.lengthComputable) return;
@@ -1119,10 +1452,11 @@
         };
         xhr.onload = function () {
           clearInterval(stallTimer);
-          if (xhr.status >= 200 && xhr.status < 300) { onProgress(100); resolve(); }
+          var data = {};
+          try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+          if (xhr.status >= 200 && xhr.status < 300 && data.id) { onProgress(100); resolve(data.id); }
           else {
-            var detail = '';
-            try { var body = JSON.parse(xhr.responseText || '{}'); detail = body.message || body.error || ''; } catch (e) {}
+            var detail = (data.error && data.error.message) || '';
             reject(new Error(detail || ('Cloud upload failed, status ' + xhr.status + '.')));
           }
         };
@@ -1138,21 +1472,17 @@
         // long as it needs while it is moving. The 60-second stall
         // check above is what catches a dead connection, so a stuck
         // upload still fails loudly instead of hanging forever.
-        xhr.send(file);
+        xhr.send(body);
       });
     });
   }
 
-  // Download a cloud game file with real progress, so a big game says
-  // how far along it is instead of sitting silent. GETs the Storage
-  // API directly (the supabase .download() call reports no progress).
+  // Download a game file from Drive with real progress, so a big game
+  // says how far along it is instead of sitting silent.
   // onProgress gets 0-100. Fails loudly if nothing moves for 60 s.
-  function downloadWithProgress(path, title, onProgress) {
-    return supabaseClient.auth.getSession().then(function (sess) {
-      var token = (sess && sess.data && sess.data.session) ? sess.data.session.access_token : window.SUPABASE_ANON_KEY;
+  function downloadWithProgress(fileId, title, onProgress) {
+    return ensureDriveToken().then(function () {
       return new Promise(function (resolve, reject) {
-        var url = window.SUPABASE_URL + '/storage/v1/object/roms/' +
-          path.split('/').map(function (s) { return encodeURIComponent(s); }).join('/');
         var xhr = new XMLHttpRequest();
         xhr.responseType = 'blob';
         var lastMove = Date.now();
@@ -1164,9 +1494,8 @@
             reject(new Error('Download seems stuck: nothing came down for a minute. Check your connection and try again.'));
           }
         }, 5000);
-        xhr.open('GET', url);
-        xhr.setRequestHeader('Authorization', 'Bearer ' + token);
-        xhr.setRequestHeader('apikey', window.SUPABASE_ANON_KEY);
+        xhr.open('GET', 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media');
+        xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
         xhr.onprogress = function (e) {
           lastMove = Date.now();
           if (!e.lengthComputable) return;
@@ -1185,9 +1514,7 @@
             announce('Downloaded ' + title + '.');
             resolve(xhr.response);
           } else {
-            var detail = '';
-            try { var body = JSON.parse(xhr.responseText || '{}'); detail = body.message || body.error || ''; } catch (e) {}
-            reject(new Error(detail || ('Cloud download failed, status ' + xhr.status + '.')));
+            reject(new Error('Cloud download failed, status ' + xhr.status + '.'));
           }
         };
         xhr.onerror = function () {
@@ -1234,28 +1561,25 @@
     var core = systemCore(system);
     setStatus(status, 'Adding ' + title + '…', '');
 
-    if (file && supabaseClient && currentUser) {
-      // Signed in: upload the file to the cloud, then save the row.
-      // The Supabase upload call reports no progress, so this uses a
-      // direct request instead, which does: the progress bar fills as
-      // the file goes up, and a stall fails loudly instead of sitting
-      // silent on "Adding...".
-      var path = currentUser.id + '/' + Date.now() + '-' + file.name;
+    if (file && currentUser) {
+      // Signed in: upload the file to Google Drive, then save it in
+      // the Drive library. The progress bar fills as the file goes
+      // up, and a stall fails loudly instead of sitting silent on
+      // "Adding...".
+      var fileName = Date.now() + '-' + file.name;
       showAddProgress(true);
       setAddProgress(0, title);
       setStatus(status, 'Uploading ' + title + ', 0 percent.', '');
       announce('Uploading ' + title + ', 0 percent.');
-      uploadWithProgress(path, file, title, function (percent) {
+      uploadWithProgress(fileName, file, title, function (percent) {
         setAddProgress(percent, title);
-      }).then(function () {
+      }).then(function (fileId) {
         showAddProgress(false);
-        return supabaseClient.from('game_library').insert({
-          user_id: currentUser.id, title: title, system: system,
-          core: core, rom_url: path, source: 'upload'
+        return addDriveRecord({
+          title: title, system: system, core: core,
+          source: 'upload', fileId: fileId, romUrl: null
         });
-      }).then(function (ins) {
-        if (!ins) return;
-        if (ins.error) { failAdd(status, title, ins.error); return; }
+      }).then(function () {
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
         announceUrgent('Added ' + title + ' to your cloud library.');
@@ -1288,12 +1612,11 @@
     }
 
     // Link only.
-    if (supabaseClient && currentUser) {
-      supabaseClient.from('game_library').insert({
-        user_id: currentUser.id, title: title, system: system,
-        core: core, rom_url: url, source: 'url'
-      }).then(function (ins) {
-        if (ins.error) { failAdd(status, title, ins.error); return; }
+    if (currentUser) {
+      addDriveRecord({
+        title: title, system: system, core: core,
+        source: 'url', romUrl: url, fileId: null
+      }).then(function () {
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
         announceUrgent('Added ' + title + ' to your cloud library.');
@@ -1365,18 +1688,25 @@
       return;
     }
     if (game.source === 'synced') {
-      if (!supabaseClient || !currentUser) {
+      if (!currentUser) {
         setStatus(status, 'Sign in to change a synced game.', 'error');
         announce('Sign in to change a synced game.');
         return;
       }
-      var rowId = String(game.id).replace(/^sync-/, '');
-      supabaseClient.from('game_library').update({ title: title, system: system, core: core }).eq('id', rowId).then(function (res) {
-        if (res.error) {
-          setStatus(status, 'Could not save: ' + res.error.message, 'error');
-          announce('Could not save: ' + res.error.message);
-          return;
-        }
+      var recId = String(game.id).replace(/^drive-/, '');
+      var rec = null;
+      for (var i = 0; i < driveLibrary.length; i++) {
+        if (driveLibrary[i].id === recId) { rec = driveLibrary[i]; break; }
+      }
+      if (!rec) {
+        setStatus(status, 'Could not find that game in your cloud library.', 'error');
+        announce('Could not find that game in your cloud library.');
+        return;
+      }
+      rec.title = title;
+      rec.system = system;
+      rec.core = core;
+      writeDriveLibrary().then(function () {
         announce('Saved ' + title + '.');
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
@@ -1414,26 +1744,22 @@
       return;
     }
     if (game.source === 'synced') {
-      if (!supabaseClient || !currentUser) {
+      if (!currentUser) {
         setStatus(status, 'Sign in to delete a synced game.', 'error');
         announce('Sign in to delete a synced game.');
         return;
       }
-      var rowId = String(game.id).replace(/^sync-/, '');
+      var recId = String(game.id).replace(/^drive-/, '');
       // Drop this game's downloaded copy too, so the cache does not
       // keep files for games that are gone.
       if (game.storagePath) idbDelete('cloud:' + game.storagePath).catch(function () {});
       var removeFile = game.storagePath
-        ? supabaseClient.storage.from('roms').remove([game.storagePath])
+        ? driveDeleteFile(game.storagePath)
         : Promise.resolve();
       removeFile.then(function () {
-        return supabaseClient.from('game_library').delete().eq('id', rowId);
-      }).then(function (res) {
-        if (res.error) {
-          setStatus(status, 'Could not delete: ' + res.error.message, 'error');
-          announce('Could not delete: ' + res.error.message);
-          return;
-        }
+        driveLibrary = driveLibrary.filter(function (r) { return r.id !== recId; });
+        return writeDriveLibrary();
+      }).then(function () {
         announce('Deleted ' + game.title + '.');
         syncLibrary().then(function () { showScreen('library'); });
       }).catch(function (err) {
@@ -1453,7 +1779,7 @@
     window.addEventListener('keydown', libraryGridNav);
     buildTabs();
     renderList();
-    initSupabase();
+    initDrive();
     updateSyncStatus();
     updateAccountStatus();
 
@@ -1474,15 +1800,9 @@
       showScreen('account');
     });
     $('accountBackBtn').addEventListener('click', function () { showScreen('library'); });
-    $('signInBtn').addEventListener('click', signIn);
-    $('signUpBtn').addEventListener('click', signUp);
-    $('signOutBtn').addEventListener('click', signOut);
-    $('forgotBtn').addEventListener('click', function () {
-      showResetSection();
-      $('authEmail').focus();
-    });
-    $('sendResetBtn').addEventListener('click', sendResetEmail);
-    $('savePasswordBtn').addEventListener('click', saveNewPassword);
+    $('driveSignInBtn').addEventListener('click', startDriveSignIn);
+    $('driveSignOutBtn').addEventListener('click', signOutDrive);
+    $('driveCancelBtn').addEventListener('click', cancelDriveSignIn);
     $('syncBtn').addEventListener('click', function () {
       if (!syncConfigured) {
         announce('Cloud sync is not set up yet.');
@@ -1494,21 +1814,9 @@
     });
     $('backBtn').addEventListener('click', function () { location.reload(); });
 
-    if (supabaseClient) {
-      supabaseClient.auth.onAuthStateChange(function (_event, session) {
-        currentUser = session ? session.user : null;
-        updateSyncStatus();
-        // In recovery mode the "Choose a new password." message must
-        // stay on screen; the default status would overwrite it.
-        if (!recoveryMode) updateAccountStatus();
-        if (currentUser) syncLibrary(); else { syncedGames = []; renderList(); }
-      });
-      refreshSession();
-      // Opened from an auth email link: the tokens are in the URL hash.
-      if (window.location.hash && window.location.hash.indexOf('access_token') !== -1) {
-        window.handleAuthCallback(window.location.href);
-      }
-    }
+    // Signed in before (tokens saved on this device)? Pick the session
+    // back up, sync the library, and move any old-cloud games over.
+    refreshSession();
 
     announce('Lynxos Retro. ' + BUNDLED.length + ' games included.');
   }
