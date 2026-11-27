@@ -1000,7 +1000,11 @@ jobs:
           gradle-version: 8.7
 
       - name: Build native N64 bridge (CMake)
-        run: gradle :app:buildCMakeRelease
+        # AGP names this task externalNativeBuildRelease (there is no
+        # buildCMakeRelease task): it compiles the C bridge so a
+        # native error fails here, fast, instead of inside the APK
+        # build below. assembleRelease would build it anyway.
+        run: gradle :app:externalNativeBuildRelease
 
       - name: Build release APK (unsigned)
         run: gradle :app:assembleRelease
