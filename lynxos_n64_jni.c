@@ -289,6 +289,7 @@ static volatile long g_frames_presented;
 static JavaVM *g_vm;
 static jobject g_activity_global;
 static jmethodID g_on_audio_batch;
+static jmethodID g_on_bridge_step;
 static pthread_key_t g_jni_key;
 static int g_jni_key_created;
 
@@ -366,6 +367,29 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames) {
     return frames;
 }
 
+/* Bridge-step breadcrumb (v1.4.7): record the last graphics-setup
+ * step in SharedPreferences via the activity, so a native crash
+ * inside the core's GL init still leaves a durable trace naming the
+ * step it died in. Called from handle_set_hw_render /
+ * create_gl_context_locked, i.e. on the core thread during
+ * retro_load_game — before any Java code could report anything. The
+ * write uses commit() (in onBridgeStep) because the crash can land
+ * milliseconds after the write. */
+static void record_bridge_step(const char *step) {
+    LOGI("bridge step: %s", step);
+    if (!g_activity_global || !g_on_bridge_step) return;
+    JNIEnv *env = get_jni_env();
+    if (!env) return;
+    jstring jstep = (*env)->NewStringUTF(env, step);
+    if (!jstep) return;
+    (*env)->CallVoidMethod(env, g_activity_global, g_on_bridge_step, jstep);
+    if ((*env)->ExceptionCheck(env)) {
+        (*env)->ExceptionDescribe(env);
+        (*env)->ExceptionClear(env);
+    }
+    (*env)->DeleteLocalRef(env, jstep);
+}
+
 static void input_poll_cb(void) {
     /* State is read directly in input_state_cb; nothing to poll. */
 }
@@ -422,22 +446,86 @@ static uintptr_t lynxos_get_current_framebuffer(void) {
     return 0;
 }
 
-static const char *PREWARM_SYMS[] = {
-    "glClear", "glViewport", "glGenFramebuffers", "glBindFramebuffer",
-    "glGenTextures", "glTexImage2D", "glDrawArrays", "glGetString",
-    "glGetIntegerv", "glGetError"
+/* Pre-warm: resolve the GL entry points the cores will ask for
+ * through lynxos_get_proc_address, before loadGame hands control to
+ * the core. A missing one is a clean, diagnosable failure — not a
+ * segfault inside the core later (a NULL proc address called by the
+ * core kills the whole process, and no Java reporting ever runs).
+ *
+ * The lists are the intersection of the OpenGL ES core API for that
+ * version with the function names in the shipped cores' string tables
+ * (parallel_n64 + mupen64plus_next .so files, as shipped in v1.4.6):
+ * ES2 set from both cores, ES3 set (ES 3.0 core only) from mupen.
+ * Extension names (EXT/OES/KHR/...) are deliberately excluded:
+ * eglGetProcAddress may legitimately return NULL for an unsupported
+ * extension, and the cores check extensions themselves. ES 3.1/3.2
+ * functions are excluded for the same reason — the context is ES 3.0.
+ * Every name here is a core function of the context version it is
+ * checked under, so a conformant driver must resolve it: a NULL here
+ * is a real failure, never a false positive. */
+static const char *PREWARM_SYMS_ES2[] = {
+    "glActiveTexture", "glAttachShader", "glBindAttribLocation", "glBindBuffer",
+    "glBindFramebuffer", "glBindRenderbuffer", "glBindTexture", "glBlendColor",
+    "glBlendEquationSeparate", "glBlendFunc", "glBlendFuncSeparate", "glBufferData",
+    "glBufferSubData", "glCheckFramebufferStatus", "glClear", "glClearColor",
+    "glClearDepthf", "glColorMask", "glCompileShader", "glCopyTexImage2D",
+    "glCopyTexSubImage2D", "glCreateProgram", "glCreateShader", "glCullFace",
+    "glDeleteBuffers", "glDeleteFramebuffers", "glDeleteProgram", "glDeleteRenderbuffers",
+    "glDeleteShader", "glDeleteTextures", "glDepthFunc", "glDepthMask",
+    "glDepthRangef", "glDetachShader", "glDisable", "glDisableVertexAttribArray",
+    "glDrawArrays", "glDrawElements", "glEnable", "glEnableVertexAttribArray",
+    "glFinish", "glFlush", "glFramebufferRenderbuffer", "glFramebufferTexture2D",
+    "glFrontFace", "glGenBuffers", "glGenFramebuffers", "glGenRenderbuffers",
+    "glGenTextures", "glGenerateMipmap", "glGetError", "glGetFloatv",
+    "glGetFramebufferAttachmentParameteriv", "glGetIntegerv", "glGetProgramInfoLog", "glGetProgramiv",
+    "glGetShaderInfoLog", "glGetShaderiv", "glGetString", "glGetTexParameteriv",
+    "glGetUniformLocation", "glGetVertexAttribPointerv", "glGetVertexAttribiv", "glIsProgram",
+    "glLineWidth", "glLinkProgram", "glPixelStorei", "glPolygonOffset",
+    "glReadPixels", "glRenderbufferStorage", "glScissor", "glShaderSource",
+    "glStencilFunc", "glStencilMask", "glStencilOp", "glTexImage2D",
+    "glTexParameterf", "glTexParameteri", "glTexSubImage2D", "glUniform1f",
+    "glUniform1i", "glUniform1iv", "glUniform2f", "glUniform2i",
+    "glUniform3f", "glUniform3fv", "glUniform4f", "glUniform4fv",
+    "glUniform4i", "glUseProgram", "glVertexAttrib1f", "glVertexAttrib4f",
+    "glVertexAttrib4fv", "glVertexAttribPointer", "glViewport"
 };
 
-/* Resolve the GL entry points glsm needs, before loadGame. A missing
- * one is a clean, diagnosable failure — not a segfault inside the
- * core later. */
-static bool prewarm_gl(void) {
-    for (size_t i = 0; i < sizeof PREWARM_SYMS / sizeof PREWARM_SYMS[0]; i++) {
-        void *p = (void *)eglGetProcAddress(PREWARM_SYMS[i]);
+static const char *PREWARM_SYMS_ES3[] = {
+    "glBindBufferBase", "glBindVertexArray", "glBlitFramebuffer", "glClientWaitSync",
+    "glDeleteSync", "glDeleteVertexArrays", "glDrawBuffers", "glFenceSync",
+    "glFlushMappedBufferRange", "glGenVertexArrays", "glGetActiveUniformBlockiv", "glGetActiveUniformsiv",
+    "glGetProgramBinary", "glGetStringi", "glGetUniformBlockIndex", "glGetUniformIndices",
+    "glInvalidateFramebuffer", "glMapBufferRange", "glProgramBinary", "glProgramParameteri",
+    "glReadBuffer", "glTexStorage2D", "glUniformBlockBinding", "glUnmapBuffer"
+};
+
+static bool prewarm_syms(const char **syms, size_t count) {
+    for (size_t i = 0; i < count; i++) {
+        void *p = (void *)eglGetProcAddress(syms[i]);
         if (!p) {
-            LOGE("pre-warm: %s is missing", PREWARM_SYMS[i]);
+            LOGE("pre-warm: %s is missing", syms[i]);
             snprintf(g_last_error, sizeof g_last_error,
-                     "The graphics could not start: %s is missing.", PREWARM_SYMS[i]);
+                     "The graphics could not start: %s is missing.", syms[i]);
+            return false;
+        }
+    }
+    return true;
+}
+
+/* The context version create_gl_context_locked really created (2 or
+ * 3 — the ES3 request falls back to ES2 when the device has no ES3
+ * config). The ES3 set is only checked on a real ES3 context: on an
+ * ES2 context those names legitimately resolve to NULL. */
+static int g_gl_actual_version = 2;
+
+static bool prewarm_gl(void) {
+    if (!prewarm_syms(PREWARM_SYMS_ES2,
+                      sizeof PREWARM_SYMS_ES2 / sizeof PREWARM_SYMS_ES2[0])) {
+        return false;
+    }
+    if (g_gl_actual_version >= 3) {
+        if (!prewarm_syms(PREWARM_SYMS_ES3,
+                          sizeof PREWARM_SYMS_ES3 / sizeof PREWARM_SYMS_ES3[0])) {
             return false;
         }
     }
@@ -488,6 +576,11 @@ static bool create_gl_context_locked(void) {
         }
         version = 2;
     }
+    /* The version that really got created (the ES3 request may have
+     * fallen back to ES2 above); prewarm_gl checks symbols against
+     * this, not the requested version. */
+    g_gl_actual_version = version;
+    record_bridge_step("graphics mode chosen");
     EGLint depth = 0, stencil = 0, visual = 0;
     eglGetConfigAttrib(g_display, config, EGL_DEPTH_SIZE, &depth);
     eglGetConfigAttrib(g_display, config, EGL_STENCIL_SIZE, &stencil);
@@ -517,6 +610,7 @@ static bool create_gl_context_locked(void) {
     }
     if (!eglSwapInterval(g_display, 1)) log_egl("eglSwapInterval");
     LOGI("GL context ready (GLES %d)", version);
+    record_bridge_step("graphics context ready");
     return true;
 }
 
@@ -587,6 +681,7 @@ static bool handle_set_hw_render(void *data) {
         set_error("The game screen was not ready.");
         return false;
     }
+    record_bridge_step("starting graphics setup");
     g_hw = *cb; /* copy: the core's struct is filled in, we add ours */
     g_hw.get_proc_address = lynxos_get_proc_address;
     g_hw.get_current_framebuffer = lynxos_get_current_framebuffer;
@@ -603,9 +698,11 @@ static bool handle_set_hw_render(void *data) {
         g_hw_active = false;
         return false;
     }
+    record_bridge_step("graphics functions checked");
     /* The context is current, so this is the correct moment: glsm
      * re-initialises its state here. */
     if (g_hw.context_reset) g_hw.context_reset();
+    record_bridge_step("core graphics started");
     LOGI("HW render ready, context_reset called");
     return true;
 }
@@ -788,6 +885,15 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeInit(JNIEnv *env, jobject
         LOGE("onAudioBatch method not found");
         set_error("The Nintendo 64 player could not start.");
         return JNI_FALSE;
+    }
+    /* Bridge-step breadcrumb (v1.4.7): diagnostic only — if the
+     * method is missing the player still works, the step just won't
+     * be recorded. A failed lookup leaves an exception pending, so
+     * clear it. */
+    g_on_bridge_step = (*env)->GetMethodID(env, clazz, "onBridgeStep", "(Ljava/lang/String;)V");
+    if (!g_on_bridge_step) {
+        if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        LOGE("onBridgeStep method not found; bridge steps will not be recorded");
     }
     LOGI("nativeInit ok");
     return JNI_TRUE;

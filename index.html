@@ -14,6 +14,9 @@
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
   #syncStatus { color: #cccccc; font-size: 16px; margin: 4px 0 16px 0; }
   .note { color: #cccccc; font-size: 16px; }
+  /* F5 (v1.4.7): the last silent-death record, gold and bold so it
+     stands out on the library screen. */
+  #lastPlayerClose { color: #F5C518; font-weight: bold; font-size: 16px; }
   .error { color: #ff8080; font-size: 17px; font-weight: bold; }
   .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
   button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
@@ -84,6 +87,10 @@
   <main id="libraryScreen" aria-label="Game library">
     <div role="tablist" aria-label="Game systems" id="systemTabs"></div>
     <p id="gameCount" role="status"></p>
+    <div id="lastPlayerCloseWrap" hidden>
+      <p id="lastPlayerClose" role="status"></p>
+      <button type="button" id="dismissLastCloseBtn">Dismiss</button>
+    </div>
     <ul id="gameList" role="list"></ul>
     <p id="emptyState" class="note" hidden></p>
     <div class="actions">
@@ -269,6 +276,41 @@
     announce(text);
     announceUrgent(text);
   };
+
+  // F5 (v1.4.7): visible record of a silent player death. The app
+  // stores "system — title — closed unexpectedly. <reason> <time>"
+  // in SharedPreferences when a player dies without reporting; the
+  // page shows it on the library screen until the next game starts
+  // or the user dismisses it. Prefs-backed, so it survives a
+  // process death.
+  function refreshLastPlayerClose() {
+    try {
+      var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
+      if (!el || !wrap) return;
+      var record = '';
+      if (window.LynxosRetro && window.LynxosRetro.getLastPlayerClose) {
+        record = window.LynxosRetro.getLastPlayerClose() || '';
+      }
+      if (record) {
+        el.textContent = 'Last game: ' + record;
+        wrap.hidden = false;
+      } else {
+        el.textContent = '';
+        wrap.hidden = true;
+      }
+    } catch (e) {}
+  }
+
+  function clearLastPlayerClose() {
+    try {
+      if (window.LynxosRetro && window.LynxosRetro.clearLastPlayerClose) {
+        window.LynxosRetro.clearLastPlayerClose();
+      }
+    } catch (e) {}
+    var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
+    if (el) el.textContent = '';
+    if (wrap) wrap.hidden = true;
+  }
 
   // Translate a raw upload/save error into plain words, never just
   // "unknown error". Returns the reason to speak and show.
@@ -511,6 +553,7 @@
     $('editScreen').hidden = name !== 'edit';
     $('accountScreen').hidden = name !== 'account';
     $('playerScreen').hidden = name !== 'player';
+    if (name === 'library') refreshLastPlayerClose();
   }
 
   // ---------- Tabs + library ----------
@@ -682,6 +725,9 @@
   // ---------- Player ----------
 
   function playGame(game) {
+    // F5: a new launch supersedes the old silent-death record; if
+    // this game dies silently, a fresh record replaces it.
+    clearLastPlayerClose();
     // PlayStation runs on the native player (real ARM code, not the
     // browser): export the game file to the app and hand it over.
     if (game.system === 'psx') {
@@ -2864,6 +2910,8 @@
     window.addEventListener('keydown', libraryGridNav);
     buildTabs();
     renderList();
+    refreshLastPlayerClose();
+    $('dismissLastCloseBtn').addEventListener('click', clearLastPlayerClose);
     initDrive();
     updateSyncStatus();
     updateAccountStatus();

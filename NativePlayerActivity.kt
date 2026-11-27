@@ -321,7 +321,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                 runOnUiThread {
                     Toast.makeText(this, "Could not start $gameTitle. $reason", Toast.LENGTH_LONG).show()
                     speak("Could not start $gameTitle. $reason")
-                    finish()
+                    finishPlayerDelayed()
                 }
             }
         }.start()
@@ -415,7 +415,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                     runOnUiThread {
                         Toast.makeText(this, "The game stopped. $reason", Toast.LENGTH_LONG).show()
                         speak("The game stopped. $reason")
-                        finishPlayer()
+                        finishPlayerDelayed()
                     }
                     return@Thread
                 }
@@ -744,8 +744,20 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         root.addView(r1)
     }
 
+    /* F3 (v1.4.7): finishPlayer() stops and shuts down TTS, which
+     * cancels any utterance speak() just queued. Delay the finish so
+     * the spoken "Could not start ..." / "The game stopped" message
+     * actually plays. Posted on mainHandler and cancelled in
+     * finishPlayer(), so it cannot leak the Activity past its end. */
+    private val finishPlayerRunnable = Runnable { finishPlayer() }
+
+    private fun finishPlayerDelayed() {
+        mainHandler.postDelayed(finishPlayerRunnable, 2500)
+    }
+
     private fun finishPlayer() {
         if (closed.getAndSet(true)) return
+        mainHandler.removeCallbacks(finishPlayerRunnable)
         // A deliberate exit (or a reported failure, whose outcome is
         // already recorded): clear the launch marker so MainActivity
         // does not announce this return as a silent crash.

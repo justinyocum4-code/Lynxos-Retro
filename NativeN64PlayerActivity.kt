@@ -163,6 +163,29 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         } catch (e: Exception) {
         }
     }
+
+    /* Bridge-step breadcrumb (v1.4.7): the native side reports the
+     * last graphics-setup step during retro_load_game; it is written
+     * with commit() so a native crash milliseconds later still
+     * leaves a durable trace naming the step it died in. Called from
+     * native code via JNI, not from JavaScript — no annotation. */
+    fun onBridgeStep(step: String) {
+        try {
+            getSharedPreferences("lynxos-retro", MODE_PRIVATE).edit()
+                .putString("playerBridgeStep", step).commit()
+        } catch (e: Exception) {}
+    }
+
+    /* F3 (v1.4.7): finishPlayer() stops and shuts down TTS, which
+     * cancels any utterance speak() just queued. Delay the finish so
+     * the spoken "Could not start ..." / "The game stopped" message
+     * actually plays. Posted on mainHandler and cancelled in
+     * finishPlayer(), so it cannot leak the Activity past its end. */
+    private val finishPlayerRunnable = Runnable { finishPlayer() }
+
+    private fun finishPlayerDelayed() {
+        mainHandler.postDelayed(finishPlayerRunnable, 2500)
+    }
     private var videoCheckDone = false
 
     private val exitRunnable = Runnable {
@@ -370,7 +393,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                                 Toast.makeText(this, "The game stopped. $reason", Toast.LENGTH_LONG).show()
                                 speak("The game stopped. $reason")
                             }
-                            finishPlayer()
+                            finishPlayerDelayed()
                         }
                         break
                     }
@@ -394,7 +417,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 runOnUiThread {
                     Toast.makeText(this, "Could not start $gameTitle. $reason", Toast.LENGTH_LONG).show()
                     speak("Could not start $gameTitle. $reason")
-                    finishPlayer()
+                    finishPlayerDelayed()
                 }
             } finally {
                 try {
@@ -942,6 +965,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     private fun finishPlayer() {
         if (closed.getAndSet(true)) return
+        mainHandler.removeCallbacks(finishPlayerRunnable)
         // A deliberate exit (or a reported failure, whose outcome is
         // already recorded): clear the launch marker so MainActivity
         // does not announce this return as a silent crash.
