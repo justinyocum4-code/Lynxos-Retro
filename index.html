@@ -1096,6 +1096,7 @@
           if (wrap2) wrap2.hidden = true;
           if (errCode === 'access_denied') authStatus('Sign-in was cancelled.', 'error');
           else if (errCode === 'expired_token') authStatus('That code expired. Tap Sign in with Google to get a new one.', 'error');
+          else if (errCode === 'invalid_client') authStatus('Google did not accept the app sign-in secret, so this code cannot work. The secret in the app needs fixing first.', 'error');
           else authStatus((data.error_description) || 'Google sign-in did not work.', 'error');
         }).catch(function () {
           // A network blip while polling: keep waiting; the next tick
