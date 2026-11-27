@@ -899,12 +899,293 @@
     });
   }
 
+  // ---------- Archives for the native player ----------
+
+  // A native core's loadGame needs a real disc image or ROM file:
+  // handing it a .7z/.zip/.rar archive fails, which is how Crash
+  // Bandicoot (a .7z) died with "Could not start". The browser
+  // player unpacks archives itself; for the native path the page
+  // unpacks first, with the very same extractor scripts EmulatorJS
+  // ships (assets/emulatorjs/data/compression/) and the same worker
+  // protocol it uses: fetch the worker script as text, run it in a
+  // Worker, post the archive bytes, collect the t:2 file messages
+  // until t:1. No new dependency. RAR needs the wrapper EmulatorJS
+  // builds around libunrar.js (see extractArchive); 7z and zip run
+  // their scripts as-is, exactly as EmulatorJS posts to them.
+  function archiveTypeOf(head) {
+    if (!head || head.length < 6) return null;
+    // 7z: 37 7A BC AF 27 1C
+    if (head[0] === 0x37 && head[1] === 0x7A && head[2] === 0xBC &&
+        head[3] === 0xAF && head[4] === 0x27 && head[5] === 0x1C) return '7z';
+    // zip: PK\x03\x04 (file), PK\x05\x06 (empty), PK\x07\x08 (spanned)
+    if (head[0] === 0x50 && head[1] === 0x4B &&
+        ((head[2] === 0x03 && head[3] === 0x04) ||
+         (head[2] === 0x05 && head[3] === 0x06) ||
+         (head[2] === 0x07 && head[3] === 0x08))) return 'zip';
+    // rar: Rar!\x1A\x07\x00 (RAR4) or Rar!\x1A\x07\x01\x00 (RAR5)
+    if (head[0] === 0x52 && head[1] === 0x61 && head[2] === 0x72 &&
+        head[3] === 0x21 && head[4] === 0x1A && head[5] === 0x07 &&
+        (head[6] === 0x00 || (head[6] === 0x01 && head[7] === 0x00))) return 'rar';
+    return null;
+  }
+
+  function readBlobHead(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsArrayBuffer(blob.slice(0, 10));
+    });
+  }
+
+  function blobToBytes(blob) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () { resolve(new Uint8Array(reader.result)); };
+      reader.onerror = function () { reject(reader.error); };
+      reader.readAsArrayBuffer(blob);
+    });
+  }
+
+  function fetchText(url) {
+    return fetch(url).then(function (r) {
+      if (!r.ok) throw new Error('Could not load ' + url + '.');
+      return r.text();
+    });
+  }
+
+  // Unpack an archive blob with the bundled EmulatorJS extractor
+  // for its type. Resolves with { fileName: Uint8Array, ... }.
+  // onProgress(percent, fileName) reports the worker's t:4 progress.
+  function extractArchive(blob, type, title, onProgress) {
+    var base = 'assets/emulatorjs/data/compression/';
+    var scriptPromise;
+    if (type === '7z') {
+      scriptPromise = fetchText(base + 'extract7z.js');
+    } else if (type === 'zip') {
+      scriptPromise = fetchText(base + 'extractzip.js');
+    } else {
+      // RAR: EmulatorJS's wrapper around libunrar.js. The wrapper
+      // sets Module (monitorRunDependencies runs unrar once the
+      // wasm runtime is ready; locateFile hands it the .wasm blob
+      // URL), then the libunrar.js text, then unrar() which walks
+      // the archive tree posting t:2 per file and t:1 at the end,
+      // and an onmessage that collects the posted archive bytes.
+      scriptPromise = Promise.all([
+        fetchText(base + 'libunrar.js'),
+        fetch(base + 'libunrar.wasm').then(function (r) {
+          if (!r.ok) throw new Error('Could not load libunrar.wasm.');
+          return r.arrayBuffer();
+        })
+      ]).then(function (parts) {
+        var wasmUrl = URL.createObjectURL(new Blob([parts[1]], { type: 'application/wasm' }));
+        return 'let dataToPass = [];\n' +
+          'Module = {\n' +
+          '  monitorRunDependencies: function(left) {\n' +
+          '    if (left == 0) {\n' +
+          '      setTimeout(function() { unrar(dataToPass, null); }, 100);\n' +
+          '    }\n' +
+          '  },\n' +
+          '  onRuntimeInitialized: function() {},\n' +
+          '  locateFile: function(file) {\n' +
+          '    return "' + wasmUrl + '";\n' +
+          '  }\n' +
+          '};\n' +
+          parts[0] + '\n' +
+          'let unrar = function(data, password) {\n' +
+          '  let cb = function(fileName, fileSize, progress) {\n' +
+          '    postMessage({ "t": 4, "current": progress, "total": fileSize, "name": fileName });\n' +
+          '  };\n' +
+          '  let rarContent = readRARContent(data.map(function(d) {\n' +
+          '    return { name: d.name, content: new Uint8Array(d.content) };\n' +
+          '  }), password, cb);\n' +
+          '  let rec = function(entry) {\n' +
+          '    if (!entry) return;\n' +
+          '    if (entry.type === "file") {\n' +
+          '      postMessage({ "t": 2, "file": entry.fullFileName, "size": entry.fileSize, "data": entry.fileContent });\n' +
+          '    } else if (entry.type === "dir") {\n' +
+          '      Object.keys(entry.ls).forEach(function(k) { rec(entry.ls[k]); });\n' +
+          '    } else {\n' +
+          '      throw "Unknown type";\n' +
+          '    }\n' +
+          '  };\n' +
+          '  rec(rarContent);\n' +
+          '  postMessage({ "t": 1 });\n' +
+          '  return rarContent;\n' +
+          '};\n' +
+          'onmessage = function(data) {\n' +
+          '  dataToPass.push({ name: "test.rar", content: data.data });\n' +
+          '};\n';
+      });
+    }
+    return Promise.all([scriptPromise, blobToBytes(blob)]).then(function (parts) {
+      var scriptText = parts[0];
+      var bytes = parts[1];
+      return new Promise(function (resolve, reject) {
+        var files = {};
+        var worker;
+        try {
+          worker = new Worker(URL.createObjectURL(new Blob([scriptText], { type: 'application/javascript' })));
+        } catch (e) {
+          reject(e);
+          return;
+        }
+        var done = false;
+        function finish(err, result) {
+          if (done) return;
+          done = true;
+          try { worker.terminate(); } catch (e) {}
+          if (err) reject(err); else resolve(result);
+        }
+        worker.onmessage = function (e) {
+          var d = e.data;
+          if (!d) return;
+          if (d.t === 4) {
+            if (typeof onProgress === 'function' && d.total) {
+              onProgress(Math.floor(d.current / d.total * 100), d.name || '');
+            }
+          } else if (d.t === 2) {
+            files[d.file] = d.data;
+          } else if (d.t === 1) {
+            finish(null, files);
+          }
+        };
+        worker.onerror = function () {
+          finish(new Error('Could not unpack ' + title + '.'));
+        };
+        worker.postMessage(bytes);
+      });
+    });
+  }
+
+  // .cue sheets are plain text (Latin-1 in practice), so these go
+  // byte by byte with no decoder dependency.
+  function bytesToLatin1(bytes) {
+    var CH = 32768, out = '';
+    for (var i = 0; i < bytes.length; i += CH) {
+      out += String.fromCharCode.apply(null, bytes.subarray(i, i + CH));
+    }
+    return out;
+  }
+
+  function latin1ToBytes(str) {
+    var out = new Uint8Array(str.length);
+    for (var i = 0; i < str.length; i++) out[i] = str.charCodeAt(i) & 0xFF;
+    return out;
+  }
+
+  function extOf(name) {
+    var i = name.lastIndexOf('.');
+    return i < 0 ? '' : name.slice(i + 1).toLowerCase();
+  }
+
+  function baseNameOf(path) {
+    var p = path.replace(/\\/g, '/');
+    var i = p.lastIndexOf('/');
+    return i < 0 ? p : p.slice(i + 1);
+  }
+
+  function filesWithExt(files, exts) {
+    var out = [];
+    Object.keys(files).forEach(function (name) {
+      if (exts.indexOf(extOf(name)) >= 0) out.push(name);
+    });
+    out.sort();
+    return out;
+  }
+
+  function firstFileWithExt(files, exts) {
+    for (var i = 0; i < exts.length; i++) {
+      var found = filesWithExt(files, [exts[i]]);
+      if (found.length > 0) return found[0];
+    }
+    return null;
+  }
+
+  // The FILE "..." lines of a .cue sheet, in order.
+  function cueReferencedFiles(cueText) {
+    var out = [];
+    cueText.split(/\r\n|\n|\r/).forEach(function (line) {
+      var m = /^\s*FILE\s+"([^"]+)"/i.exec(line);
+      if (m) out.push(m[1]);
+    });
+    return out;
+  }
+
+  // A .cue names its disc file by the name in the archive, which
+  // may carry folders; the bridge writes every file flat into one
+  // folder, so flatten the FILE lines to plain basenames and the
+  // disc file resolves next to the .cue on the device.
+  function rewriteCueToBasenames(cueText) {
+    return cueText.split(/\r\n|\n|\r/).map(function (line) {
+      var m = /^(\s*FILE\s+")([^"]+)(".*)$/i.exec(line);
+      if (!m) return line;
+      return m[1] + baseNameOf(m[2]) + m[3];
+    }).join('\n');
+  }
+
+  // Pick the files a native core can play out of an unpacked
+  // archive. Returns { main, mainBytes, support } or null:
+  // main is the file the player starts from, support the extra
+  // files that must sit next to it (the .bin a .cue names).
+  function pickNativeFiles(system, files) {
+    if (system === 'psx') {
+      var cues = filesWithExt(files, ['cue']);
+      for (var i = 0; i < cues.length; i++) {
+        var cueName = cues[i];
+        var cueText = bytesToLatin1(files[cueName]);
+        var refs = cueReferencedFiles(cueText);
+        var support = [];
+        refs.forEach(function (ref) {
+          var want = baseNameOf(ref).toLowerCase();
+          Object.keys(files).forEach(function (name) {
+            if (baseNameOf(name).toLowerCase() === want && support.indexOf(name) < 0) {
+              support.push(name);
+            }
+          });
+        });
+        if (support.length > 0) {
+          return {
+            main: cueName,
+            mainBytes: latin1ToBytes(rewriteCueToBasenames(cueText)),
+            support: support
+          };
+        }
+      }
+      var single = firstFileWithExt(files, ['chd', 'pbp', 'iso', 'bin', 'img']);
+      if (single) return { main: single, mainBytes: files[single], support: [] };
+      return null;
+    }
+    // n64: one ROM file.
+    var rom = firstFileWithExt(files, ['z64', 'n64', 'v64']);
+    if (rom) return { main: rom, mainBytes: files[rom], support: [] };
+    return null;
+  }
+
   // Sends a PlayStation or Nintendo 64 game to the native player,
   // 1 MB at a time through the bridge, with spoken progress. The
   // bridge launches the player when the last chunk lands. For N64
   // the game's Options-screen core choice goes along too (Parallel
-  // N64 unless Mupen was picked).
+  // N64 unless Mupen was picked). An archived game (.7z/.zip/.rar)
+  // is unpacked first and sent as its disc files instead.
   function exportGameForNative(game) {
+    if (!window.LynxosRetro || !window.LynxosRetro.nativeBegin) {
+      return Promise.reject(new Error('This version cannot start the native player.'));
+    }
+    return resolveGameBlob(game, function (percent) {
+      $('nowPlaying').textContent = 'Downloading ' + game.title + ', ' + percent + ' percent.';
+    }).then(function (blob) {
+      if (!blob) throw new Error('Could not load ' + game.title + '.');
+      return readBlobHead(blob).then(function (head) {
+        var type = archiveTypeOf(head);
+        if (!type) return exportSingleFileForNative(game, blob);
+        return exportArchiveForNative(game, blob, type);
+      });
+    });
+  }
+
+  // The original path, unchanged: one file, straight to the bridge.
+  function exportSingleFileForNative(game, blob) {
     var CHUNK = 1024 * 1024;
     var announced = { 25: false, 50: false, 75: false };
     function announceAt(percent) {
@@ -916,35 +1197,103 @@
         }
       });
     }
-    if (!window.LynxosRetro || !window.LynxosRetro.nativeBegin) {
+    var begin = window.LynxosRetro.nativeBegin(game.title, game.system, blob.size);
+    if (begin !== 'ok') throw new Error(begin);
+    if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
+      window.LynxosRetro.nativeSetCore(game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+    }
+    var offset = 0;
+    function next() {
+      if (offset >= blob.size) {
+        var end = window.LynxosRetro.nativeEnd();
+        if (end !== 'ok') throw new Error(end);
+        return Promise.resolve();
+      }
+      var slice = blob.slice(offset, offset + CHUNK);
+      return blobToBase64(slice).then(function (b64) {
+        var r = window.LynxosRetro.nativeChunk(b64);
+        if (r !== 'ok') throw new Error(r);
+        offset += slice.size;
+        announceAt(Math.floor(offset / blob.size * 100));
+        return next();
+      });
+    }
+    return next();
+  }
+
+  // Unpack, pick the play files, and send them through the
+  // multi-file bridge: support files first, the play file last,
+  // then name it and let nativeEnd launch the player.
+  function exportArchiveForNative(game, blob, type) {
+    var CHUNK = 1024 * 1024;
+    if (!window.LynxosRetro || !window.LynxosRetro.nativeBeginMulti ||
+        !window.LynxosRetro.nativeBeginFile || !window.LynxosRetro.nativeEndFile ||
+        !window.LynxosRetro.nativeSetMainFile) {
       return Promise.reject(new Error('This version cannot start the native player.'));
     }
-    return resolveGameBlob(game, function (percent) {
-      $('nowPlaying').textContent = 'Downloading ' + game.title + ', ' + percent + ' percent.';
-    }).then(function (blob) {
-      if (!blob) throw new Error('Could not load ' + game.title + '.');
-      var begin = window.LynxosRetro.nativeBegin(game.title, game.system, blob.size);
+    $('nowPlaying').textContent = 'Extracting ' + game.title + '…';
+    announce('Extracting ' + game.title + '.');
+    return extractArchive(blob, type, game.title, function (percent) {
+      $('nowPlaying').textContent = 'Extracting ' + game.title + ', ' + percent + ' percent.';
+    }).then(function (files) {
+      var picked = pickNativeFiles(game.system, files);
+      if (!picked) throw new Error('No playable game file inside ' + (game.fileName || game.title) + '.');
+      var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
       if (begin !== 'ok') throw new Error(begin);
       if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
         window.LynxosRetro.nativeSetCore(game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
       }
-      var offset = 0;
-      function next() {
-        if (offset >= blob.size) {
-          var end = window.LynxosRetro.nativeEnd();
-          if (end !== 'ok') throw new Error(end);
-          return Promise.resolve();
-        }
-        var slice = blob.slice(offset, offset + CHUNK);
-        return blobToBase64(slice).then(function (b64) {
-          var r = window.LynxosRetro.nativeChunk(b64);
-          if (r !== 'ok') throw new Error(r);
-          offset += slice.size;
-          announceAt(Math.floor(offset / blob.size * 100));
-          return next();
+      var order = picked.support.slice();
+      order.push(picked.main);
+      var totalBytes = 0;
+      order.forEach(function (name) {
+        totalBytes += name === picked.main ? picked.mainBytes.length : files[name].length;
+      });
+      var sentBytes = 0;
+      var announced = { 25: false, 50: false, 75: false };
+      function announceSend(name, percent) {
+        [25, 50, 75].forEach(function (mark) {
+          if (percent >= mark && !announced[mark]) {
+            announced[mark] = true;
+            $('nowPlaying').textContent = 'Sending ' + name + ', ' + mark + ' percent.';
+            announce('Sending ' + name + ', ' + mark + ' percent.');
+          }
         });
       }
-      return next();
+      function sendOne(name, bytes) {
+        var fileBlob = new Blob([bytes]);
+        var b = window.LynxosRetro.nativeBeginFile(name, fileBlob.size);
+        if (b !== 'ok') throw new Error(b);
+        var offset = 0;
+        function next() {
+          if (offset >= fileBlob.size) {
+            var end = window.LynxosRetro.nativeEndFile();
+            if (end !== 'ok') throw new Error(end);
+            return Promise.resolve();
+          }
+          var slice = fileBlob.slice(offset, offset + CHUNK);
+          return blobToBase64(slice).then(function (b64) {
+            var r = window.LynxosRetro.nativeChunk(b64);
+            if (r !== 'ok') throw new Error(r);
+            offset += slice.size;
+            sentBytes += slice.size;
+            announceSend(name, Math.floor(sentBytes / totalBytes * 100));
+            return next();
+          });
+        }
+        return next();
+      }
+      var chain = Promise.resolve();
+      order.forEach(function (name) {
+        var bytes = name === picked.main ? picked.mainBytes : files[name];
+        chain = chain.then(function () { return sendOne(name, bytes); });
+      });
+      return chain.then(function () {
+        var m = window.LynxosRetro.nativeSetMainFile(picked.main);
+        if (m !== 'ok') throw new Error(m);
+        var end = window.LynxosRetro.nativeEnd();
+        if (end !== 'ok') throw new Error(end);
+      });
     });
   }
 
