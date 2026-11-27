@@ -10,4 +10,4 @@
 // Until this is filled in, the app works fully offline with the
 // games included in the app, and shows "Cloud sync is not set up yet".
 window.DRIVE_CLIENT_ID = "896137836159-luk8sg6p38cnqhmm5ksgucda3ts194m3.apps.googleusercontent.com";
-window.DRIVE_CLIENT_SECRET = "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";
+window.DRIVE_CLIENT_SECRET = "__DRIVE_CLIENT_SECRET__";
