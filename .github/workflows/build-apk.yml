@@ -152,6 +152,16 @@ jobs:
                   versionCode __APP_VERSION_CODE__
                   versionName '__APP_VERSION_NAME__'
               }
+              // Kotlin defaults to JVM 17 (the workflow's JDK) while
+              // the Java compile defaults to 1.8; the build refuses
+              // to mix them, so pin both to 17.
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
           }
           dependencies {
               implementation 'dev.kotlinds:libretro-kmp:0.1.2'
