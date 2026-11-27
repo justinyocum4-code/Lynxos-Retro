@@ -6,11 +6,11 @@ on:
       version_name:
         description: 'Version name (e.g. 1.0.0)'
         required: false
-        default: '1.4.11'
+        default: '1.4.12'
       version_code:
         description: 'Version code (whole number, bump every build)'
         required: false
-        default: '35'
+        default: '36'
       release_notes:
         description: 'Release notes'
         required: false
@@ -464,6 +464,23 @@ jobs:
                   } catch (Exception ignored) {}
               }
 
+              /* Audio diagnostics (v1.4.12): the PS1 player reports
+                 once a second — actual frame rate, underrun count,
+                 average batch size, sample rate. Static here on
+                 MainActivity (not on the LynxosBridge inner class)
+                 so the Kotlin player can call it as
+                 MainActivity.reportPS1AudioDiag. Same prefs-backed
+                 pattern as the N64 line. */
+              private static final String PS1_AUDIO_DIAG_KEY = "lastPS1AudioDiag";
+              public static void reportPS1AudioDiag(String text) {
+                  try {
+                      MainActivity a = instance;
+                      if (a == null || text == null) return;
+                      a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                          .putString(PS1_AUDIO_DIAG_KEY, text).apply();
+                  } catch (Exception ignored) {}
+              }
+
               /* Silent-death marker (v1.4.5): the player Activity
                  sets this when it launches; a clean exit or a
                  reported outcome clears it. If MainActivity comes
@@ -641,6 +658,27 @@ jobs:
                       try {
                           MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
                               .remove(N64_AUDIO_DIAG_KEY).apply();
+                      } catch (Exception ignored) {}
+                  }
+
+                  /* Audio diagnostics (v1.4.12): the PS1 player
+                     reports once a second via
+                     MainActivity.reportPS1AudioDiag (static, on
+                     MainActivity so the Kotlin player can call
+                     it); the page reads it here. Same prefs-backed
+                     pattern as the N64 line. */
+                  @JavascriptInterface
+                  public String getLastPS1AudioDiag() {
+                      try {
+                          return MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE)
+                              .getString(PS1_AUDIO_DIAG_KEY, "");
+                      } catch (Exception ignored) { return ""; }
+                  }
+                  @JavascriptInterface
+                  public void clearLastPS1AudioDiag() {
+                      try {
+                          MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                              .remove(PS1_AUDIO_DIAG_KEY).apply();
                       } catch (Exception ignored) {}
                   }
 
