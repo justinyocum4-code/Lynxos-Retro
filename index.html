@@ -1584,7 +1584,312 @@
   // progress. One multipart POST (Drive takes files up to 5 TB, so
   // there is no size cap here any more). onProgress gets 0-100.
   // Fails loudly if nothing moves for 60 s. Resolves the Drive file id.
+  // How much of a file goes up in one piece. Must stay a multiple of
+  // 256 KB: Google only accepts piece sizes that divide evenly, except
+  // for the last piece.
+  var RESUMABLE_CHUNK = 8 * 1024 * 1024;
+
+  // The upload currently running from the Add screen, if any — so the
+  // Back button can stop it instead of leaving it running behind the
+  // library. Only one add runs at a time.
+  var activeUpload = null;
+
+  function cancelActiveUpload() {
+    if (activeUpload) activeUpload.cancel();
+    activeUpload = null;
+  }
+
+  // "Range: bytes=0-123" -> 123, the last byte Google confirmed. -1
+  // when the header is missing or unreadable.
+  function rangeLastByte(xhr) {
+    var range = null;
+    try { range = xhr.getResponseHeader('Range'); } catch (e) {}
+    if (!range) return -1;
+    var m = /bytes=\d+-(\d+)/.exec(range);
+    return m ? parseInt(m[1], 10) : -1;
+  }
+
+  // "Content-Range: bytes 0-99/500" -> { end: 99, total: 500 }.
+  // Null when the header is missing or unreadable.
+  function contentRangeInfo(xhr) {
+    var header = null;
+    try { header = xhr.getResponseHeader('Content-Range'); } catch (e) {}
+    if (!header) return null;
+    var m = /bytes (\d+)-(\d+)\/(\d+)/.exec(header);
+    if (!m) return null;
+    return { start: parseInt(m[1], 10), end: parseInt(m[2], 10), total: parseInt(m[3], 10) };
+  }
+
+  // Upload a file to Drive. Same inputs and outputs as before — the
+  // Add screen, the old-cloud migration, and the native export all
+  // call it the same way — but the file now goes up in pieces through
+  // Google's resumable-upload protocol instead of one giant request:
+  // open a session, send 8 MB pieces, Google confirms each piece.
+  // When the connection drops or nothing moves for a minute, the
+  // upload PAUSES: it says so out loud, waits, then asks Google how
+  // much arrived and picks up exactly from there. A piece already
+  // sent is never sent twice. If the session cannot be opened (an
+  // older WebView that hides the session address), it falls back to
+  // the old single-request upload, so adding a game never gets worse
+  // than it was. onProgress gets 0-100.
   function uploadWithProgress(fileName, file, title, onProgress) {
+    return ensureDriveFolder().then(function () {
+      return ensureDriveToken();
+    }).then(function () {
+      return openUploadSession(fileName, file);
+    }).then(function (sessionUri) {
+      if (!sessionUri) return uploadSingleShot(fileName, file, title, onProgress);
+      return uploadResumable(sessionUri, fileName, file, title, onProgress);
+    });
+  }
+
+  // Open a resumable-upload session. Resolves the session address, or
+  // null when the address cannot be read (fallback trigger). Rejects
+  // for a real failure such as the sign-in being gone.
+  function openUploadSession(fileName, file) {
+    return new Promise(function (resolve, reject) {
+      var xhr = new XMLHttpRequest();
+      xhr.open('POST', 'https://www.googleapis.com/upload/drive/v3/files?uploadType=resumable');
+      xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
+      xhr.setRequestHeader('Content-Type', 'application/json; charset=UTF-8');
+      xhr.setRequestHeader('X-Upload-Content-Type', file.type || 'application/octet-stream');
+      xhr.setRequestHeader('X-Upload-Content-Length', String(file.size));
+      xhr.onload = function () {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          var loc = null;
+          try { loc = xhr.getResponseHeader('Location'); } catch (e) {}
+          resolve(loc || null);
+        } else if (xhr.status === 401) {
+          driveAccessToken = null;
+          driveTokenExpiry = 0;
+          ensureDriveToken().then(function () {
+            return openUploadSession(fileName, file);
+          }).then(resolve, reject);
+        } else {
+          var data = {};
+          try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+          reject(new Error((data.error && data.error.message) || ('Cloud upload failed, status ' + xhr.status + '.')));
+        }
+      };
+      xhr.onerror = function () { reject(new Error('Network error while uploading. Check your connection and try again.')); };
+      xhr.send(JSON.stringify({ name: fileName, parents: [driveFolderId] }));
+    });
+  }
+
+  // Send the file piece by piece to an open session. Pauses on any
+  // drop or stall and resumes from the last piece Google confirmed.
+  function uploadResumable(sessionUri, fileName, file, title, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var total = file.size;
+      var confirmed = 0; // bytes Google has confirmed receiving
+      var lastMilestone = 0;
+      var paused = false;
+      var cancelled = false;
+      var sessionGone = false;
+      var currentXhr = null;
+      var retryTimer = null;
+      var stallTimer = null;
+      var lastMove = Date.now();
+      var authTries = 0;
+      var rejectFn = reject;
+
+      var handle = {
+        cancel: function () {
+          cancelled = true;
+          if (retryTimer) clearTimeout(retryTimer);
+          if (stallTimer) clearInterval(stallTimer);
+          if (currentXhr) { try { currentXhr.abort(); } catch (e) {} }
+          rejectFn(new Error('Upload cancelled.'));
+        }
+      };
+      activeUpload = handle;
+
+      function finish() {
+        if (stallTimer) clearInterval(stallTimer);
+        if (retryTimer) clearTimeout(retryTimer);
+        if (activeUpload === handle) activeUpload = null;
+      }
+      function finishOk(id) { finish(); resolve(id); }
+      function finishErr(err) { finish(); reject(err); }
+
+      function report(loaded) {
+        if (!total) return;
+        var percent = Math.min(100, Math.round((confirmed + loaded) * 100 / total));
+        onProgress(percent);
+        var milestone = Math.floor(percent / 25) * 25;
+        if (milestone > lastMilestone && milestone < 100) {
+          lastMilestone = milestone;
+          announce('Uploading ' + title + ', ' + milestone + ' percent.');
+        }
+      }
+
+      function pause() {
+        if (paused || cancelled) return;
+        paused = true;
+        if (currentXhr) { try { currentXhr.abort(); } catch (e) {} currentXhr = null; }
+        announce('Upload paused. The connection dropped. It will pick up where it stopped when the connection is back.');
+        scheduleRetry(20000);
+      }
+
+      function scheduleRetry(delay) {
+        if (cancelled) return;
+        if (retryTimer) clearTimeout(retryTimer);
+        retryTimer = setTimeout(tryResume, delay);
+      }
+
+      // Ask Google how much of the file it already has. Resolves
+      // { done, id, confirmed }. A lost reply to the last piece is how
+      // Google can hold MORE than we think — the answer here is always
+      // the truth.
+      function queryUploadStatus(retried) {
+        return new Promise(function (resolveStatus, rejectStatus) {
+          var xhr = new XMLHttpRequest();
+          xhr.open('PUT', sessionUri);
+          xhr.setRequestHeader('Content-Range', 'bytes */' + total);
+          xhr.onload = function () {
+            if (xhr.status === 200 || xhr.status === 201) {
+              var data = {};
+              try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+              resolveStatus({ done: true, id: data.id || null, confirmed: total });
+            } else if (xhr.status === 308) {
+              var last = rangeLastByte(xhr);
+              resolveStatus({ done: false, id: null, confirmed: last >= 0 ? last + 1 : confirmed });
+            } else if (xhr.status === 401 && !retried) {
+              driveAccessToken = null;
+              driveTokenExpiry = 0;
+              ensureDriveToken().then(function () {
+                queryUploadStatus(true).then(resolveStatus, rejectStatus);
+              }, rejectStatus);
+            } else if (xhr.status === 404 || xhr.status === 410) {
+              rejectStatus(new Error('session-gone'));
+            } else {
+              rejectStatus(new Error('status ' + xhr.status));
+            }
+          };
+          xhr.onerror = function () { rejectStatus(new Error('Network error while uploading.')); };
+          xhr.send();
+        });
+      }
+
+      function tryResume() {
+        if (cancelled) return;
+        lastMove = Date.now();
+        if (sessionGone) {
+          openUploadSession(fileName, file).then(function (uri) {
+            if (cancelled) return;
+            if (!uri) { finishErr(new Error('The upload session expired. Try adding the game again.')); return; }
+            sessionUri = uri;
+            sessionGone = false;
+            paused = false;
+            announce('Connection is back. Resuming the upload of ' + title + '.');
+            sendChunk();
+          }, function () { if (!cancelled) scheduleRetry(20000); });
+          return;
+        }
+        queryUploadStatus(false).then(function (res) {
+          if (cancelled) return;
+          if (res.done) {
+            if (res.id) { onProgress(100); finishOk(res.id); }
+            else { confirmed = total; sendChunk(); }
+            return;
+          }
+          confirmed = res.confirmed;
+          paused = false;
+          announce('Connection is back. Resuming the upload of ' + title + '.');
+          sendChunk();
+        }, function (err) {
+          if (cancelled) return;
+          if (err && err.message === 'session-gone') {
+            // Sessions live about a week; if this one is gone, start
+            // a fresh one and send the file again from the beginning.
+            sessionGone = true;
+            announce('The upload session expired. Starting the upload of ' + title + ' again from the beginning.');
+            confirmed = 0;
+            lastMilestone = 0;
+            paused = false;
+            scheduleRetry(5000);
+            return;
+          }
+          // Still no connection (or Google is having a moment): wait
+          // and ask again. The upload only ends when the user leaves
+          // the Add screen.
+          scheduleRetry(20000);
+        });
+      }
+
+      function sendChunk() {
+        if (cancelled) return;
+        if (total === 0) { finishErr(new Error('That file is empty.')); return; }
+        if (confirmed >= total) {
+          queryUploadStatus(false).then(function (res) {
+            if (cancelled) return;
+            if (res.done && res.id) { onProgress(100); finishOk(res.id); }
+            else if (res.done) { confirmed = total; sendChunk(); }
+            else { confirmed = res.confirmed; sendChunk(); }
+          }, function () { pause(); });
+          return;
+        }
+        lastMove = Date.now();
+        var end = Math.min(confirmed + RESUMABLE_CHUNK, total);
+        var piece = file.slice(confirmed, end);
+        var xhr = new XMLHttpRequest();
+        currentXhr = xhr;
+        xhr.open('PUT', sessionUri);
+        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        xhr.setRequestHeader('Content-Range', 'bytes ' + confirmed + '-' + (end - 1) + '/' + total);
+        xhr.upload.onprogress = function (e) {
+          lastMove = Date.now();
+          if (!e.lengthComputable) return;
+          report(e.loaded);
+        };
+        xhr.onload = function () {
+          currentXhr = null;
+          if (cancelled) return;
+          if (xhr.status === 200 || xhr.status === 201) {
+            authTries = 0;
+            var data = {};
+            try { data = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+            if (data.id) { onProgress(100); finishOk(data.id); }
+            else finishErr(new Error('Cloud upload failed, status ' + xhr.status + '.'));
+          } else if (xhr.status === 308) {
+            authTries = 0;
+            var last = rangeLastByte(xhr);
+            // A 308 means Google got the whole piece; the Range header
+            // only refines how far along it is.
+            confirmed = last >= confirmed ? last + 1 : end;
+            report(0);
+            sendChunk();
+          } else if (xhr.status === 401) {
+            if (authTries++ >= 1) { pause(); return; }
+            driveAccessToken = null;
+            driveTokenExpiry = 0;
+            ensureDriveToken().then(function () { if (!cancelled) sendChunk(); }, function () { pause(); });
+          } else if (xhr.status >= 500) {
+            pause(); // Google blipped: wait and pick up where it stopped.
+          } else {
+            var detail = {};
+            try { detail = JSON.parse(xhr.responseText || '{}'); } catch (e) {}
+            finishErr(new Error((detail.error && detail.error.message) || ('Cloud upload failed, status ' + xhr.status + '.')));
+          }
+        };
+        xhr.onerror = function () { currentXhr = null; if (!cancelled) pause(); };
+        xhr.ontimeout = function () { currentXhr = null; if (!cancelled) pause(); };
+        xhr.timeout = 0;
+        xhr.send(piece);
+      }
+
+      stallTimer = setInterval(function () {
+        if (cancelled || paused) return;
+        if (Date.now() - lastMove > 60000) pause();
+      }, 5000);
+      sendChunk();
+    });
+  }
+
+  // The old single-request upload, kept only as the fallback when a
+  // resumable session cannot be opened. Unchanged behavior: one
+  // multipart POST of the whole file, failing loudly on a stall.
+  function uploadSingleShot(fileName, file, title, onProgress) {
     return ensureDriveFolder().then(function () {
       return ensureDriveToken();
     }).then(function () {
@@ -1648,60 +1953,144 @@
     });
   }
 
-  // Download a game file from Drive with real progress, so a big game
-  // says how far along it is instead of sitting silent.
-  // onProgress gets 0-100. Fails loudly if nothing moves for 60 s.
+  // Download a game file from Drive with real progress. Same inputs
+  // and outputs as before, but the download now asks for only the
+  // bytes it does not have yet: if the connection drops or nothing
+  // comes down for a minute, it pauses, says so out loud, and waits —
+  // then resumes from the last byte that arrived. A part already
+  // downloaded is never downloaded twice. onProgress gets 0-100.
+  // Resolves the whole file as one Blob.
   function downloadWithProgress(fileId, title, onProgress) {
     return ensureDriveToken().then(function () {
+      // The file's size up front, so the download knows when it is
+      // done even if a reply hides its byte-range header.
+      return driveApi('GET', 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?fields=size').then(function (res) {
+        var data = {};
+        try { data = JSON.parse(res.text || '{}'); } catch (e) {}
+        return data.size ? parseInt(data.size, 10) : 0;
+      }, function () { return 0; });
+    }).then(function (knownTotal) {
       return new Promise(function (resolve, reject) {
-        var xhr = new XMLHttpRequest();
-        xhr.responseType = 'blob';
-        var lastMove = Date.now();
+        var parts = [];
+        var have = 0; // bytes already downloaded
+        var total = knownTotal || 0;
         var lastMilestone = 0;
-        var stallTimer = setInterval(function () {
-          if (Date.now() - lastMove > 60000) {
-            clearInterval(stallTimer);
-            try { xhr.abort(); } catch (e) {}
-            reject(new Error('Download seems stuck: nothing came down for a minute. Check your connection and try again.'));
-          }
-        }, 5000);
-        xhr.open('GET', 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media');
-        xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
-        xhr.onprogress = function (e) {
-          lastMove = Date.now();
-          if (!e.lengthComputable) return;
-          var percent = Math.min(100, Math.round(e.loaded * 100 / e.total));
+        var paused = false;
+        var currentXhr = null;
+        var retryTimer = null;
+        var stallTimer = null;
+        var lastMove = Date.now();
+        var pausedSince = 0;
+        var tokenRefreshed = false;
+
+        function finish() {
+          if (stallTimer) clearInterval(stallTimer);
+          if (retryTimer) clearTimeout(retryTimer);
+        }
+        function finishOk(blob) { finish(); onProgress(100); announce('Downloaded ' + title + '.'); resolve(blob); }
+        function finishErr(err) { finish(); reject(err); }
+
+        function report(loaded) {
+          if (!total) return;
+          var percent = Math.min(100, Math.round((have + loaded) * 100 / total));
           onProgress(percent);
           var milestone = Math.floor(percent / 25) * 25;
           if (milestone > lastMilestone && milestone < 100) {
             lastMilestone = milestone;
             announce('Downloading ' + title + ', ' + milestone + ' percent.');
           }
-        };
-        xhr.onload = function () {
-          clearInterval(stallTimer);
-          if (xhr.status >= 200 && xhr.status < 300) {
-            onProgress(100);
-            announce('Downloaded ' + title + '.');
-            resolve(xhr.response);
-          } else {
-            reject(new Error('Cloud download failed, status ' + xhr.status + '.'));
-          }
-        };
-        xhr.onerror = function () {
-          clearInterval(stallTimer);
-          reject(new Error('Network error while downloading. Check your connection and try again.'));
-        };
-        xhr.ontimeout = function () {
-          clearInterval(stallTimer);
-          reject(new Error('Download timed out. Check your connection and try again.'));
-        };
-        xhr.timeout = 0; // No overall cap: a slow download can take as
-        // long as it needs while it is moving. The 60-second stall
-        // check above is what catches a dead connection, so a stuck
-        // download still fails loudly instead of hanging forever.
-        announce('Downloading ' + title + ', 0 percent.');
-        xhr.send();
+        }
+
+        function pause() {
+          if (paused) return;
+          paused = true;
+          pausedSince = Date.now();
+          if (currentXhr) { try { currentXhr.abort(); } catch (e) {} currentXhr = null; }
+          announce('Download paused. The connection dropped. It will pick up where it stopped when the connection is back.');
+          scheduleRetry(20000);
+        }
+
+        function scheduleRetry(delay) {
+          if (retryTimer) clearTimeout(retryTimer);
+          retryTimer = setTimeout(function () {
+            // After half an hour with no connection at all, fail
+            // loudly instead of waiting forever.
+            if (Date.now() - pausedSince > 1800000) {
+              finishErr(new Error('The connection never came back. Try again when your connection is back.'));
+              return;
+            }
+            fetchRange();
+          }, delay);
+        }
+
+        function fetchRange() {
+          lastMove = Date.now();
+          paused = false;
+          var xhr = new XMLHttpRequest();
+          xhr.responseType = 'blob';
+          currentXhr = xhr;
+          xhr.open('GET', 'https://www.googleapis.com/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media');
+          xhr.setRequestHeader('Authorization', 'Bearer ' + driveAccessToken);
+          if (have > 0) xhr.setRequestHeader('Range', 'bytes=' + have + '-');
+          xhr.onprogress = function (e) {
+            lastMove = Date.now();
+            if (!e.lengthComputable) return;
+            report(e.loaded);
+          };
+          xhr.onload = function () {
+            currentXhr = null;
+            if (xhr.status === 401 && !tokenRefreshed) {
+              tokenRefreshed = true;
+              driveAccessToken = null;
+              driveTokenExpiry = 0;
+              ensureDriveToken().then(function () { fetchRange(); }, function () { pause(); });
+              return;
+            }
+            if (xhr.status === 206) {
+              tokenRefreshed = false;
+              var info = contentRangeInfo(xhr);
+              if (info && info.total) total = info.total;
+              var size = xhr.response ? xhr.response.size : 0;
+              if (xhr.response) parts.push(xhr.response);
+              have = info ? info.end + 1 : have + size;
+              if (total && have >= total) { finishOk(new Blob(parts)); return; }
+              fetchRange();
+              return;
+            }
+            if (xhr.status >= 200 && xhr.status < 300) {
+              // The server ignored the Range header and sent the whole
+              // file: take this copy from the top.
+              tokenRefreshed = false;
+              var fullSize = xhr.response ? xhr.response.size : 0;
+              if (have > 0) { parts = []; have = 0; }
+              if (xhr.response) parts.push(xhr.response);
+              if (!total) total = fullSize;
+              if (fullSize === 0) { finishOk(new Blob(parts)); return; }
+              if (total && fullSize >= total) { finishOk(new Blob(parts)); return; }
+              have = fullSize;
+              fetchRange();
+              return;
+            }
+            if (xhr.status === 416) {
+              // Asked past the end of the file: we already have it all.
+              finishOk(new Blob(parts));
+              return;
+            }
+            if (xhr.status >= 500) { pause(); return; }
+            finishErr(new Error('Cloud download failed, status ' + xhr.status + '.'));
+          };
+          xhr.onerror = function () { currentXhr = null; pause(); };
+          xhr.ontimeout = function () { currentXhr = null; pause(); };
+          xhr.timeout = 0;
+          if (have === 0 && parts.length === 0) announce('Downloading ' + title + ', 0 percent.');
+          xhr.send();
+        }
+
+        stallTimer = setInterval(function () {
+          if (paused) return;
+          if (Date.now() - lastMove > 60000) pause();
+        }, 5000);
+        fetchRange();
       });
     });
   }
@@ -1735,8 +2124,9 @@
     if (file && currentUser) {
       // Signed in: upload the file to Google Drive, then save it in
       // the Drive library. The progress bar fills as the file goes
-      // up, and a stall fails loudly instead of sitting silent on
-      // "Adding...".
+      // up, and a dropped connection pauses the upload instead of
+      // killing it — it picks up where it stopped when the
+      // connection is back.
       var fileName = Date.now() + '-' + file.name;
       showAddProgress(true);
       setAddProgress(0, title);
@@ -1757,6 +2147,9 @@
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
         showAddProgress(false);
+        // Leaving the Add screen on purpose is not a failure: the
+        // upload was cancelled, so stay quiet about it.
+        if (err && err.message === 'Upload cancelled.') return;
         failAdd(status, title, err);
       });
       return;
@@ -1970,7 +2363,7 @@
       showScreen('add');
       $('addTitle').focus();
     });
-    $('addCancelBtn').addEventListener('click', function () { showScreen('library'); });
+    $('addCancelBtn').addEventListener('click', function () { cancelActiveUpload(); showScreen('library'); });
     $('addSaveBtn').addEventListener('click', addGame);
     $('editSaveBtn').addEventListener('click', saveEdit);
     $('editDeleteBtn').addEventListener('click', deleteGame);
