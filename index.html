@@ -22,6 +22,7 @@
      scrolls instead of pushing the whole library down. */
   #lastN64Crash { color: #F5C518; font-weight: bold; font-size: 16px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; }
   #lastN64AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
+  #lastPS1AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
   .error { color: #ff8080; font-size: 17px; font-weight: bold; }
   .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
   button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
@@ -103,6 +104,10 @@
     <div id="lastN64AudioDiagWrap" hidden>
       <p id="lastN64AudioDiag" role="status"></p>
       <button type="button" id="dismissLastAudioDiagBtn">Dismiss</button>
+    </div>
+    <div id="lastPS1AudioDiagWrap" hidden>
+      <p id="lastPS1AudioDiag" role="status"></p>
+      <button type="button" id="dismissLastPS1AudioDiagBtn">Dismiss</button>
     </div>
     <ul id="gameList" role="list"></ul>
     <p id="emptyState" class="note" hidden></p>
@@ -394,6 +399,39 @@
     if (wrap) wrap.hidden = true;
   }
 
+  // Audio diagnostics (v1.4.12): the PS1 player reports once a
+  // second — actual frame rate, underrun count, average batch size,
+  // sample rate. The page shows the latest line on the library
+  // screen (it names the game), next to the N64 audio line.
+  function refreshLastPS1AudioDiag() {
+    try {
+      var el = $('lastPS1AudioDiag'), wrap = $('lastPS1AudioDiagWrap');
+      if (!el || !wrap) return;
+      var record = '';
+      if (window.LynxosRetro && window.LynxosRetro.getLastPS1AudioDiag) {
+        record = window.LynxosRetro.getLastPS1AudioDiag() || '';
+      }
+      if (record) {
+        el.textContent = record;
+        wrap.hidden = false;
+      } else {
+        el.textContent = '';
+        wrap.hidden = true;
+      }
+    } catch (e) {}
+  }
+
+  function clearLastPS1AudioDiag() {
+    try {
+      if (window.LynxosRetro && window.LynxosRetro.clearLastPS1AudioDiag) {
+        window.LynxosRetro.clearLastPS1AudioDiag();
+      }
+    } catch (e) {}
+    var el = $('lastPS1AudioDiag'), wrap = $('lastPS1AudioDiagWrap');
+    if (el) el.textContent = '';
+    if (wrap) wrap.hidden = true;
+  }
+
   // Translate a raw upload/save error into plain words, never just
   // "unknown error". Returns the reason to speak and show.
   function plainErrorReason(err) {
@@ -638,6 +676,7 @@
     if (name === 'library') refreshLastPlayerClose();
     if (name === 'library') refreshLastN64Crash();
     if (name === 'library') refreshLastN64AudioDiag();
+    if (name === 'library') refreshLastPS1AudioDiag();
   }
 
   // ---------- Tabs + library ----------
@@ -3003,6 +3042,8 @@
     $('dismissLastCrashBtn').addEventListener('click', clearLastN64Crash);
     refreshLastN64AudioDiag();
     $('dismissLastAudioDiagBtn').addEventListener('click', clearLastN64AudioDiag);
+    refreshLastPS1AudioDiag();
+    $('dismissLastPS1AudioDiagBtn').addEventListener('click', clearLastPS1AudioDiag);
     initDrive();
     updateSyncStatus();
     updateAccountStatus();
