@@ -6,11 +6,11 @@ on:
       version_name:
         description: 'Version name (e.g. 1.0.0)'
         required: false
-        default: '1.0.0'
+        default: '1.4.11'
       version_code:
         description: 'Version code (whole number, bump every build)'
         required: false
-        default: '1'
+        default: '35'
       release_notes:
         description: 'Release notes'
         required: false
@@ -601,6 +601,38 @@ jobs:
                           if (!f.exists()) return;
                           String fp = f.length() + "|" + f.lastModified();
                           MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit().putString(CRASH_DISMISSED_KEY, fp).apply();
+                      } catch (Exception ignored) {}
+                  }
+
+                  /* Audio diagnostics (v1.4.11): the N64 player
+                     reports once a second — actual frame rate,
+                     underrun count, average batch size, sample
+                     rate. Same prefs-backed pattern as the
+                     Last-game line: the page shows the latest line
+                     on the library screen (it names the game, so a
+                     line from the previous session is still
+                     readable), and Dismiss clears it. */
+                  private static final String N64_AUDIO_DIAG_KEY = "lastN64AudioDiag";
+                  public static void reportN64AudioDiag(String text) {
+                      try {
+                          MainActivity a = instance;
+                          if (a == null || text == null) return;
+                          a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                              .putString(N64_AUDIO_DIAG_KEY, text).apply();
+                      } catch (Exception ignored) {}
+                  }
+                  @JavascriptInterface
+                  public String getLastN64AudioDiag() {
+                      try {
+                          return MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE)
+                              .getString(N64_AUDIO_DIAG_KEY, "");
+                      } catch (Exception ignored) { return ""; }
+                  }
+                  @JavascriptInterface
+                  public void clearLastN64AudioDiag() {
+                      try {
+                          MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                              .remove(N64_AUDIO_DIAG_KEY).apply();
                       } catch (Exception ignored) {}
                   }
 
@@ -1217,13 +1249,20 @@ jobs:
                   return null;
               }
 
-              /* One display line for the crash report: signal, fault
-                 address, core, last bridge step, and the top 3
-                 backtrace frames. The page shows it as the "Last
-                 crash" line; the raw file stays on the device for
-                 the full diagnosis. */
+              /* One display block for the crash report (v1.4.11):
+                 signal, code, core, last bridge step, the load
+                 bases, and ALL backtrace frames. The old version
+                 capped the trace at 3 frames and dropped the bases,
+                 so the exact throw site could never be named from
+                 the screen. The fault address is shown only when it
+                 means something: for a self-raised abort (SIGABRT,
+                 code -6 = SI_TKILL) si_addr is just the process PID
+                 and UID mashed together, so the code line is shown
+                 instead. The page renders this in a scrollable block
+                 (white-space: pre-wrap). */
               private String formatCrashSummary(File f) {
-                  String sig = "", fault = "", core = "", step = "";
+                  String sig = "", code = "", fault = "", core = "", step = "";
+                  String bases = "";
                   java.util.ArrayList<String> trace = new java.util.ArrayList<String>();
                   BufferedReader r = null;
                   try {
@@ -1232,11 +1271,13 @@ jobs:
                       boolean inTrace = false;
                       while ((line = r.readLine()) != null) {
                           if (line.startsWith("signal ")) sig = line.substring(7).trim();
+                          else if (line.startsWith("code ")) code = line.substring(5).trim();
                           else if (line.startsWith("fault ")) fault = line.substring(6).trim();
                           else if (line.startsWith("core ")) core = line.substring(5).trim();
                           else if (line.startsWith("step ")) step = line.substring(5).trim();
+                          else if (line.startsWith("bases:")) bases = line.substring(6).trim();
                           else if (line.equals("trace:")) inTrace = true;
-                          else if (inTrace && trace.size() < 3) trace.add(line.trim());
+                          else if (inTrace) trace.add(line.trim());
                       }
                   } catch (Exception ignored) {
                   } finally {
@@ -1244,12 +1285,20 @@ jobs:
                   }
                   StringBuilder sb = new StringBuilder();
                   if (!sig.isEmpty()) sb.append("signal ").append(sig);
-                  if (!fault.isEmpty()) { if (sb.length() > 0) sb.append(", "); sb.append("fault ").append(fault); }
+                  if (!code.isEmpty()) { if (sb.length() > 0) sb.append(", "); sb.append("code ").append(code); }
+                  // Fault address: only meaningful for real faults
+                  // (code > 0, e.g. SEGV_MAPERR). A self-raised
+                  // abort (code -6) carries PID+UID in si_addr,
+                  // not an address.
+                  int codeVal = 0;
+                  try { codeVal = Integer.parseInt(code); } catch (Exception ignored) {}
+                  if (!fault.isEmpty() && codeVal > 0) { if (sb.length() > 0) sb.append(", "); sb.append("fault ").append(fault); }
                   if (!core.isEmpty() && !"(none)".equals(core)) { if (sb.length() > 0) sb.append(", "); sb.append("core ").append(core); }
                   if (!step.isEmpty() && !"(none)".equals(step)) { if (sb.length() > 0) sb.append(", "); sb.append("step ").append(step); }
+                  if (!bases.isEmpty()) sb.append("\nbases ").append(bases);
                   if (!trace.isEmpty()) {
-                      if (sb.length() > 0) sb.append(", ");
-                      sb.append("trace ").append(android.text.TextUtils.join(" ", trace));
+                      sb.append("\ntrace");
+                      for (String fr : trace) sb.append("\n").append(fr);
                   }
                   return sb.toString();
               }
