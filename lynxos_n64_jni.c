@@ -35,10 +35,12 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <dlfcn.h>
+#include <fcntl.h>
 #include <EGL/egl.h>
 #include <jni.h>
 #include <limits.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdatomic.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -47,6 +49,7 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#include <unwind.h>
 
 #define LOG_TAG "LynxosN64"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
@@ -202,6 +205,9 @@ static char g_game_path[PATH_MAX] = "";
 static void *g_game_data = NULL;   /* ROM bytes: kept until nativeClose (libretro contract) */
 static size_t g_game_size = 0;
 static char g_title[256] = "";
+/* Last bridge step, kept in C as well as SharedPreferences (v1.4.9):
+ * the crash handler can only read plain memory, never call into Java. */
+static char g_last_bridge_step[128] = "";
 
 static void set_error(const char *msg) {
     snprintf(g_last_error, sizeof g_last_error, "%s", msg ? msg : "Unknown error.");
@@ -270,6 +276,13 @@ static pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct retro_hw_render_callback g_hw;
 static bool g_hw_active;
 static int g_hw_gl_version = 2;
+/* Deferred context_reset (v1.4.9): context_reset must run AFTER
+ * retro_load_game returns, once the core's first_context_reset is
+ * set — calling it inside handle_set_hw_render (mid-load, before
+ * the ROM is loaded) runs the video plugin's GL init on
+ * uninitialized core state and crashes (v1.4.8). handle_set_hw_render
+ * only arms this flag; nativeLoadGame fires the reset. */
+static bool g_context_reset_pending;
 
 static volatile int g_frame_ready;
 static int g_video_cb_count;
@@ -377,6 +390,9 @@ static size_t audio_batch_cb(const int16_t *data, size_t frames) {
  * milliseconds after the write. */
 static void record_bridge_step(const char *step) {
     LOGI("bridge step: %s", step);
+    /* Keep a C-side copy too: the crash handler (v1.4.9) can only
+     * read plain memory, never call into Java. */
+    if (step) snprintf(g_last_bridge_step, sizeof g_last_bridge_step, "%s", step);
     if (!g_activity_global || !g_on_bridge_step) return;
     JNIEnv *env = get_jni_env();
     if (!env) return;
@@ -388,6 +404,282 @@ static void record_bridge_step(const char *step) {
         (*env)->ExceptionClear(env);
     }
     (*env)->DeleteLocalRef(env, jstep);
+}
+
+/* ---------- native crash recorder (v1.4.9) ----------
+ *
+ * A native crash (SIGSEGV in a core) kills the whole process, so no
+ * Java code can report it — the v1.4.7/1.4.8 silent deaths. A signal
+ * handler writes the crash spot to filesDir/n64-crash.txt, and
+ * MainActivity reads it on the next launch and reports it. The
+ * handler uses ONLY async-signal-safe calls: a file descriptor opened
+ * at init (open() is not signal-safe) plus write(). The backtrace
+ * uses _Unwind_Backtrace into a fixed static buffer — not strictly
+ * async-signal-safe, but the standard pragmatic choice; it never
+ * allocates on the common path. Library load bases are captured at
+ * init by parsing /proc/self/maps, so the handler only subtracts.
+ * After recording, the handler restores the default disposition and
+ * re-raises, so the process still dies normally (Android writes its
+ * tombstone too). */
+
+#define CRASH_MAX_FRAMES 32
+#define CRASH_MAX_LIBS 6
+static int g_crash_fd = -1;
+static char g_crash_path[PATH_MAX] = "";
+static char g_crash_core[64] = "";
+static volatile sig_atomic_t g_crash_handling = 0;
+static struct {
+    const char *name;
+    uintptr_t start;
+    uintptr_t end;
+} g_crash_libs[CRASH_MAX_LIBS];
+static int g_crash_lib_count = 0;
+
+/* Write a string with write() only — safe inside a signal handler. */
+static void crash_write_str(const char *s) {
+    if (g_crash_fd < 0 || !s) return;
+    size_t n = 0;
+    while (s[n]) n++;
+    while (n > 0) {
+        ssize_t w = write(g_crash_fd, s, n);
+        if (w <= 0) return;
+        s += w;
+        n -= (size_t)w;
+    }
+}
+
+/* Write a small integer in decimal, with no libc formatting (snprintf
+ * is not async-signal-safe). */
+static void crash_write_dec(int v) {
+    if (v == 0) { crash_write_str("0"); return; }
+    if (v < 0) { crash_write_str("-"); v = -v; }
+    char rev[12];
+    int n = 0;
+    while (v > 0 && n < 12) { rev[n++] = (char)('0' + (v % 10)); v /= 10; }
+    char buf[13];
+    int i = 0;
+    while (n > 0) buf[i++] = rev[--n];
+    buf[i] = '\0';
+    crash_write_str(buf);
+}
+
+/* Write a pointer-sized value in hex ("0x..."), no libc formatting. */
+static void crash_write_hex(uintptr_t v) {
+    crash_write_str("0x");
+    if (v == 0) { crash_write_str("0"); return; }
+    char rev[16];
+    int n = 0;
+    while (v && n < 16) {
+        unsigned d = (unsigned)(v & 0xF);
+        rev[n++] = (char)(d < 10 ? '0' + d : 'a' + (d - 10));
+        v >>= 4;
+    }
+    char buf[17];
+    int i = 0;
+    while (n > 0) buf[i++] = rev[--n];
+    buf[i] = '\0';
+    crash_write_str(buf);
+}
+
+struct crash_unwind_state {
+    uintptr_t *pcs;
+    int count;
+    int max;
+};
+
+static _Unwind_Reason_Code crash_unwind_cb(struct _Unwind_Context *ctx, void *arg) {
+    struct crash_unwind_state *st = (struct crash_unwind_state *)arg;
+    if (st->count >= st->max) return _URC_END_OF_STACK;
+    uintptr_t ip = (uintptr_t)_Unwind_GetIP(ctx);
+    if (ip != 0) st->pcs[st->count++] = ip;
+    return _URC_NO_REASON;
+}
+
+static void crash_handler(int sig, siginfo_t *info, void *ucontext) {
+    (void)ucontext;
+    if (g_crash_handling) {
+        /* A second signal while recording: die at once, no recursion. */
+        signal(sig, SIG_DFL);
+        raise(sig);
+        _exit(128 + sig);
+    }
+    g_crash_handling = 1;
+    if (g_crash_fd >= 0) {
+        crash_write_str("signal ");
+        crash_write_dec(sig);
+        crash_write_str("\ncode ");
+        crash_write_dec(info ? info->si_code : 0);
+        crash_write_str("\nfault ");
+        crash_write_hex(info ? (uintptr_t)info->si_addr : 0);
+        crash_write_str("\ncore ");
+        crash_write_str(g_crash_core[0] ? g_crash_core : "(none)");
+        crash_write_str("\ntitle ");
+        crash_write_str(g_title[0] ? g_title : "(none)");
+        crash_write_str("\nstep ");
+        crash_write_str(g_last_bridge_step[0] ? g_last_bridge_step : "(none)");
+        crash_write_str("\nbases:");
+        for (int i = 0; i < g_crash_lib_count; i++) {
+            crash_write_str(" ");
+            crash_write_str(g_crash_libs[i].name);
+            crash_write_str(" ");
+            crash_write_hex(g_crash_libs[i].start);
+            crash_write_str("-");
+            crash_write_hex(g_crash_libs[i].end);
+        }
+        crash_write_str("\ntrace:\n");
+        uintptr_t pcs[CRASH_MAX_FRAMES];
+        struct crash_unwind_state st;
+        st.pcs = pcs;
+        st.count = 0;
+        st.max = CRASH_MAX_FRAMES;
+        _Unwind_Backtrace(crash_unwind_cb, &st);
+        for (int i = 0; i < st.count; i++) {
+            uintptr_t pc = pcs[i];
+            int found = 0;
+            for (int j = 0; j < g_crash_lib_count; j++) {
+                if (pc >= g_crash_libs[j].start && pc < g_crash_libs[j].end) {
+                    crash_write_str(g_crash_libs[j].name);
+                    crash_write_str("+");
+                    crash_write_hex(pc - g_crash_libs[j].start);
+                    crash_write_str("\n");
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                crash_write_hex(pc);
+                crash_write_str("\n");
+            }
+        }
+    }
+    /* Die normally: restore the default disposition and re-raise so
+     * Android still writes its tombstone. */
+    signal(sig, SIG_DFL);
+    raise(sig);
+    _exit(128 + sig);
+}
+
+static void crash_install_handlers(void) {
+    static int installed = 0;
+    if (installed) return;
+    installed = 1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGABRT, &sa, NULL);
+    sigaction(SIGFPE, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
+}
+
+/* Capture each .so's load base (lowest mapped address) at init time
+ * by parsing /proc/self/maps. Offsets in the crash file are PC minus
+ * base, so addr2line resolves them against the shipped .so files.
+ * Only the directory of the first sighting of a basename is kept:
+ * the same basename could exist in two places (e.g. libEGL in
+ * /system and /vendor) and the loaded one is the first mapped. */
+static void crash_capture_bases(void) {
+    static const char *names[CRASH_MAX_LIBS] = {
+        "liblynxos_n64_jni.so",
+        "parallel_n64_libretro_android.so",
+        "mupen64plus_next_gles3_libretro_android.so",
+        "libEGL.so",
+        "libGLESv3.so",
+        "libGLESv2.so"
+    };
+    static char first_dir[CRASH_MAX_LIBS][PATH_MAX];
+    g_crash_lib_count = 0;
+    FILE *f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof line, f)) {
+        unsigned long start = 0, end = 0;
+        if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        char *path = strchr(line, '/');
+        if (!path) continue;
+        /* Trim the trailing newline for an exact basename match. */
+        size_t plen = strlen(path);
+        while (plen > 0 && (path[plen - 1] == '\n' || path[plen - 1] == '\r')) path[--plen] = '\0';
+        for (int i = 0; i < CRASH_MAX_LIBS; i++) {
+            if (!names[i]) continue;
+            size_t nl = strlen(names[i]);
+            if (plen < nl || strcmp(path + plen - nl, names[i]) != 0) continue;
+            /* Directory of this sighting (everything before the name). */
+            char dir[PATH_MAX];
+            size_t dlen = plen - nl;
+            if (dlen >= sizeof dir) dlen = sizeof dir - 1;
+            memcpy(dir, path, dlen);
+            dir[dlen] = '\0';
+            int idx = -1;
+            for (int j = 0; j < g_crash_lib_count; j++) {
+                if (g_crash_libs[j].name == names[i]) { idx = j; break; }
+            }
+            if (idx < 0) {
+                if (g_crash_lib_count >= CRASH_MAX_LIBS) break;
+                idx = g_crash_lib_count++;
+                g_crash_libs[idx].name = names[i];
+                g_crash_libs[idx].start = (uintptr_t)start;
+                g_crash_libs[idx].end = (uintptr_t)end;
+                snprintf(first_dir[idx], sizeof first_dir[idx], "%s", dir);
+            } else if (strcmp(first_dir[idx], dir) == 0) {
+                if ((uintptr_t)start < g_crash_libs[idx].start) g_crash_libs[idx].start = (uintptr_t)start;
+                if ((uintptr_t)end > g_crash_libs[idx].end) g_crash_libs[idx].end = (uintptr_t)end;
+            }
+            break;
+        }
+    }
+    fclose(f);
+}
+
+/* Open the crash file at init (never in the handler) and capture the
+ * .so bases. If anything here fails the recorder simply stays off —
+ * it must never break a launch. The file is truncated on every
+ * player start, so a record only ever describes the most recent
+ * run; MainActivity reads it before the next start truncates it. */
+static void crash_setup(JNIEnv *env, jobject activity) {
+    if (g_crash_fd >= 0) {
+        close(g_crash_fd);
+        g_crash_fd = -1;
+    }
+    jclass clazz = (*env)->GetObjectClass(env, activity);
+    if (clazz) {
+        jmethodID getFilesDir = (*env)->GetMethodID(env, clazz, "getFilesDir", "()Ljava/io/File;");
+        if (!getFilesDir) {
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+        } else {
+            jobject dirObj = (*env)->CallObjectMethod(env, activity, getFilesDir);
+            if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+            if (dirObj) {
+                jclass fileClazz = (*env)->GetObjectClass(env, dirObj);
+                jmethodID getAbsPath = fileClazz ? (*env)->GetMethodID(env, fileClazz, "getAbsolutePath", "()Ljava/lang/String;") : NULL;
+                if (!getAbsPath) {
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                } else {
+                    jstring jpath = (jstring)(*env)->CallObjectMethod(env, dirObj, getAbsPath);
+                    if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
+                    if (jpath) {
+                        const char *cpath = (*env)->GetStringUTFChars(env, jpath, NULL);
+                        if (cpath) {
+                            snprintf(g_crash_path, sizeof g_crash_path, "%s/n64-crash.txt", cpath);
+                            (*env)->ReleaseStringUTFChars(env, jpath, cpath);
+                        }
+                        (*env)->DeleteLocalRef(env, jpath);
+                    }
+                }
+                (*env)->DeleteLocalRef(env, dirObj);
+            }
+        }
+    }
+    if (g_crash_path[0]) {
+        g_crash_fd = open(g_crash_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (g_crash_fd < 0) LOGW("crash recorder: could not open %s", g_crash_path);
+    }
+    crash_capture_bases();
+    crash_install_handlers();
+    LOGI("crash recorder armed: %s (fd %d)", g_crash_path, g_crash_fd);
 }
 
 static void input_poll_cb(void) {
@@ -732,11 +1024,18 @@ static bool handle_set_hw_render(void *data) {
         return false;
     }
     record_bridge_step("graphics functions checked");
-    /* The context is current, so this is the correct moment: glsm
-     * re-initialises its state here. */
-    if (g_hw.context_reset) g_hw.context_reset();
-    record_bridge_step("core graphics started");
-    LOGI("HW render ready, context_reset called");
+    /* v1.4.9: do NOT call context_reset here. SET_HW_RENDER fires
+     * in the middle of retro_load_game, before the ROM is loaded
+     * and before either core's emulator init (both cores gate
+     * their init on first_context_reset, set only at the END of
+     * retro_load_game). Calling it now runs the video plugin's GL
+     * init on uninitialized core state and crashes (v1.4.8). The
+     * reset is deferred to nativeLoadGame, after retro_load_game
+     * returns — the moment the libretro contract and both cores
+     * expect. The EGL context stays created here. */
+    g_context_reset_pending = true;
+    record_bridge_step("graphics context ready, reset deferred");
+    LOGI("HW render ready, context_reset deferred");
     return true;
 }
 
@@ -928,6 +1227,9 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeInit(JNIEnv *env, jobject
         if ((*env)->ExceptionCheck(env)) (*env)->ExceptionClear(env);
         LOGE("onBridgeStep method not found; bridge steps will not be recorded");
     }
+    /* Crash recorder (v1.4.9): arm the signal handler now that the
+     * activity is known. A failure here never fails the launch. */
+    crash_setup(env, activity);
     LOGI("nativeInit ok");
     return JNI_TRUE;
 }
@@ -972,6 +1274,7 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadCore(JNIEnv *env, job
     g_fps_frames = 0;
     g_fps_second = 0;
     g_hw_active = false;
+    g_context_reset_pending = false;
     g_surface_lost = 0;
     g_surface_new = 0;
     memset(&g_av, 0, sizeof g_av);
@@ -989,6 +1292,15 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadCore(JNIEnv *env, job
     if (!core_path) {
         set_error("No game core file to load.");
         goto out;
+    }
+    /* Crash recorder: remember which core was attempted, so a crash
+     * during load still names it. */
+    if (strstr(core_path, "parallel")) {
+        snprintf(g_crash_core, sizeof g_crash_core, "parallel");
+    } else if (strstr(core_path, "mupen")) {
+        snprintf(g_crash_core, sizeof g_crash_core, "mupen");
+    } else {
+        snprintf(g_crash_core, sizeof g_crash_core, "(unknown)");
     }
     g_core_handle = dlopen(core_path, RTLD_NOW | RTLD_LOCAL);
     if (!g_core_handle) {
@@ -1138,6 +1450,10 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadGame(JNIEnv *env, job
     info.data = g_game_data;
     info.size = g_game_size;
     info.meta = NULL;
+    /* A stale pending flag from a failed earlier load must not fire
+     * a reset for this one; handle_set_hw_render arms it again
+     * during this load if the core asks for hardware rendering. */
+    g_context_reset_pending = false;
     bool ok = g_retro_load_game(&info);
     if (path) (*env)->ReleaseStringUTFChars(env, jpath, path);
     if (title) (*env)->ReleaseStringUTFChars(env, jtitle, title);
@@ -1150,6 +1466,18 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadGame(JNIEnv *env, job
          * for hardware rendering would run blind. Fail loudly. */
         set_error("The game did not ask for hardware graphics.");
         return JNI_FALSE;
+    }
+    /* v1.4.9: the deferred context_reset (see handle_set_hw_render).
+     * retro_load_game has returned, so first_context_reset is set
+     * and the cores' emulator init runs before the video plugin's
+     * GL init — the order RetroArch uses. */
+    if (g_context_reset_pending) {
+        g_context_reset_pending = false;
+        if (g_hw.context_reset) {
+            record_bridge_step("core graphics starting");
+            g_hw.context_reset();
+            record_bridge_step("core graphics started");
+        }
     }
     g_game_loaded = true;
     g_retro_set_controller_port_device(0, LR_DEVICE_JOYPAD);
@@ -1329,5 +1657,11 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeClose(JNIEnv *env, jobjec
         g_activity_global = NULL;
     }
     g_on_audio_batch = NULL;
+    /* The N64 player exited cleanly: forget which core/game was
+     * loaded, so a later native crash in another player (PS1) is
+     * not mislabelled as an N64 crash. The crash file itself is
+     * left alone — MainActivity owns reading it. */
+    g_crash_core[0] = '\0';
+    g_title[0] = '\0';
     LOGI("nativeClose done");
 }
