@@ -437,7 +437,9 @@ jobs:
                  still there, the player died without saying anything
                  — a native crash in the core, or a Java Error — and
                  the page says so instead of staying silent. The
-                 marker carries system|title|time; markers older
+                 marker carries system|core|title|time (v1.4.8; old
+                 3-field markers still parse — see
+                 checkSilentPlayerDeath); markers older
                  than 10 minutes are dropped silently (the app may
                  simply have been killed while backgrounded). */
               private static final String PLAYER_PREFS = "lynxos-retro";
@@ -446,7 +448,10 @@ jobs:
               private static final String PLAYER_BRIDGE_STEP_KEY = "playerBridgeStep";
               private static final String LAST_CLOSE_KEY = "lastPlayerClose";
               private static final long PLAYER_MARKER_MAX_AGE_MS = 10L * 60L * 1000L;
-              private static void setPlayerLaunchMarker(String system, String title) {
+              /* F3 (v1.4.8): the marker carries the core too, so the
+                 Last-game line can name it ("parallel" / "mupen";
+                 "" for PlayStation, which has no core choice). */
+              private static void setPlayerLaunchMarker(String system, String core, String title) {
                   try {
                       MainActivity a = instance;
                       if (a == null) return;
@@ -456,7 +461,7 @@ jobs:
                          later still leaves it behind. A fresh launch
                          also clears the previous bridge step. */
                       a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
-                          .putString(PLAYER_LAUNCH_KEY, system + "|" + title + "|" + System.currentTimeMillis())
+                          .putString(PLAYER_LAUNCH_KEY, system + "|" + (core == null ? "" : core) + "|" + title + "|" + System.currentTimeMillis())
                           .remove(PLAYER_BRIDGE_STEP_KEY)
                           .commit();
                   } catch (Exception ignored) {}
@@ -501,11 +506,16 @@ jobs:
               /* F5 (v1.4.7): visible record of a silent death, shown
                  as a line on the library screen until the next game
                  starts or the user dismisses it. Prefs-backed with
-                 commit() so it survives a process death. */
-              private void storeLastPlayerClose(String system, String title, String reason) {
+                 commit() so it survives a process death. F3 (v1.4.8):
+                 the core rides along, e.g. "Nintendo 64 (Mupen) — ...". */
+              private void storeLastPlayerClose(String system, String core, String title, String reason) {
                   try {
                       String when = new SimpleDateFormat("MMM d, h:mm a", Locale.US).format(new Date());
-                      String record = systemDisplayName(system) + " — " + title + " — closed unexpectedly. " + reason + " " + when;
+                      String display = systemDisplayName(system);
+                      if ("n64".equals(system) && core != null && !core.isEmpty()) {
+                          display += " (" + ("mupen".equals(core) ? "Mupen" : "Parallel") + ")";
+                      }
+                      String record = display + " — " + title + " — closed unexpectedly. " + reason + " " + when;
                       getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
                           .putString(LAST_CLOSE_KEY, record).commit();
                   } catch (Exception ignored) {}
@@ -649,7 +659,7 @@ jobs:
                       startActivity(i);
                       gamePlaying = true;
                       nativePlayerLaunched = true;
-                      setPlayerLaunchMarker(nativeSystem, nativeTitle);
+                      setPlayerLaunchMarker(nativeSystem, "n64".equals(nativeSystem) ? nativeCore : "", nativeTitle);
                   }
                   @JavascriptInterface
                   public void nativeCancel() {
@@ -1019,8 +1029,14 @@ jobs:
                   String marker = getPlayerLaunchMarker();
                   if (marker == null) return;
                   /* Split on the first and last pipes, not a plain
-                     split: a game title could itself contain '|'. */
+                     split: a game title could itself contain '|'.
+                     F3 (v1.4.8): new markers are
+                     system|core|title|time; old 3-field markers
+                     (system|title|time) still parse — the core is
+                     then just empty. The core itself never
+                     contains '|', so the second pipe is safe. */
                   int firstPipe = marker.indexOf('|');
+                  int secondPipe = firstPipe < 0 ? -1 : marker.indexOf('|', firstPipe + 1);
                   int lastPipe = marker.lastIndexOf('|');
                   if (firstPipe < 0 || lastPipe <= firstPipe) { clearPlayerLaunchMarker(); return; }
                   long when = 0;
@@ -1030,7 +1046,26 @@ jobs:
                       return;
                   }
                   final String system = marker.substring(0, firstPipe);
-                  final String title = marker.substring(firstPipe + 1, lastPipe);
+                  final String core;
+                  final String title;
+                  if (secondPipe > firstPipe && secondPipe < lastPipe) {
+                      /* New 4-field marker — but only when the
+                         second field is a real core value. An old
+                         3-field marker whose title contains '|' would
+                         otherwise be misread (core = title fragment). */
+                      String maybeCore = marker.substring(firstPipe + 1, secondPipe);
+                      if (maybeCore.isEmpty() || "parallel".equals(maybeCore) || "mupen".equals(maybeCore)) {
+                          core = maybeCore;
+                          title = marker.substring(secondPipe + 1, lastPipe);
+                      } else {
+                          core = "";
+                          title = marker.substring(firstPipe + 1, lastPipe);
+                      }
+                  } else {
+                      /* Old 3-field marker: no core recorded. */
+                      core = "";
+                      title = marker.substring(firstPipe + 1, lastPipe);
+                  }
                   final String stage = getPlayerLoadStage();
                   /* F4b: the bridge step is read BEFORE the marker is
                      cleared (clearing also removes the step). */
@@ -1050,7 +1085,7 @@ jobs:
                       fullReason = (reason.isEmpty() ? "" : reason + " ") + "Last graphics step: " + bridgeStep + ".";
                   }
                   /* F5: leave a visible record on the library screen. */
-                  storeLastPlayerClose(system, title, fullReason);
+                  storeLastPlayerClose(system, core, title, fullReason);
                   clearPlayerLaunchMarker();
                   startClosedOutcome(system, fullReason);
               }
