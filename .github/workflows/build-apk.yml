@@ -311,6 +311,8 @@ jobs:
 
           import android.app.Activity;
           import android.app.UiModeManager;
+          import android.speech.tts.TextToSpeech;
+          import android.speech.tts.UtteranceProgressListener;
           import android.content.Intent;
           import android.content.res.Configuration;
           import android.net.Uri;
@@ -319,6 +321,7 @@ jobs:
           import android.os.Looper;
           import android.os.SystemClock;
           import android.util.Base64;
+          import android.widget.Toast;
           import android.view.KeyEvent;
           import android.view.InputDevice;
           import android.webkit.JavascriptInterface;
@@ -329,6 +332,9 @@ jobs:
           import android.webkit.WebViewClient;
           import java.io.File;
           import java.io.FileOutputStream;
+          import java.text.SimpleDateFormat;
+          import java.util.Date;
+          import java.util.Locale;
 
           public class MainActivity extends Activity {
               private WebView webView;
@@ -373,6 +379,35 @@ jobs:
               private boolean runLatched = false;
               private long lastChDnUpTime = 0;
               private final Handler mainHandler = new Handler(Looper.getMainLooper());
+              /* Closed-outcome delivery state (v1.4.7, F1/F2): the
+                 page delivery must not depend on the probe callback
+                 alone — after a process death the WebView may not be
+                 loaded yet, and a probe ValueCallback that never
+                 fires schedules no retry at all. A Handler watchdog
+                 advances the attempts, onPageFinished triggers a
+                 delivery, and the probe remains one trigger among
+                 them. closedOutcomeDelivered guards double delivery;
+                 closedProbeToken lets a stale probe callback be
+                 ignored when a new outcome starts. */
+              private boolean closedOutcomePending = false;
+              private String closedOutcomeSystem = null;
+              private String closedOutcomeReason = null;
+              private int closedOutcomeAttempt = 0;
+              private boolean closedOutcomeDelivered = false;
+              private int closedProbeToken = 0;
+              private boolean closedProbeOutstanding = false;
+              private TextToSpeech closedTts = null;
+              private final Runnable closedOutcomeWatchdog = new Runnable() {
+                  @Override public void run() {
+                      if (!closedOutcomePending || closedOutcomeDelivered) return;
+                      closedOutcomeAttempt++;
+                      if (closedOutcomeAttempt > 20) { finishClosedOutcome(); return; }
+                      if (!closedProbeOutstanding) {
+                          deliverClosedOutcome(closedOutcomeSystem, closedOutcomeReason);
+                      }
+                      scheduleClosedWatchdog();
+                  }
+              };
               private static MainActivity instance;
 
               /* Player outcome reporting (v1.4.4): the native
@@ -408,14 +443,22 @@ jobs:
               private static final String PLAYER_PREFS = "lynxos-retro";
               private static final String PLAYER_LAUNCH_KEY = "playerLaunch";
               private static final String PLAYER_STAGE_KEY = "playerLoadStage";
+              private static final String PLAYER_BRIDGE_STEP_KEY = "playerBridgeStep";
+              private static final String LAST_CLOSE_KEY = "lastPlayerClose";
               private static final long PLAYER_MARKER_MAX_AGE_MS = 10L * 60L * 1000L;
               private static void setPlayerLaunchMarker(String system, String title) {
                   try {
                       MainActivity a = instance;
                       if (a == null) return;
+                      /* F6 (v1.4.7): commit(), not apply() — the
+                         marker must be durable before the player
+                         Activity starts, so a crash milliseconds
+                         later still leaves it behind. A fresh launch
+                         also clears the previous bridge step. */
                       a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
                           .putString(PLAYER_LAUNCH_KEY, system + "|" + title + "|" + System.currentTimeMillis())
-                          .apply();
+                          .remove(PLAYER_BRIDGE_STEP_KEY)
+                          .commit();
                   } catch (Exception ignored) {}
               }
               public static void clearPlayerLaunchMarker() {
@@ -423,7 +466,7 @@ jobs:
                       MainActivity a = instance;
                       if (a == null) return;
                       a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
-                          .remove(PLAYER_LAUNCH_KEY).remove(PLAYER_STAGE_KEY).apply();
+                          .remove(PLAYER_LAUNCH_KEY).remove(PLAYER_STAGE_KEY).remove(PLAYER_BRIDGE_STEP_KEY).apply();
                   } catch (Exception ignored) {}
               }
               private static String getPlayerLaunchMarker() {
@@ -440,6 +483,33 @@ jobs:
                       return a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).getString(PLAYER_STAGE_KEY, null);
                   } catch (Exception ignored) { return null; }
               }
+              /* F4b (v1.4.7): the native side records the last
+                 graphics-setup step here during retro_load_game, so a
+                 native crash still leaves a trace naming the step. */
+              private static String getPlayerBridgeStep() {
+                  try {
+                      MainActivity a = instance;
+                      if (a == null) return null;
+                      return a.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).getString(PLAYER_BRIDGE_STEP_KEY, null);
+                  } catch (Exception ignored) { return null; }
+              }
+              /* The marker carries the short system code ('n64' /
+                 'psx'); the page maps it the same way for display. */
+              private static String systemDisplayName(String system) {
+                  return "n64".equals(system) ? "Nintendo 64" : "PlayStation";
+              }
+              /* F5 (v1.4.7): visible record of a silent death, shown
+                 as a line on the library screen until the next game
+                 starts or the user dismisses it. Prefs-backed with
+                 commit() so it survives a process death. */
+              private void storeLastPlayerClose(String system, String title, String reason) {
+                  try {
+                      String when = new SimpleDateFormat("MMM d, h:mm a", Locale.US).format(new Date());
+                      String record = systemDisplayName(system) + " — " + title + " — closed unexpectedly. " + reason + " " + when;
+                      getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit()
+                          .putString(LAST_CLOSE_KEY, record).commit();
+                  } catch (Exception ignored) {}
+              }
               private static String escapeJs(String s) {
                   if (s == null) return "";
                   return s.replace("\\", "\\\\").replace("'", "\\'").replace("\n", " ").replace("\r", " ");
@@ -453,6 +523,24 @@ jobs:
                   public void setPlaying(boolean p) { gamePlaying = p; }
                   @JavascriptInterface
                   public boolean isTV() { return isTV; }
+                  /* F5 (v1.4.7): the page reads the last silent-death
+                     record on load and shows it on the library screen;
+                     it clears it when a new game starts, or when the
+                     user dismisses it. Prefs-backed, so it survives a
+                     process death. */
+                  @JavascriptInterface
+                  public String getLastPlayerClose() {
+                      try {
+                          String v = MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).getString(LAST_CLOSE_KEY, "");
+                          return v == null ? "" : v;
+                      } catch (Exception ignored) { return ""; }
+                  }
+                  @JavascriptInterface
+                  public void clearLastPlayerClose() {
+                      try {
+                          MainActivity.this.getSharedPreferences(PLAYER_PREFS, MODE_PRIVATE).edit().remove(LAST_CLOSE_KEY).apply();
+                      } catch (Exception ignored) {}
+                  }
 
                   /* Native PS1 player: the page streams the game file
                      here in base64 chunks; nativeEnd launches the
@@ -835,6 +923,13 @@ jobs:
                                  bridge check ever misses. */
                               webView.evaluateJavascript("document.body.classList.add('tv')", null);
                           }
+                          /* F2 (v1.4.7): a closed outcome waiting on
+                             the page gets another delivery attempt
+                             now that the page has finished loading. */
+                          if (closedOutcomePending && !closedOutcomeDelivered) {
+                              deliverClosedOutcome(closedOutcomeSystem, closedOutcomeReason);
+                              scheduleClosedWatchdog();
+                          }
                           if (pendingAuthUrl != null) {
                               final String u = pendingAuthUrl; pendingAuthUrl = null;
                               forwardAuth(u);
@@ -935,8 +1030,11 @@ jobs:
                       return;
                   }
                   final String system = marker.substring(0, firstPipe);
+                  final String title = marker.substring(firstPipe + 1, lastPipe);
                   final String stage = getPlayerLoadStage();
-                  clearPlayerLaunchMarker();
+                  /* F4b: the bridge step is read BEFORE the marker is
+                     cleared (clearing also removes the step). */
+                  final String bridgeStep = getPlayerBridgeStep();
                   final String reason;
                   if (stage == null || stage.isEmpty()) {
                       reason = "";
@@ -945,32 +1043,138 @@ jobs:
                   } else {
                       reason = "It was still " + stage + ".";
                   }
-                  deliverClosedOutcome(system, reason, 0);
+                  final String fullReason;
+                  if (bridgeStep == null || bridgeStep.isEmpty()) {
+                      fullReason = reason;
+                  } else {
+                      fullReason = (reason.isEmpty() ? "" : reason + " ") + "Last graphics step: " + bridgeStep + ".";
+                  }
+                  /* F5: leave a visible record on the library screen. */
+                  storeLastPlayerClose(system, title, fullReason);
+                  clearPlayerLaunchMarker();
+                  startClosedOutcome(system, fullReason);
+              }
+
+              /* F1/F2 (v1.4.7): start a closed-outcome delivery. The
+                 spoken announcement and Toast fire immediately — the
+                 page live region alone is silent after a process
+                 death, because TalkBack has no focus on the freshly
+                 restarted WebView. The page delivery then runs
+                 best-effort, driven by three triggers: the probe
+                 below, the Handler watchdog, and onPageFinished. */
+              private void startClosedOutcome(String system, String reason) {
+                  closedOutcomeSystem = system;
+                  closedOutcomeReason = reason;
+                  closedOutcomeAttempt = 0;
+                  closedOutcomeDelivered = false;
+                  closedOutcomePending = true;
+                  closedProbeToken++; /* invalidate any stale probe callback */
+                  closedProbeOutstanding = false;
+                  speakClosedOutcome(system, reason);
+                  deliverClosedOutcome(system, reason);
+                  scheduleClosedWatchdog();
+              }
+
+              /* F1: the closed path gets its own voice — a short-lived
+                 TextToSpeech plus a Toast carrying the full text,
+                 mirroring the players' speakAndToast pattern. The TTS
+                 is shut down after the utterance completes (or after
+                 15 s as a safety net) so it cannot outlive the
+                 Activity. */
+              private void speakClosedOutcome(String system, String reason) {
+                  final String text = "The " + systemDisplayName(system) + " game closed unexpectedly. " + reason;
+                  try {
+                      Toast.makeText(this, text, Toast.LENGTH_LONG).show();
+                  } catch (Exception ignored) {}
+                  try {
+                      if (closedTts != null) {
+                          try { closedTts.stop(); } catch (Exception ignored) {}
+                          try { closedTts.shutdown(); } catch (Exception ignored) {}
+                          closedTts = null;
+                      }
+                      /* The listener is created inside the
+                         constructor call, so it cannot capture the
+                         local being initialised (javac: "might not
+                         have been initialised"); a holder carries
+                         the instance to onInit instead. */
+                      final TextToSpeech[] holder = new TextToSpeech[1];
+                      final TextToSpeech tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
+                          @Override public void onInit(int status) {
+                              TextToSpeech self = holder[0];
+                              if (status == TextToSpeech.SUCCESS && self != null) {
+                                  try { self.speak(text, TextToSpeech.QUEUE_FLUSH, null, "closed-outcome"); }
+                                  catch (Exception ignored) {}
+                              }
+                          }
+                      });
+                      holder[0] = tts;
+                      closedTts = tts;
+                      tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                          @Override public void onStart(String utteranceId) {}
+                          @Override public void onDone(String utteranceId) { shutdownClosedTts(tts); }
+                          @Override public void onError(String utteranceId) { shutdownClosedTts(tts); }
+                      });
+                      final TextToSpeech t = tts;
+                      mainHandler.postDelayed(new Runnable() {
+                          @Override public void run() { shutdownClosedTts(t); }
+                      }, 15000);
+                  } catch (Exception ignored) {}
+              }
+
+              private void shutdownClosedTts(TextToSpeech tts) {
+                  try {
+                      if (closedTts == tts) closedTts = null;
+                      tts.stop();
+                      tts.shutdown();
+                  } catch (Exception ignored) {}
+              }
+
+              private void scheduleClosedWatchdog() {
+                  mainHandler.removeCallbacks(closedOutcomeWatchdog);
+                  mainHandler.postDelayed(closedOutcomeWatchdog, 600);
+              }
+
+              private void finishClosedOutcome() {
+                  closedOutcomePending = false;
+                  closedOutcomeSystem = null;
+                  closedOutcomeReason = null;
+                  closedOutcomeAttempt = 0;
+                  closedProbeOutstanding = false;
+                  mainHandler.removeCallbacks(closedOutcomeWatchdog);
               }
 
               /* The page may not be loaded yet when we come back
                  after a crash (fresh process, WebView still loading
                  index.html), so a one-shot evaluateJavascript can
                  silently no-op. Probe for handlePlayerOutcome and
-                 retry until it exists, up to 10 seconds. */
-              private void deliverClosedOutcome(final String system, final String reason, final int attempt) {
-                  if (webView == null) return;
-                  if (attempt > 20) return;
+                 retry until it exists, up to ~10 seconds. F2: the
+                 probe is one trigger among three now — the watchdog
+                 and onPageFinished also drive delivery, so a probe
+                 ValueCallback that never fires can no longer strand
+                 the outcome. A probe already in flight is not
+                 re-issued; the watchdog moves things on. */
+              private void deliverClosedOutcome(final String system, final String reason) {
+                  if (!closedOutcomePending || closedOutcomeDelivered || webView == null) return;
+                  if (closedOutcomeAttempt > 20) { finishClosedOutcome(); return; }
+                  if (closedProbeOutstanding) return;
+                  closedProbeOutstanding = true;
+                  final int token = ++closedProbeToken;
                   webView.evaluateJavascript(
                       "(typeof window.handlePlayerOutcome === 'function') ? '1' : '0'",
                       new ValueCallback<String>() {
                           @Override public void onReceiveValue(String value) {
+                              closedProbeOutstanding = false;
+                              if (token != closedProbeToken || !closedOutcomePending || closedOutcomeDelivered) return;
                               if ("\"1\"".equals(value) || "1".equals(value)) {
                                   webView.evaluateJavascript(
                                       "try{if(window.handlePlayerOutcome)window.handlePlayerOutcome('" +
                                       escapeJs(system) + "','closed','" + escapeJs(reason) + "');}catch(e){}",
                                       null);
+                                  closedOutcomeDelivered = true;
+                                  finishClosedOutcome();
                               } else {
-                                  mainHandler.postDelayed(new Runnable() {
-                                      @Override public void run() {
-                                          deliverClosedOutcome(system, reason, attempt + 1);
-                                      }
-                                  }, 500);
+                                  closedOutcomeAttempt++;
+                                  scheduleClosedWatchdog();
                               }
                           }
                       });
@@ -1332,6 +1536,8 @@ jobs:
               @Override
               protected void onDestroy() {
                   if (instance == this) instance = null;
+                  try { mainHandler.removeCallbacks(closedOutcomeWatchdog); } catch (Exception ignored) {}
+                  try { if (closedTts != null) { closedTts.stop(); closedTts.shutdown(); closedTts = null; } } catch (Exception ignored) {}
                   try { if (webView != null) webView.destroy(); } catch (Exception ignored) {}
                   super.onDestroy();
               }
