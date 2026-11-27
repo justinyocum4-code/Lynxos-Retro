@@ -64,6 +64,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val START_WATCHDOG_MS = 30_000L
+        private const val VIDEO_CHECK_MS = 5_000L
         private const val Z_TAP_MS = 100L
         private const val STICK_MAX = 32767
         private const val STICK_DEAD_ZONE = 0.15f
@@ -116,6 +117,15 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     private var tts: TextToSpeech? = null
     private var pendingSpeak: String? = null
 
+    // Which load stage the core thread is in right now. The start
+    // watchdog names it, so the next test pinpoints the hang stage
+    // without logcat (init / screen / core copy / core load /
+    // options / game load). Volatile: written on the core thread,
+    // read on the main thread by the watchdog.
+    @Volatile
+    private var loadStage = "starting the player"
+    private var videoCheckDone = false
+
     private val exitRunnable = Runnable {
         if (backHeld && !backChordUsed) finishPlayer()
     }
@@ -129,13 +139,64 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     // on running still being false: finishPlayer stops and shuts
     // down TTS, so finishing immediately would cut the warning off
     // before it is heard, and a game that starts in those 5 s must
-    // not be killed.
+    // not be killed. The warning names the load stage the thread is
+    // stuck in, and the delayed finish reports it back to the page
+    // (the player's own speech may be silent on the TV).
     private val startWatchdog = Runnable {
         if (!running.get()) {
-            speak("The Nintendo 64 game is taking too long to start.")
+            speakAndToast("The Nintendo 64 game is taking too long to start. Still waiting: $loadStage.")
             mainHandler.postDelayed({
-                if (!running.get()) finishPlayer()
+                if (!running.get()) {
+                    reportOutcome("hang", "Still waiting: $loadStage.", hard = true)
+                    finishPlayer()
+                }
             }, 5000L)
+        }
+    }
+
+    // Video check, 5 s after the frame loop starts: a zero presented
+    // count here means the game runs but nothing reaches the screen.
+    // The two native counters name the layer: no video callbacks at
+    // all means the core is not producing frames; callbacks without
+    // a presented frame means the screen is not ready. Fires once.
+    private val videoCheck = Runnable {
+        if (!videoCheckDone) {
+            videoCheckDone = true
+            val callbacks = try { nativeGetVideoCallbacks() } catch (e: Throwable) { -1L }
+            val presented = try { nativeGetFramesPresented() } catch (e: Throwable) { -1L }
+            if (presented == 0L) {
+                val reason = if (callbacks == 0L)
+                    "No video frames from the game."
+                else
+                    "The game screen is not ready."
+                speakAndToast("The Nintendo 64 game is running but no picture has been drawn yet. $reason")
+                reportOutcome("novideo", reason, hard = false)
+                Log.w(TAG, "video check: callbacks=$callbacks presented=$presented")
+            } else {
+                Log.i(TAG, "video check: callbacks=$callbacks presented=$presented")
+            }
+        }
+    }
+
+    /** Speak AND show a Toast: the TV's own text-to-speech may be
+     * silent, so speech alone can vanish unheard. TalkBack reads
+     * Toasts aloud, so the Toast is the channel that still works. */
+    private fun speakAndToast(text: String) {
+        speak(text)
+        runOnUiThread {
+            try { Toast.makeText(this, text, Toast.LENGTH_LONG).show() } catch (e: Exception) { }
+        }
+    }
+
+    /** Report this player's outcome back to MainActivity so the page
+     * can announce it through TalkBack when the player closes (the
+     * player's own speech may be silent on the TV). Soft outcomes
+     * (the video warning) only stick when nothing is set yet; hard
+     * ones (failures, stops, hangs) overwrite. MainActivity owns
+     * the rule; this just forwards. */
+    private fun reportOutcome(kind: String, reason: String, hard: Boolean) {
+        try { MainActivity.reportPlayerOutcome("n64", kind, reason, hard) } catch (e: Exception) {
+            Log.w(TAG, "report outcome failed", e)
         }
     }
 
@@ -152,6 +213,8 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     private external fun nativeSetButton(id: Int, pressed: Boolean)
     private external fun nativeSetAnalog(index: Int, x: Int, y: Int)
     private external fun nativeGetLastError(): String
+    private external fun nativeGetVideoCallbacks(): Long
+    private external fun nativeGetFramesPresented(): Long
     private external fun nativeClose()
 
     /** Called from the native bridge on the core thread with one audio batch. */
@@ -197,7 +260,13 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         surfaceView = SurfaceView(this)
-        surfaceView.setBackgroundColor(Color.BLACK)
+        // NO background on the SurfaceView itself: an opaque
+        // background clears SKIP_DRAW, so the view no longer punches
+        // its hole in the window and the EGL window surface below
+        // stays hidden behind opaque black (same defect as the
+        // PlayStation player's sound-with-no-picture). The root's
+        // black is fine — only the SurfaceView's own background
+        // kills the hole.
         surfaceView.holder.addCallback(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
@@ -215,22 +284,36 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
 
         // The core thread does everything: load, run the frame loop,
         // and close the bridge when it ends. The EGL context lives on
-        // this thread, so cleanup must happen here too.
+        // this thread, so cleanup must happen here too. Each step
+        // updates loadStage (logged here, named by the watchdog)
+        // so a hang is diagnosable by stage, not just by silence.
         coreThread = Thread {
             try {
+                loadStage = "starting the player"
+                Log.i(TAG, "load stage: $loadStage")
                 if (!nativeInit(this)) {
                     throw IllegalStateException(lastErrorOr("The Nintendo 64 player could not start."))
                 }
+                loadStage = "waiting for the game screen"
+                Log.i(TAG, "load stage: $loadStage")
                 if (!surfaceReady.await(5, TimeUnit.SECONDS)) {
                     throw IllegalStateException("The game screen was not ready.")
                 }
+                loadStage = "copying the game core"
+                Log.i(TAG, "load stage: $loadStage")
                 val coreFile = ensureCoreFile(coreChoice)
                 val systemDir = File(filesDir, "native-system").apply { mkdirs() }.absolutePath
                 val saveDir = File(filesDir, "native-saves").apply { mkdirs() }.absolutePath
+                loadStage = "loading the game core"
+                Log.i(TAG, "load stage: $loadStage")
                 if (!nativeLoadCore(coreFile.absolutePath, systemDir, saveDir)) {
                     throw IllegalStateException(lastErrorOr("The Nintendo 64 game core could not be loaded."))
                 }
+                loadStage = "setting game options"
+                Log.i(TAG, "load stage: $loadStage")
                 applyCoreOptions(coreChoice)
+                loadStage = "loading the game"
+                Log.i(TAG, "load stage: $loadStage")
                 if (!nativeLoadGame(gamePath, gameTitle)) {
                     throw IllegalStateException(lastErrorOr("The game could not be loaded."))
                 }
@@ -240,14 +323,16 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 speak("Now playing $gameTitle, Nintendo 64. " + controlSummary())
                 running.set(true)
                 mainHandler.removeCallbacks(startWatchdog)
+                mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
                 val frameNanos = (1_000_000_000.0 / fps).toLong()
                 while (running.get()) {
                     val t0 = System.nanoTime()
                     if (!nativeRunFrame()) {
                         val reason = nativeGetLastError()
+                        reportOutcome("stopped", reason.ifEmpty { "The game stopped." }, hard = true)
                         runOnUiThread {
                             if (reason.isNotEmpty()) {
-                                Toast.makeText(this, "The game stopped.", Toast.LENGTH_LONG).show()
+                                Toast.makeText(this, "The game stopped. $reason", Toast.LENGTH_LONG).show()
                                 speak("The game stopped. $reason")
                             }
                             finishPlayer()
@@ -267,8 +352,12 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
             } catch (e: Exception) {
                 Log.e(TAG, "Could not start $gameTitle", e)
                 val reason = lastErrorOr(e.message ?: "Could not start $gameTitle.")
+                // The reason also goes back to the page: the
+                // player's own speech may be silent on the TV, and
+                // the Toast carries the full text for the same reason.
+                reportOutcome("failed", reason, hard = true)
                 runOnUiThread {
-                    Toast.makeText(this, "Could not start $gameTitle.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Could not start $gameTitle. $reason", Toast.LENGTH_LONG).show()
                     speak("Could not start $gameTitle. $reason")
                     finishPlayer()
                 }
@@ -555,6 +644,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
         mainHandler.removeCallbacks(startWatchdog)
+        mainHandler.removeCallbacks(videoCheck)
         try {
             coreThread?.join(1000)
         } catch (e: Exception) {

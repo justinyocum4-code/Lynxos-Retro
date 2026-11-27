@@ -16,6 +16,7 @@ import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.view.InputDevice
 import android.view.KeyEvent
+import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.WindowManager
 import android.widget.FrameLayout
@@ -31,6 +32,7 @@ import java.io.FileOutputStream
 import java.util.Collections
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Native PlayStation player (milestone 1 of the native-player project).
@@ -46,7 +48,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * for half a second leaves the game. A standard gamepad (Switch controller)
  * works with its own buttons, no rotation.
  */
-class NativePlayerActivity : Activity() {
+class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
 
     companion object {
         const val EXTRA_GAME_PATH = "gamePath"
@@ -57,6 +59,7 @@ class NativePlayerActivity : Activity() {
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val START_WATCHDOG_MS = 30_000L
+        private const val VIDEO_CHECK_MS = 5_000L
         private const val TRIANGLE_TAP_MS = 100L
     }
 
@@ -84,6 +87,15 @@ class NativePlayerActivity : Activity() {
     private var frameBitmap: Bitmap? = null
     private val paint = Paint().apply { isFilterBitmap = false }
 
+    // Video-state diagnostics: frames the core delivered vs frames
+    // actually posted to the surface. If the game runs (sound) but
+    // nothing is drawn, these two counts name the layer without
+    // logcat — the 5 s check below speaks the difference.
+    private val framesPresented = AtomicInteger(0)
+    private val framesDrawn = AtomicInteger(0)
+    private val surfaceReady = AtomicBoolean(false)
+    private var videoCheckDone = false
+
     private val exitRunnable = Runnable {
         if (backHeld && !backChordUsed) finishPlayer()
     }
@@ -97,11 +109,75 @@ class NativePlayerActivity : Activity() {
     // immediately would cut the warning off unheard.
     private val startWatchdog = Runnable {
         if (!running.get()) {
-            speak("The PlayStation game is taking too long to start.")
+            speakAndToast("The PlayStation game is taking too long to start.")
             mainHandler.postDelayed({
-                if (!running.get()) finishPlayer()
+                if (!running.get()) {
+                    reportOutcome("hang", "The game did not start within 30 seconds.", hard = true)
+                    finishPlayer()
+                }
             }, 5000L)
         }
+    }
+
+    // Video check, 5 s after the frame loop starts: the game is
+    // running (sound proves the core is alive), so a zero drawn
+    // count here means sound-with-no-picture. The two counts name
+    // the layer: no frames delivered at all means the core is not
+    // producing video; frames delivered but none drawn means the
+    // screen is not ready. Fires once; a game that starts drawing
+    // late is left alone.
+    private val videoCheck = Runnable {
+        if (!videoCheckDone) {
+            videoCheckDone = true
+            val presented = framesPresented.get()
+            val drawn = framesDrawn.get()
+            if (drawn == 0) {
+                val reason = if (presented == 0)
+                    "No video frames from the game."
+                else
+                    "The game screen is not ready."
+                speakAndToast("The PlayStation game is running but no picture has been drawn yet. $reason")
+                reportOutcome("novideo", reason, hard = false)
+                Log.w(TAG, "video check: presented=$presented drawn=$drawn surfaceReady=${surfaceReady.get()}")
+            } else {
+                Log.i(TAG, "video check: presented=$presented drawn=$drawn surfaceReady=${surfaceReady.get()}")
+            }
+        }
+    }
+
+    /** Speak AND show a Toast: the TV's own text-to-speech may be
+     * silent, so speech alone can vanish unheard. TalkBack reads
+     * Toasts aloud, so the Toast is the channel that still works. */
+    private fun speakAndToast(text: String) {
+        speak(text)
+        runOnUiThread {
+            try { Toast.makeText(this, text, Toast.LENGTH_LONG).show() } catch (e: Exception) { }
+        }
+    }
+
+    /** Report this player's outcome back to MainActivity so the page
+     * can announce it through TalkBack when the player closes (the
+     * player's own speech may be silent on the TV). Soft outcomes
+     * (the video warning) only stick when nothing is set yet; hard
+     * ones (failures, stops, hangs) overwrite. MainActivity owns
+     * the rule; this just forwards. */
+    private fun reportOutcome(kind: String, reason: String, hard: Boolean) {
+        try { MainActivity.reportPlayerOutcome("psx", kind, reason, hard) } catch (e: Exception) {
+            Log.w(TAG, "report outcome failed", e)
+        }
+    }
+
+    // ----- Surface lifecycle -----
+
+    override fun surfaceCreated(holder: SurfaceHolder) {
+        surfaceReady.set(true)
+    }
+
+    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
+    }
+
+    override fun surfaceDestroyed(holder: SurfaceHolder) {
+        surfaceReady.set(false)
     }
 
     private val frontend = object : LibretroFrontend {
@@ -123,6 +199,7 @@ class NativePlayerActivity : Activity() {
         }
 
         override fun onVideoFrame(frame: VideoFrame) {
+            framesPresented.incrementAndGet()
             var bmp = frameBitmap
             if (bmp == null || bmp.width != frame.width || bmp.height != frame.height) {
                 bmp = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
@@ -163,7 +240,14 @@ class NativePlayerActivity : Activity() {
         val root = FrameLayout(this)
         root.setBackgroundColor(Color.BLACK)
         surfaceView = SurfaceView(this)
-        surfaceView.setBackgroundColor(Color.BLACK)
+        // NO background on the SurfaceView itself. An opaque
+        // background clears SKIP_DRAW, so the view no longer punches
+        // its hole in the window (SurfaceView.gatherTransparentRegion
+        // removes the rect from the transparent region instead of
+        // adding it) and the video surface below stays hidden behind
+        // opaque black: sound, no picture. The root's black is fine
+        // — only the SurfaceView's own background kills the hole.
+        surfaceView.holder.addCallback(this)
         root.addView(surfaceView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
         setContentView(root)
@@ -194,10 +278,15 @@ class NativePlayerActivity : Activity() {
                 Log.e(TAG, "Could not start $gameTitle", e)
                 // Speak the reason, like the N64 player does: a bare
                 // "Could not start" leaves Justin guessing. libretro-kmp
-                // throws with the load failure as its message.
+                // throws with the load failure as its message. The
+                // reason also goes back to the page (reportOutcome),
+                // because the player's own speech may be silent on
+                // the TV — and the Toast carries the full text, not
+                // the short version, for the same reason.
                 val reason = e.message?.takeIf { it.isNotBlank() } ?: "The game could not be started."
+                reportOutcome("failed", reason, hard = true)
                 runOnUiThread {
-                    Toast.makeText(this, "Could not start $gameTitle.", Toast.LENGTH_LONG).show()
+                    Toast.makeText(this, "Could not start $gameTitle. $reason", Toast.LENGTH_LONG).show()
                     speak("Could not start $gameTitle. $reason")
                     finish()
                 }
@@ -269,6 +358,7 @@ class NativePlayerActivity : Activity() {
     private fun startLoop(fps: Double) {
         running.set(true)
         mainHandler.removeCallbacks(startWatchdog)
+        mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
         val frameNanos = (1_000_000_000.0 / fps).toLong()
         loopThread = Thread {
             val c = core ?: return@Thread
@@ -278,8 +368,11 @@ class NativePlayerActivity : Activity() {
                     c.run()
                 } catch (e: Exception) {
                     Log.e(TAG, "core run failed", e)
+                    val reason = e.message?.takeIf { it.isNotBlank() } ?: "The game stopped."
+                    reportOutcome("stopped", reason, hard = true)
                     runOnUiThread {
-                        Toast.makeText(this, "The game stopped.", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this, "The game stopped. $reason", Toast.LENGTH_LONG).show()
+                        speak("The game stopped. $reason")
                         finishPlayer()
                     }
                     return@Thread
@@ -320,6 +413,9 @@ class NativePlayerActivity : Activity() {
         } finally {
             surfaceView.holder.unlockCanvasAndPost(canvas)
         }
+        // Only reached when the frame was actually posted: a null
+        // canvas or an invalid surface returns before this line.
+        framesDrawn.incrementAndGet()
     }
 
     // ---------- Input: remote (sideways) and standard gamepad ----------
@@ -403,6 +499,7 @@ class NativePlayerActivity : Activity() {
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
         mainHandler.removeCallbacks(startWatchdog)
+        mainHandler.removeCallbacks(videoCheck)
         try { loopThread?.join(1000) } catch (e: Exception) { }
         try { core?.close() } catch (e: Exception) { Log.w(TAG, "core close failed", e) }
         core = null

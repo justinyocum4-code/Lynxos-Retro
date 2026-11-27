@@ -246,6 +246,25 @@
   // live region: assertive interrupts and is read right away.
   function announceUrgent(text) { $('liveAssertive').textContent = text; }
 
+  // Called by MainActivity when a native player reports an outcome
+  // on its way out. The player's own speech may be silent on the TV,
+  // so the page says it through TalkBack instead. kind: 'failed',
+  // 'stopped', 'hang', 'novideo'. Players only report failures,
+  // stops, hangs and no-picture warnings — a normal exit reports
+  // nothing, so this is never called for a game that played fine.
+  window.handlePlayerOutcome = function (system, kind, reason) {
+    var name = system === 'n64' ? 'Nintendo 64' : 'PlayStation';
+    var text = '';
+    if (kind === 'failed') text = 'The ' + name + ' game could not start. ' + (reason || '');
+    else if (kind === 'stopped') text = 'The ' + name + ' game stopped. ' + (reason || '');
+    else if (kind === 'hang') text = 'The ' + name + ' game took too long to start. ' + (reason || '');
+    else if (kind === 'novideo') text = 'The ' + name + ' game was running but no picture was drawn. ' + (reason || '');
+    if (!text) return;
+    if (kind === 'failed' || kind === 'hang') $('nowPlaying').textContent = text;
+    announce(text);
+    announceUrgent(text);
+  };
+
   // Translate a raw upload/save error into plain words, never just
   // "unknown error". Returns the reason to speak and show.
   function plainErrorReason(err) {
@@ -665,6 +684,21 @@
       setPlayingBridge(true);
       $('nowPlaying').textContent = 'Loading ' + game.title + '…';
       announce('Loading ' + game.title + ' on the native player. ' + controlSummary('psx'));
+      // Extract-once cache: a finished export lives in the app's
+      // files, so a game that already played starts straight from
+      // the saved copy — no download, no extract, no re-send. Any
+      // launch error falls through to the normal export below.
+      try {
+        if (window.LynxosRetro && window.LynxosRetro.nativeCachedMainFile &&
+            window.LynxosRetro.nativeLaunchCached) {
+          var cached = window.LynxosRetro.nativeCachedMainFile(game.title, game.system);
+          if (cached) {
+            announce('Starting ' + game.title + ' from the saved copy.');
+            var launched = window.LynxosRetro.nativeLaunchCached(game.title, game.system, '');
+            if (launched === 'ok') return;
+          }
+        }
+      } catch (e) {}
       exportGameForNative(game).then(function () {
         // The native player Activity is now in front.
       }).catch(function (err) {
@@ -692,6 +726,20 @@
       setPlayingBridge(true);
       $('nowPlaying').textContent = 'Loading ' + game.title + '…';
       announce('Loading ' + game.title + ' on the native player. ' + controlSummary('n64'));
+      // Extract-once cache: same as PlayStation above — a game that
+      // already played starts straight from the saved copy.
+      try {
+        if (window.LynxosRetro && window.LynxosRetro.nativeCachedMainFile &&
+            window.LynxosRetro.nativeLaunchCached) {
+          var cached = window.LynxosRetro.nativeCachedMainFile(game.title, game.system);
+          if (cached) {
+            announce('Starting ' + game.title + ' from the saved copy.');
+            var launched = window.LynxosRetro.nativeLaunchCached(game.title, game.system,
+              game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+            if (launched === 'ok') return;
+          }
+        }
+      } catch (e) {}
       exportGameForNative(game).then(function () {
         // The native player Activity is now in front.
       }).catch(function (err) {
@@ -2762,6 +2810,9 @@
       localGames = localGames.filter(function (g) { return g.id !== game.id; });
       var done = Promise.resolve();
       if (game.idbKey) done = idbDelete(game.idbKey).catch(function () {});
+      // Drop this game's extracted cache too, so a deleted game
+      // leaves no unpacked files behind.
+      try { if (window.LynxosRetro && window.LynxosRetro.nativeDeleteCache) window.LynxosRetro.nativeDeleteCache(game.title, game.system); } catch (e) {}
       done.then(function () {
         saveLocalGames();
         renderList();
@@ -2780,6 +2831,8 @@
       // Drop this game's downloaded copy too, so the cache does not
       // keep files for games that are gone.
       if (game.storagePath) idbDelete('cloud:' + game.storagePath).catch(function () {});
+      // And its extracted cache, for the same reason.
+      try { if (window.LynxosRetro && window.LynxosRetro.nativeDeleteCache) window.LynxosRetro.nativeDeleteCache(game.title, game.system); } catch (e) {}
       var removeFile = game.storagePath
         ? driveDeleteFile(game.storagePath)
         : Promise.resolve();

@@ -273,6 +273,13 @@ static volatile int g_frame_ready;
 static int g_video_cb_count;
 static long g_fps_frames;
 static long g_fps_second;
+/* Video diagnostics for the Kotlin 5 s check: total video callbacks
+ * from the core vs frames actually presented with eglSwapBuffers.
+ * A running game with callbacks but no presented frames means the
+ * screen is not ready; no callbacks at all means the core is not
+ * producing video. */
+static volatile long g_video_cb_total;
+static volatile long g_frames_presented;
 
 /* Audio upcall back into Kotlin. The core thread is a Java thread, so
  * GetEnv normally succeeds; the attach path covers a core-spawned
@@ -323,6 +330,7 @@ static void video_cb(const void *data, unsigned width, unsigned height, size_t p
         g_video_cb_count++;
         LOGI("video_cb #%d: data=%p %ux%u", g_video_cb_count, data, width, height);
     }
+    g_video_cb_total++;
     if (data == LR_HW_FRAME_BUFFER_VALID) {
         g_frame_ready = 1;
     } else if (data == NULL) {
@@ -558,6 +566,21 @@ static bool handle_set_hw_render(void *data) {
             set_error("This game needs a graphics mode this player does not support.");
             return false;
     }
+    /* The window arrives via nativeSetSurface as g_pending_window and
+     * is normally promoted by the first nativeRunFrame — but
+     * SET_HW_RENDER is called during retro_load_game, BEFORE any
+     * frame runs, so the first load always saw a NULL window here
+     * and failed with "The game screen was not ready." Promote the
+     * pending window now so the EGL context can be created during
+     * load. nativeRunFrame's own promotion then finds nothing left
+     * to do (g_pending_window is NULL), so ownership transfers once. */
+    pthread_mutex_lock(&g_gl_mutex);
+    if (!g_window && g_pending_window) {
+        g_window = g_pending_window;
+        g_pending_window = NULL;
+        g_surface_new = 0;
+    }
+    pthread_mutex_unlock(&g_gl_mutex);
     if (!g_window) {
         set_error("The game screen was not ready.");
         return false;
@@ -801,6 +824,8 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeLoadCore(JNIEnv *env, job
     g_game_loaded = false;
     g_frame_ready = 0;
     g_video_cb_count = 0;
+    g_video_cb_total = 0;
+    g_frames_presented = 0;
     g_input_log_count = 0;
     g_missing_sym_count = 0;
     g_fps_frames = 0;
@@ -1009,7 +1034,8 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeRunFrame(JNIEnv *env, job
     if (g_frame_ready) {
         pthread_mutex_lock(&g_gl_mutex);
         if (g_context != EGL_NO_CONTEXT && g_surface != EGL_NO_SURFACE) {
-            if (!eglSwapBuffers(g_display, g_surface)) log_egl("eglSwapBuffers");
+            if (eglSwapBuffers(g_display, g_surface)) g_frames_presented++;
+            else log_egl("eglSwapBuffers");
         }
         pthread_mutex_unlock(&g_gl_mutex);
         g_fps_frames++;
@@ -1068,6 +1094,22 @@ JNIEXPORT jstring JNICALL
 Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeGetLastError(JNIEnv *env, jobject thiz) {
     (void)thiz;
     return (*env)->NewStringUTF(env, g_last_error);
+}
+
+/* Video diagnostics for the Kotlin 5 s check (see g_video_cb_total /
+ * g_frames_presented above). */
+JNIEXPORT jlong JNICALL
+Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeGetVideoCallbacks(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    return (jlong)g_video_cb_total;
+}
+
+JNIEXPORT jlong JNICALL
+Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeGetFramesPresented(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    return (jlong)g_frames_presented;
 }
 
 JNIEXPORT void JNICALL
