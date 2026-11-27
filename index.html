@@ -17,6 +17,7 @@
   /* F5 (v1.4.7): the last silent-death record, gold and bold so it
      stands out on the library screen. */
   #lastPlayerClose { color: #F5C518; font-weight: bold; font-size: 16px; }
+  #lastN64Crash { color: #F5C518; font-weight: bold; font-size: 16px; }
   .error { color: #ff8080; font-size: 17px; font-weight: bold; }
   .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
   button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
@@ -90,6 +91,10 @@
     <div id="lastPlayerCloseWrap" hidden>
       <p id="lastPlayerClose" role="status"></p>
       <button type="button" id="dismissLastCloseBtn">Dismiss</button>
+    </div>
+    <div id="lastN64CrashWrap" hidden>
+      <p id="lastN64Crash" role="status"></p>
+      <button type="button" id="dismissLastCrashBtn">Dismiss</button>
     </div>
     <ul id="gameList" role="list"></ul>
     <p id="emptyState" class="note" hidden></p>
@@ -308,6 +313,42 @@
       }
     } catch (e) {}
     var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
+    if (el) el.textContent = '';
+    if (wrap) wrap.hidden = true;
+  }
+
+  // Crash recorder (v1.4.9): the native bridge writes a crash
+  // report to filesDir/n64-crash.txt when the N64 player dies in
+  // native code. MainActivity speaks a summary on the next launch;
+  // the page shows the details here, next to the Last-game line
+  // but never overwriting it. Dismissing only records the report
+  // as seen — the file itself stays put for later diagnosis, and
+  // a new crash shows again.
+  function refreshLastN64Crash() {
+    try {
+      var el = $('lastN64Crash'), wrap = $('lastN64CrashWrap');
+      if (!el || !wrap) return;
+      var record = '';
+      if (window.LynxosRetro && window.LynxosRetro.getLastN64Crash) {
+        record = window.LynxosRetro.getLastN64Crash() || '';
+      }
+      if (record) {
+        el.textContent = 'Last crash: ' + record;
+        wrap.hidden = false;
+      } else {
+        el.textContent = '';
+        wrap.hidden = true;
+      }
+    } catch (e) {}
+  }
+
+  function clearLastN64Crash() {
+    try {
+      if (window.LynxosRetro && window.LynxosRetro.clearLastN64Crash) {
+        window.LynxosRetro.clearLastN64Crash();
+      }
+    } catch (e) {}
+    var el = $('lastN64Crash'), wrap = $('lastN64CrashWrap');
     if (el) el.textContent = '';
     if (wrap) wrap.hidden = true;
   }
@@ -554,6 +595,7 @@
     $('accountScreen').hidden = name !== 'account';
     $('playerScreen').hidden = name !== 'player';
     if (name === 'library') refreshLastPlayerClose();
+    if (name === 'library') refreshLastN64Crash();
   }
 
   // ---------- Tabs + library ----------
@@ -728,6 +770,9 @@
     // F5: a new launch supersedes the old silent-death record; if
     // this game dies silently, a fresh record replaces it.
     clearLastPlayerClose();
+    // v1.4.9: same for the crash record — a new launch dismisses
+    // the old report (the file stays put); a new crash shows again.
+    clearLastN64Crash();
     // PlayStation runs on the native player (real ARM code, not the
     // browser): export the game file to the app and hand it over.
     if (game.system === 'psx') {
@@ -2912,6 +2957,8 @@
     renderList();
     refreshLastPlayerClose();
     $('dismissLastCloseBtn').addEventListener('click', clearLastPlayerClose);
+    refreshLastN64Crash();
+    $('dismissLastCrashBtn').addEventListener('click', clearLastN64Crash);
     initDrive();
     updateSyncStatus();
     updateAccountStatus();
