@@ -561,6 +561,13 @@ static bool create_gl_context_locked(void) {
     EGLint ncfg = 0;
     if (!eglChooseConfig(g_display, attribs, &config, 1, &ncfg) || ncfg < 1) {
         log_egl("eglChooseConfig");
+        if (version == 3) {
+            /* F2 (v1.4.8): never hand an ES2 context to a core that
+               asked for ES3 — it segfaults on its first ES3 call.
+               Fail cleanly so the player reports it instead. */
+            set_error("The device has no ES3 graphics mode.");
+            return false;
+        }
         /* Fall back to an ES2 renderable type and try once more. */
         const EGLint attribs2[] = {
             EGL_SURFACE_TYPE, EGL_WINDOW_BIT,
@@ -576,11 +583,18 @@ static bool create_gl_context_locked(void) {
         }
         version = 2;
     }
-    /* The version that really got created (the ES3 request may have
-     * fallen back to ES2 above); prewarm_gl checks symbols against
-     * this, not the requested version. */
+    /* The version that really got created (F2 v1.4.8: an ES3 request
+     * no longer falls back to ES2 — it fails cleanly instead);
+     * prewarm_gl checks symbols against this, not the requested
+     * version. */
     g_gl_actual_version = version;
-    record_bridge_step("graphics mode chosen");
+    /* F2 (v1.4.8): record the version that really got created, so a
+       future silent death names it. */
+    {
+        char step[48];
+        snprintf(step, sizeof step, "graphics mode chosen (GLES %d)", version);
+        record_bridge_step(step);
+    }
     EGLint depth = 0, stencil = 0, visual = 0;
     eglGetConfigAttrib(g_display, config, EGL_DEPTH_SIZE, &depth);
     eglGetConfigAttrib(g_display, config, EGL_STENCIL_SIZE, &stencil);
@@ -681,8 +695,27 @@ static bool handle_set_hw_render(void *data) {
         set_error("The game screen was not ready.");
         return false;
     }
+    /* F4 (v1.4.8): a 0-size window makes a 0-size EGL surface;
+       fail cleanly instead of finding out later in retro_run. */
+    int winW = ANativeWindow_getWidth(g_window);
+    int winH = ANativeWindow_getHeight(g_window);
+    if (winW <= 0 || winH <= 0) {
+        set_error("The game screen has no size yet.");
+        return false;
+    }
+    {
+        char step[48];
+        snprintf(step, sizeof step, "game screen %dx%d", winW, winH);
+        record_bridge_step(step);
+    }
     record_bridge_step("starting graphics setup");
+    /* F1 (v1.4.8): the two frontend-owned callbacks must be written
+       back into the CORE's struct as well as our copy — glsm reads
+       its own struct, and with NULL pointers there context_reset
+       segfaults (the v1.4.7 silent death). */
     g_hw = *cb; /* copy: the core's struct is filled in, we add ours */
+    cb->get_proc_address = lynxos_get_proc_address;
+    cb->get_current_framebuffer = lynxos_get_current_framebuffer;
     g_hw.get_proc_address = lynxos_get_proc_address;
     g_hw.get_current_framebuffer = lynxos_get_current_framebuffer;
     g_hw_gl_version = version;
