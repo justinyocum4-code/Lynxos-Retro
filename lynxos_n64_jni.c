@@ -1566,6 +1566,20 @@ Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeGetSampleRate(JNIEnv *env
     return g_av.timing.sample_rate;
 }
 
+JNIEXPORT jfloat JNICALL
+Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeGetAspectRatio(JNIEnv *env, jobject thiz) {
+    (void)env;
+    (void)thiz;
+    /* libretro: aspect_ratio 0 means "use base_width/base_height".
+     * The geometry arrives via SET_SYSTEM_AV_INFO / SET_GEOMETRY
+     * during load and retro_get_system_av_info at the end of
+     * nativeLoadGame, so this is only meaningful after load. */
+    if (g_av.geometry.aspect_ratio > 0) return g_av.geometry.aspect_ratio;
+    if (g_av.geometry.base_width > 0 && g_av.geometry.base_height > 0)
+        return (float)g_av.geometry.base_width / (float)g_av.geometry.base_height;
+    return 4.0f / 3.0f;
+}
+
 JNIEXPORT void JNICALL
 Java_com_lynxosretro_app_NativeN64PlayerActivity_nativeSetButton(JNIEnv *env, jobject thiz,
         jint id, jboolean pressed) {
