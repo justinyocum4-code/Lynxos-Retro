@@ -70,6 +70,7 @@ jobs:
           mkdir -p app/src/main/java/com/lynxosretro/app app/src/main/assets/www app/src/main/res/xml
           cp "$HTML_FILE" app/src/main/assets/www/index.html
           cp supabase-config.js app/src/main/assets/www/supabase-config.js
+          cp drive-config.js app/src/main/assets/www/drive-config.js
           cp -r assets app/src/main/assets/www/assets
           echo "App files copied into assets/www:"
           du -sh app/src/main/assets/www
