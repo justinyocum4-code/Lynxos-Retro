@@ -128,6 +128,14 @@
     <input type="text" id="editTitle">
     <label for="editSystem">System</label>
     <select id="editSystem"></select>
+    <div id="editCoreWrap" hidden>
+      <label for="editCore">Core (Nintendo 64 only)</label>
+      <select id="editCore">
+        <option value="mupen64plus_next">Mupen64Plus-Next (default)</option>
+        <option value="parallel_n64">Parallel N64 (try if the game is slow)</option>
+      </select>
+      <p class="note">Two different Nintendo 64 engines. If a game is slow or glitchy on one, try the other. In-game saves carry over.</p>
+    </div>
     <p class="note">Games that came with the app cannot be changed. Only games you added can be edited or deleted.</p>
     <div class="actions">
       <button type="button" id="editSaveBtn">Save changes</button>
@@ -520,6 +528,9 @@
       eo.textContent = sys.label;
       esel.appendChild(eo);
     });
+    esel.addEventListener('change', function () {
+      $('editCoreWrap').hidden = esel.value !== 'n64';
+    });
   }
 
   function selectTab(id) {
@@ -685,26 +696,53 @@
       // IDs verified in the bundled core itself (see below).
       window.EJS_defaultOptions = { video_smooth: false };
       if (game.system === 'n64') {
-        // N64 renders at its own native size (320x240 for 4:3,
-        // 640x360 for 16:9) instead of the TV's resolution — the
-        // biggest speed win on this box. v1.2.3 adds the low-end
-        // speed set: framebuffer emulation OFF (the single biggest
-        // extra win on weak GPUs; a few games may show a wrong-looking
-        // effect), threaded renderer ON (spreads GLideN64 across the
-        // box's cores), bilinear mode 3point (the real N64's own
-        // filtering, cheaper than standard), and frame duplication ON
-        // (re-shows the last frame instead of juddering when the box
-        // falls behind). All IDs verified in the bundled
-        // mupen64plus_next wasm; values/defaults from the core's own
-        // libretro_core_options.h (FBEmu default True, threaded
-        // renderer default False, bilinear default standard, frame
-        // duping default False).
-        window.EJS_defaultOptions['mupen64plus-43screensize'] = '320x240';
-        window.EJS_defaultOptions['mupen64plus-169screensize'] = '640x360';
-        window.EJS_defaultOptions['mupen64plus-EnableFBEmulation'] = 'False';
-        window.EJS_defaultOptions['mupen64plus-ThreadedRenderer'] = 'True';
-        window.EJS_defaultOptions['mupen64plus-BilinearMode'] = '3point';
-        window.EJS_defaultOptions['mupen64plus-FrameDuping'] = 'True';
+        var n64Core = game.core || systemCore(game.system);
+        if (n64Core === 'parallel_n64') {
+          // Parallel N64 (v1.2.4): the other N64 engine, picked per
+          // game on its Options screen. Its build has NO GLideN64 —
+          // its video plugins are the older, lighter Glide64, glN64
+          // and Rice — so Glide64 is set here on purpose, at its
+          // fastest accuracy. Left alone the core would default to
+          // its heavy ParaLLEl renderer, which is slower than the
+          // current core. IDs verified in the bundled parallel_n64
+          // wasm; values/defaults from the core's own
+          // libretro_core_options.h (accuracy default medium on
+          // Android; RSP left on auto, which picks HLE).
+          window.EJS_defaultOptions['parallel-n64-gfxplugin'] = 'glide64';
+          window.EJS_defaultOptions['parallel-n64-gfxplugin-accuracy'] = 'low';
+        } else {
+          // N64 renders at its own native size (320x240 for 4:3,
+          // 640x360 for 16:9) instead of the TV's resolution — the
+          // biggest speed win on this box. v1.2.3 adds the low-end
+          // speed set: framebuffer emulation OFF (the single biggest
+          // extra win on weak GPUs; a few games may show a wrong-looking
+          // effect), threaded renderer ON (spreads GLideN64 across the
+          // box's cores), bilinear mode 3point (the real N64's own
+          // filtering, cheaper than standard), and frame duplication ON
+          // (re-shows the last frame instead of juddering when the box
+          // falls behind). v1.2.4 adds the last untried settings:
+          // detail (LOD) calculation OFF, color and depth buffer
+          // copies OFF (both trade some effects for speed), and the
+          // timing counter at 1 (the fastest value, what the core's
+          // Fullspeed mode enforces — it can break timing in some
+          // games). All IDs verified in the bundled
+          // mupen64plus_next wasm; values/defaults from the core's own
+          // libretro_core_options.h (FBEmu default True, threaded
+          // renderer default False, bilinear default standard, frame
+          // duping default False, LOD default True, color copy
+          // default TripleBuffer, depth copy default Software,
+          // CountPerOp default 0).
+          window.EJS_defaultOptions['mupen64plus-43screensize'] = '320x240';
+          window.EJS_defaultOptions['mupen64plus-169screensize'] = '640x360';
+          window.EJS_defaultOptions['mupen64plus-EnableFBEmulation'] = 'False';
+          window.EJS_defaultOptions['mupen64plus-ThreadedRenderer'] = 'True';
+          window.EJS_defaultOptions['mupen64plus-BilinearMode'] = '3point';
+          window.EJS_defaultOptions['mupen64plus-FrameDuping'] = 'True';
+          window.EJS_defaultOptions['mupen64plus-EnableLODEmulation'] = 'False';
+          window.EJS_defaultOptions['mupen64plus-EnableCopyColorToRDRAM'] = 'Off';
+          window.EJS_defaultOptions['mupen64plus-EnableCopyDepthToRDRAM'] = 'Off';
+          window.EJS_defaultOptions['mupen64plus-CountPerOp'] = '1';
+        }
       }
       if (game.system === 'psx') {
         // PlayStation: frameskip on auto_threshold — the core watches
@@ -1678,6 +1716,12 @@
     setStatus($('editStatus'), '', '');
     $('editTitle').value = game.title;
     $('editSystem').value = game.system;
+    if (game.system === 'n64') {
+      $('editCoreWrap').hidden = false;
+      $('editCore').value = (game.core === 'parallel_n64') ? 'parallel_n64' : 'mupen64plus_next';
+    } else {
+      $('editCoreWrap').hidden = true;
+    }
     showScreen('edit');
     announce('Editing ' + game.title + '. Change the title or system, then save, or delete the game.');
     $('editTitle').focus();
@@ -1695,6 +1739,9 @@
       return;
     }
     var core = systemCore(system);
+    if (system === 'n64' && $('editCore').value === 'parallel_n64') {
+      core = 'parallel_n64';
+    }
     if (game.source === 'local') {
       var found = null;
       for (var i = 0; i < localGames.length; i++) {
