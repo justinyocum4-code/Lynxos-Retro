@@ -348,6 +348,13 @@ jobs:
                  the player Activity. */
               private String nativeSystem = "";
               private String nativeCore = "";
+              /* Multi-file export (archive case): the page unpacks
+                 the archive and sends the disc files one at a time
+                 into native-games/<title>/; nativeEnd launches with
+                 the file named by nativeSetMainFile. */
+              private File nativeMultiDir;
+              private File nativeMainFile;
+              private boolean nativeMulti = false;
               private long backDownTime = 0;
               private boolean backHeld = false;
               private boolean backChordUsed = false;
@@ -404,6 +411,20 @@ jobs:
                   @JavascriptInterface
                   public String nativeEnd() {
                       try {
+                          if (nativeMulti) {
+                              /* Every file must have been closed by
+                                 nativeEndFile, which is what verifies
+                                 its byte count; launching with a file
+                                 still open would risk a truncated
+                                 game, so fail loudly instead. */
+                              if (nativeOut != null) return "error: file not finished";
+                              if (nativeMainFile == null || !nativeMainFile.exists()) {
+                                  nativeCancel();
+                                  return "error: no main game file";
+                              }
+                              launchNativePlayer(nativeMainFile);
+                              return "ok";
+                          }
                           if (nativeOut == null) return "error: no export in progress";
                           nativeOut.close();
                           nativeOut = null;
@@ -411,33 +432,60 @@ jobs:
                               nativeCancel();
                               return "error: incomplete file";
                           }
-                          Intent i;
-                          if ("n64".equals(nativeSystem)) {
-                              i = new Intent(MainActivity.this, NativeN64PlayerActivity.class);
-                              i.putExtra("core", "mupen".equals(nativeCore) ? "mupen" : "parallel");
-                          } else {
-                              i = new Intent(MainActivity.this, NativePlayerActivity.class);
-                          }
-                          i.putExtra("gamePath", nativeGameFile.getAbsolutePath());
-                          i.putExtra("gameTitle", nativeTitle);
-                          startActivity(i);
-                          gamePlaying = true;
-                          nativePlayerLaunched = true;
+                          launchNativePlayer(nativeGameFile);
                           return "ok";
                       } catch (Exception e) {
                           return "error: " + e.getMessage();
                       }
+                  }
+
+                  /* Shared by both export paths: start the player
+                     Activity for the finished game file. */
+                  private void launchNativePlayer(File gameFile) {
+                      Intent i;
+                      if ("n64".equals(nativeSystem)) {
+                          i = new Intent(MainActivity.this, NativeN64PlayerActivity.class);
+                          i.putExtra("core", "mupen".equals(nativeCore) ? "mupen" : "parallel");
+                      } else {
+                          i = new Intent(MainActivity.this, NativePlayerActivity.class);
+                      }
+                      i.putExtra("gamePath", gameFile.getAbsolutePath());
+                      i.putExtra("gameTitle", nativeTitle);
+                      startActivity(i);
+                      gamePlaying = true;
+                      nativePlayerLaunched = true;
                   }
                   @JavascriptInterface
                   public void nativeCancel() {
                       try {
                           if (nativeOut != null) { nativeOut.close(); nativeOut = null; }
                       } catch (Exception ignored) {}
-                      if (nativeGameFile != null) { nativeGameFile.delete(); nativeGameFile = null; }
+                      if (nativeMulti && nativeMultiDir != null) {
+                          deleteRecursive(nativeMultiDir);
+                      } else if (nativeGameFile != null) {
+                          nativeGameFile.delete();
+                      }
+                      nativeGameFile = null;
+                      nativeMultiDir = null;
+                      nativeMainFile = null;
+                      nativeMulti = false;
                       nativeWritten = 0;
                       nativeTotal = 0;
                       nativeSystem = "";
                       nativeCore = "";
+                  }
+
+                  /* Delete a file or a whole directory tree (the
+                     multi-file export folder). */
+                  private void deleteRecursive(File f) {
+                      if (f == null) return;
+                      if (f.isDirectory()) {
+                          File[] kids = f.listFiles();
+                          if (kids != null) {
+                              for (File kid : kids) deleteRecursive(kid);
+                          }
+                      }
+                      f.delete();
                   }
                   /* Native N64 player: which core the page picked
                      ("parallel" or "mupen"). Called right after
@@ -446,6 +494,91 @@ jobs:
                   @JavascriptInterface
                   public void nativeSetCore(String core) {
                       nativeCore = core == null ? "" : core;
+                  }
+
+                  /* Multi-file export: the page unpacked an archive
+                     and sends its disc files one at a time into
+                     native-games/<title>/. nativeBeginFile and
+                     nativeEndFile bracket each file; nativeEnd
+                     launches with the file named by
+                     nativeSetMainFile. Each call returns "ok" or
+                     "error: ...". */
+                  @JavascriptInterface
+                  public String nativeBeginMulti(String title, String system) {
+                      try {
+                          nativeCancel();
+                          String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
+                          if (safe.isEmpty()) safe = "game";
+                          File dir = new File(getCacheDir(), "native-games");
+                          nativeMultiDir = new File(dir, safe);
+                          deleteRecursive(nativeMultiDir);
+                          nativeMultiDir.mkdirs();
+                          nativeTitle = title;
+                          nativeSystem = system;
+                          nativeCore = "";
+                          nativeMainFile = null;
+                          nativeMulti = true;
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public String nativeBeginFile(String fileName, long totalBytes) {
+                      try {
+                          if (!nativeMulti || nativeMultiDir == null) return "error: no multi-file export in progress";
+                          if (nativeOut != null) return "error: previous file not finished";
+                          String base = baseNameOf(fileName);
+                          if (base.isEmpty()) return "error: bad file name";
+                          nativeGameFile = new File(nativeMultiDir, base);
+                          nativeOut = new FileOutputStream(nativeGameFile);
+                          nativeTotal = totalBytes;
+                          nativeWritten = 0;
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public String nativeEndFile() {
+                      try {
+                          if (nativeOut == null) return "error: no file in progress";
+                          nativeOut.close();
+                          nativeOut = null;
+                          if (nativeWritten != nativeTotal || nativeGameFile == null || !nativeGameFile.exists()) {
+                              if (nativeGameFile != null) nativeGameFile.delete();
+                              nativeGameFile = null;
+                              return "error: incomplete file";
+                          }
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+                  @JavascriptInterface
+                  public String nativeSetMainFile(String fileName) {
+                      try {
+                          if (!nativeMulti || nativeMultiDir == null) return "error: no multi-file export in progress";
+                          String base = baseNameOf(fileName);
+                          if (base.isEmpty()) return "error: bad file name";
+                          nativeMainFile = new File(nativeMultiDir, base);
+                          return "ok";
+                      } catch (Exception e) {
+                          return "error: " + e.getMessage();
+                      }
+                  }
+
+                  /* Archive entry names may carry folders ("disc/
+                     game.bin"); only the basename ever reaches the
+                     disk, so the .cue's FILE lines and the files
+                     next to it always agree. */
+                  private String baseNameOf(String fileName) {
+                      if (fileName == null) return "";
+                      String base = fileName.replace('\\', '/');
+                      int slash = base.lastIndexOf('/');
+                      if (slash >= 0) base = base.substring(slash + 1);
+                      base = base.replaceAll("[^A-Za-z0-9._-]", "_");
+                      return base;
                   }
               }
 
