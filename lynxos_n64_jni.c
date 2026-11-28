@@ -428,7 +428,9 @@ static void record_bridge_step(const char *step) {
  * still dies normally (Android writes its tombstone too). */
 
 #define CRASH_MAX_FRAMES 32
-#define CRASH_MAX_LIBS 6
+/* 7 named libs + vdso (v1.4.13: libc.so added; vdso recorded
+ * separately, not via the names array). */
+#define CRASH_MAX_LIBS 8
 static int g_crash_fd = -1;
 static char g_crash_path[PATH_MAX] = "";
 static char g_crash_core[64] = "";
@@ -600,7 +602,8 @@ static void crash_capture_bases(void) {
         "mupen64plus_next_gles3_libretro_android.so",
         "libEGL.so",
         "libGLESv3.so",
-        "libGLESv2.so"
+        "libGLESv2.so",
+        "libc.so"
     };
     static char first_dir[CRASH_MAX_LIBS][PATH_MAX];
     g_crash_lib_count = 0;
@@ -610,6 +613,26 @@ static void crash_capture_bases(void) {
     while (fgets(line, sizeof line, f)) {
         unsigned long start = 0, end = 0;
         if (sscanf(line, "%lx-%lx", &start, &end) != 2) continue;
+        /* [vdso] (v1.4.13): its maps line has no '/' path, so the
+         * basename scan below would skip it. Record it as "vdso". */
+        if (strstr(line, "[vdso]")) {
+            int idx = -1;
+            for (int j = 0; j < g_crash_lib_count; j++) {
+                if (strcmp(g_crash_libs[j].name, "vdso") == 0) { idx = j; break; }
+            }
+            if (idx < 0) {
+                if (g_crash_lib_count >= CRASH_MAX_LIBS) continue;
+                idx = g_crash_lib_count++;
+                g_crash_libs[idx].name = "vdso";
+                g_crash_libs[idx].start = (uintptr_t)start;
+                g_crash_libs[idx].end = (uintptr_t)end;
+                first_dir[idx][0] = '\0';
+            } else {
+                if ((uintptr_t)start < g_crash_libs[idx].start) g_crash_libs[idx].start = (uintptr_t)start;
+                if ((uintptr_t)end > g_crash_libs[idx].end) g_crash_libs[idx].end = (uintptr_t)end;
+            }
+            continue;
+        }
         char *path = strchr(line, '/');
         if (!path) continue;
         /* Trim the trailing newline for an exact basename match. */
@@ -649,11 +672,13 @@ static void crash_capture_bases(void) {
      * from base.apk, so its /proc/self/maps path ends in "base.apk"
      * and the basename scan above never sees it. dladdr on a
      * function in this file gives the load base directly. The end
-     * is left 0 rather than guessed — the bases line still shows
-     * the start, so a bridge PC can be attributed by hand
-     * (pc - start). Only add the entry when the scan did not find
-     * one: a device that extracts the .so to a real path already
-     * has a real start AND end. */
+     * (v1.4.13) is derived from the base.apk maps ranges: the .so's
+     * segments are contiguous APK-path ranges starting at
+     * dli_fbase, so the run's max end is the .so's end — without
+     * it the attribution check (pc >= start && pc < end) never
+     * matches a bridge PC. Only add the entry when the scan did
+     * not find one: a device that extracts the .so to a real path
+     * already has a real start AND end. */
     {
         Dl_info info;
         if (dladdr((const void *)crash_capture_bases, &info) && info.dli_fbase) {
@@ -666,6 +691,34 @@ static void crash_capture_bases(void) {
                 g_crash_libs[idx].name = names[0];
                 g_crash_libs[idx].start = (uintptr_t)info.dli_fbase;
                 g_crash_libs[idx].end = 0;
+                /* Second maps pass: walk the contiguous run of
+                 * base.apk ranges starting at dli_fbase. Ranges
+                 * are address-ordered, so the run ends at the
+                 * first gap (another .so from the same APK lives
+                 * past it and must not be included). */
+                FILE *mf = fopen("/proc/self/maps", "r");
+                if (mf) {
+                    char mline[1024];
+                    uintptr_t run_end = 0;
+                    while (fgets(mline, sizeof mline, mf)) {
+                        unsigned long ms = 0, me = 0;
+                        if (sscanf(mline, "%lx-%lx", &ms, &me) != 2) continue;
+                        char *mpath = strchr(mline, '/');
+                        if (!mpath) continue;
+                        size_t mplen = strlen(mpath);
+                        while (mplen > 0 && (mpath[mplen - 1] == '\n' || mpath[mplen - 1] == '\r')) mpath[--mplen] = '\0';
+                        if (mplen < 8 || strcmp(mpath + mplen - 8, "base.apk") != 0) continue;
+                        if ((uintptr_t)ms == (uintptr_t)info.dli_fbase) {
+                            run_end = (uintptr_t)me;
+                        } else if (run_end && (uintptr_t)ms == run_end) {
+                            run_end = (uintptr_t)me;
+                        } else if (run_end && (uintptr_t)ms > run_end) {
+                            break;
+                        }
+                    }
+                    fclose(mf);
+                    g_crash_libs[idx].end = run_end;
+                }
             }
         }
     }

@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Native Nintendo 64 player (milestone M1 of the native-player project).
  *
- * Runs a prebuilt N64 libretro core (parallel_n64 by default,
- * mupen64plus_next as a per-game choice) as real ARM code through a
+ * Runs the prebuilt N64 libretro core (parallel_n64 only — Mupen
+ * was dropped in v1.4.13) as real ARM code through a
  * custom JNI bridge (lynxos_n64_jni.c) with EGL: the core renders
  * straight into this Activity's SurfaceView. libretro-kmp cannot run
  * N64 cores — it has no hardware-render support — so this player does
@@ -66,12 +66,10 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         const val EXTRA_GAME_PATH = "gamePath"
         const val EXTRA_GAME_TITLE = "gameTitle"
-        const val EXTRA_CORE = "core" // "parallel" or "mupen"
+        const val EXTRA_CORE = "core" // "parallel" only (v1.4.13: Mupen dropped; any other value coerces to Parallel)
         private const val TAG = "LynxosN64"
         private const val CORE_PARALLEL_ASSET = "native/parallel_n64_libretro_android.so"
         private const val CORE_PARALLEL_NAME = "parallel_n64_libretro_android.so"
-        private const val CORE_MUPEN_ASSET = "native/mupen64plus_next_gles3_libretro_android.so"
-        private const val CORE_MUPEN_NAME = "mupen64plus_next_gles3_libretro_android.so"
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val START_WATCHDOG_MS = 30_000L
@@ -451,7 +449,14 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         gameTitle = intent.getStringExtra(EXTRA_GAME_TITLE) ?: "game"
         val gamePath = intent.getStringExtra(EXTRA_GAME_PATH)
-        val coreChoice = intent.getStringExtra(EXTRA_CORE) ?: "parallel"
+        // Parallel-only (v1.4.13): Mupen was dropped. Any "core"
+        // extra that is not Parallel coerces to Parallel — the last
+        // line of defense (MainActivity also forces "parallel" and
+        // the page lost the picker).
+        val coreChoice = when (intent.getStringExtra(EXTRA_CORE)) {
+            "parallel" -> "parallel"
+            else -> "parallel"
+        }
         if (gamePath.isNullOrEmpty()) {
             Toast.makeText(this, "No game file to play.", Toast.LENGTH_LONG).show()
             finish()
@@ -551,6 +556,14 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 diagWindowStartNanos = System.nanoTime()
                 audioRateCheckUntilNanos = diagWindowStartNanos + 5_000_000_000L
                 val frameNanos = (1_000_000_000.0 / fps).toLong()
+                // Per-phase timing (v1.4.13): total ns spent inside
+                // nativeRunFrame() vs in app-side work around it,
+                // per 1 s window. eglSwapBuffers lives inside
+                // nativeRunFrame() in this bridge, so "rest" here is
+                // app-side work only (diag, rate check, pacing
+                // math) — the pacing sleep is excluded.
+                var runFrameNanosTotal = 0L
+                var restNanosTotal = 0L
                 while (running.get()) {
                     val t0 = System.nanoTime()
                     if (!nativeRunFrame()) {
@@ -565,6 +578,8 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                         }
                         break
                     }
+                    val runEndNanos = System.nanoTime()
+                    runFrameNanosTotal += runEndNanos - t0
                     // Diagnostics once a second (v1.4.11): actual
                     // frame rate, underrun count, average batch
                     // size — the numbers that prove whether the
@@ -588,10 +603,14 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                         val batches = audioBatchesReceived.get()
                         val frames = audioFramesReceived.get()
                         val avgBatch = if (batches > 0) (frames / batches).toInt() else 0
-                        val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz"
+                        val avgRunMs = if (diagFramesRun > 0) runFrameNanosTotal.toDouble() / diagFramesRun / 1_000_000.0 else 0.0
+                        val avgRestMs = if (diagFramesRun > 0) restNanosTotal.toDouble() / diagFramesRun / 1_000_000.0 else 0.0
+                        val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz, run ${String.format(Locale.US, "%.1f", avgRunMs)} ms, rest ${String.format(Locale.US, "%.1f", avgRestMs)} ms"
                         Log.i(TAG, "audio diag: $diag")
                         reportAudioDiag(diag)
                         diagFramesRun = 0
+                        runFrameNanosTotal = 0
+                        restNanosTotal = 0
                         diagWindowStartNanos = nowNanos
                         // Rate renegotiation (v1.4.11): the rate is
                         // read once at load, before the game has
@@ -625,6 +644,10 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                             break
                         }
                     }
+                    // Rest = app-side work after nativeRunFrame()
+                    // returned, excluding the pacing sleep (any
+                    // sleep overshoot lands here too).
+                    restNanosTotal += System.nanoTime() - runEndNanos - maxOf(sleepNanos, 0L)
                 }
             } catch (e: Throwable) {
                 Log.e(TAG, "Could not start $gameTitle", e)
@@ -685,13 +708,13 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
 
     /** Copies the bundled core .so from assets to internal storage (dlopen needs a real file). */
     private fun ensureCoreFile(coreChoice: String): File {
+        // Parallel-only (v1.4.13): Mupen dropped. coreChoice is
+        // coerced to "parallel" in onCreate; warn if anything else
+        // ever arrives here.
+        if (coreChoice != "parallel") Log.w(TAG, "ignoring non-Parallel core choice: $coreChoice")
         val dir = File(filesDir, "native-cores")
         dir.mkdirs()
-        val (asset, name) = if (coreChoice == "mupen") {
-            CORE_MUPEN_ASSET to CORE_MUPEN_NAME
-        } else {
-            CORE_PARALLEL_ASSET to CORE_PARALLEL_NAME
-        }
+        val (asset, name) = CORE_PARALLEL_ASSET to CORE_PARALLEL_NAME
         val out = File(dir, name)
         val ver = File(dir, "version.txt")
         val current = try { ver.readText() } catch (e: Exception) { "" }
@@ -708,25 +731,19 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
      * Every key and value below was verified against the core's own
      * libretro_core_options.h and the shipped .so. */
     private fun applyCoreOptions(core: String) {
-        if (core == "mupen") {
-            nativeSetOption("mupen64plus-rdp-plugin", "gliden64")
-            nativeSetOption("mupen64plus-rsp-plugin", "hle")
-            nativeSetOption("mupen64plus-cpucore", "dynamic_recompiler")
-            nativeSetOption("mupen64plus-43screensize", "640x480")
-            nativeSetOption("mupen64plus-ThreadedRenderer", "False")
-            nativeSetOption("mupen64plus-EnableFBEmulation", "False")
-            nativeSetOption("mupen64plus-EnableLODEmulation", "False")
-            nativeSetOption("mupen64plus-EnableCopyColorToRDRAM", "Off")
-            nativeSetOption("mupen64plus-EnableCopyDepthToRDRAM", "Off")
-            nativeSetOption("mupen64plus-CountPerOp", "1")
-            nativeSetOption("mupen64plus-BilinearMode", "3point")
-            nativeSetOption("mupen64plus-Framerate", "Original")
-        } else {
-            nativeSetOption("parallel-n64-gfxplugin", "glide64")
-            nativeSetOption("parallel-n64-gfxplugin-accuracy", "low")
-            nativeSetOption("parallel-n64-rspplugin", "hle")
-            nativeSetOption("parallel-n64-cpucore", "dynamic_recompiler")
-        }
+        // Parallel-only (v1.4.13): the Mupen branch is gone. `core`
+        // is coerced to "parallel" in onCreate; warn if anything
+        // else ever arrives here.
+        if (core != "parallel") Log.w(TAG, "ignoring non-Parallel core choice: $core")
+        nativeSetOption("parallel-n64-gfxplugin", "glide64")
+        nativeSetOption("parallel-n64-gfxplugin-accuracy", "low")
+        nativeSetOption("parallel-n64-rspplugin", "hle")
+        nativeSetOption("parallel-n64-cpucore", "dynamic_recompiler")
+        // 320x240 (v1.4.13): the unset default is 640x480, 4x the
+        // GL fragment work on this weak GPU — quartering it is the
+        // best shot at closing the ~8% speed gap (Mario 64 at ~55
+        // of ~60 fps).
+        nativeSetOption("parallel-n64-43screensize", "320x240")
     }
 
     private fun startAudio(sampleRate: Int) {

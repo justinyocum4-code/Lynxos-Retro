@@ -153,14 +153,6 @@
     <input type="text" id="editTitle">
     <label for="editSystem">System</label>
     <select id="editSystem"></select>
-    <div id="editCoreWrap" hidden>
-      <label for="editCore">Core (Nintendo 64 only)</label>
-      <select id="editCore">
-        <option value="parallel_n64">Parallel N64 (default)</option>
-        <option value="mupen64plus_next">Mupen64Plus-Next (try if the game is slow)</option>
-      </select>
-      <p class="note">Two different Nintendo 64 engines. If a game is slow or glitchy on one, try the other. In-game saves carry over.</p>
-    </div>
     <p class="note">Games that came with the app cannot be changed. Only games you added can be edited or deleted.</p>
     <div class="actions">
       <button type="button" id="editSaveBtn">Save changes</button>
@@ -301,6 +293,14 @@
   // page shows it on the library screen until the next game starts
   // or the user dismisses it. Prefs-backed, so it survives a
   // process death.
+  // v1.4.13: Mupen is dropped — N64 always uses Parallel now. The
+  // native side no longer writes "(Mupen)" into these records, but
+  // strip any stale "(Mupen...)" suffix so an old record never
+  // shows it again; the lines just say "Nintendo 64".
+  function withoutMupenCore(record) {
+    return record.replace(/\s*\(Mupen[^)]*\)/g, '');
+  }
+
   function refreshLastPlayerClose() {
     try {
       var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
@@ -310,7 +310,7 @@
         record = window.LynxosRetro.getLastPlayerClose() || '';
       }
       if (record) {
-        el.textContent = 'Last game: ' + record;
+        el.textContent = 'Last game: ' + withoutMupenCore(record);
         wrap.hidden = false;
       } else {
         el.textContent = '';
@@ -346,7 +346,7 @@
         record = window.LynxosRetro.getLastN64Crash() || '';
       }
       if (record) {
-        el.textContent = 'Last crash: ' + record;
+        el.textContent = 'Last crash: ' + withoutMupenCore(record);
         wrap.hidden = false;
       } else {
         el.textContent = '';
@@ -721,9 +721,6 @@
       eo.textContent = sys.label;
       esel.appendChild(eo);
     });
-    esel.addEventListener('change', function () {
-      $('editCoreWrap').hidden = esel.value !== 'n64';
-    });
   }
 
   function selectTab(id) {
@@ -896,8 +893,8 @@
     }
     // Nintendo 64 runs on the native player (real ARM code with a
     // graphics bridge, not the browser): export the game file to the
-    // app and hand it over, with the core picked on the game's
-    // Options screen (Parallel N64 by default).
+    // app and hand it over. N64 always uses Parallel now (Mupen
+    // dropped in v1.4.13).
     if (game.system === 'n64') {
       showScreen('player');
       setPlayingBridge(true);
@@ -911,8 +908,7 @@
           var cached = window.LynxosRetro.nativeCachedMainFile(game.title, game.system);
           if (cached) {
             announce('Starting ' + game.title + ' from the saved copy.');
-            var launched = window.LynxosRetro.nativeLaunchCached(game.title, game.system,
-              game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+            var launched = window.LynxosRetro.nativeLaunchCached(game.title, game.system, 'parallel');
             if (launched === 'ok') return;
           }
         }
@@ -1444,12 +1440,20 @@
   // A .cue names its disc file by the name in the archive, which
   // may carry folders; the bridge writes every file flat into one
   // folder, so flatten the FILE lines to plain basenames and the
-  // disc file resolves next to the .cue on the device.
-  function rewriteCueToBasenames(cueText) {
+  // disc file resolves next to the .cue on the device. refToEntry
+  // maps each lowercased referenced basename to the ACTUAL archive
+  // entry's basename (v1.4.13 / F4): a .cue saying GAME.BIN while
+  // the archive holds game.bin must rewrite to game.bin, because
+  // the device filesystem is case-sensitive and the reference's
+  // own casing would make the core fail to find the disc file.
+  // Entries with no match keep the reference's basename.
+  function rewriteCueToBasenames(cueText, refToEntry) {
     return cueText.split(/\r\n|\n|\r/).map(function (line) {
       var m = /^(\s*FILE\s+")([^"]+)(".*)$/i.exec(line);
       if (!m) return line;
-      return m[1] + baseNameOf(m[2]) + m[3];
+      var key = baseNameOf(m[2]).toLowerCase();
+      var actual = (refToEntry && refToEntry[key]) || baseNameOf(m[2]);
+      return m[1] + actual + m[3];
     }).join('\n');
   }
 
@@ -1465,18 +1469,23 @@
         var cueText = bytesToLatin1(files[cueName]);
         var refs = cueReferencedFiles(cueText);
         var support = [];
+        var refToEntry = {};
         refs.forEach(function (ref) {
           var want = baseNameOf(ref).toLowerCase();
           Object.keys(files).forEach(function (name) {
             if (baseNameOf(name).toLowerCase() === want && support.indexOf(name) < 0) {
               support.push(name);
+              // F4: remember the actual entry basename for this
+              // reference, so the .cue is rewritten to the name
+              // that really exists on the case-sensitive device.
+              if (!refToEntry[want]) refToEntry[want] = baseNameOf(name);
             }
           });
         });
         if (support.length > 0) {
           return {
             main: cueName,
-            mainBytes: latin1ToBytes(rewriteCueToBasenames(cueText)),
+            mainBytes: latin1ToBytes(rewriteCueToBasenames(cueText, refToEntry)),
             support: support
           };
         }
@@ -1493,10 +1502,10 @@
 
   // Sends a PlayStation or Nintendo 64 game to the native player,
   // 1 MB at a time through the bridge, with spoken progress. The
-  // bridge launches the player when the last chunk lands. For N64
-  // the game's Options-screen core choice goes along too (Parallel
-  // N64 unless Mupen was picked). An archived game (.7z/.zip/.rar)
-  // is unpacked first and sent as its disc files instead.
+  // bridge launches the player when the last chunk lands. N64
+  // always uses Parallel (Mupen dropped in v1.4.13). An archived
+  // game (.7z/.zip/.rar) is unpacked first and sent as its disc
+  // files instead.
   function exportGameForNative(game) {
     if (!window.LynxosRetro || !window.LynxosRetro.nativeBegin) {
       return Promise.reject(new Error('This version cannot start the native player.'));
@@ -1529,7 +1538,7 @@
     var begin = window.LynxosRetro.nativeBegin(game.title, game.system, blob.size);
     if (begin !== 'ok') throw new Error(begin);
     if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
-      window.LynxosRetro.nativeSetCore(game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+      window.LynxosRetro.nativeSetCore('parallel');
     }
     var offset = 0;
     function next() {
@@ -1588,7 +1597,7 @@
       var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
       if (begin !== 'ok') throw new Error(begin);
       if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
-        window.LynxosRetro.nativeSetCore(game.core === 'mupen64plus_next' ? 'mupen' : 'parallel');
+        window.LynxosRetro.nativeSetCore('parallel');
       }
       var order = picked.support.slice();
       order.push(picked.main);
@@ -2072,7 +2081,9 @@
       id: 'drive-' + rec.id,
       title: rec.title,
       system: rec.system,
-      core: rec.core,
+      // v1.4.13: a stored Mupen choice from before the drop resolves
+      // to Parallel — N64 always uses Parallel now.
+      core: rec.core === 'mupen64plus_next' ? 'parallel_n64' : rec.core,
       author: 'You',
       source: 'synced',
       romUrl: rec.source === 'url' ? rec.romUrl : null,
@@ -2226,6 +2237,9 @@
   }
 
   function moveOneOldGame(sess, row) {
+    // v1.4.13: a stored Mupen choice from before the drop resolves
+    // to Parallel — N64 always uses Parallel now.
+    if (row.system === 'n64' && row.core === 'mupen64plus_next') row.core = 'parallel_n64';
     // Already moved? Same title + system already in the Drive library.
     for (var i = 0; i < driveLibrary.length; i++) {
       if (driveLibrary[i].title === row.title && driveLibrary[i].system === row.system) return Promise.resolve(false);
@@ -2892,12 +2906,6 @@
     setStatus($('editStatus'), '', '');
     $('editTitle').value = game.title;
     $('editSystem').value = game.system;
-    if (game.system === 'n64') {
-      $('editCoreWrap').hidden = false;
-      $('editCore').value = (game.core === 'mupen64plus_next') ? 'mupen64plus_next' : 'parallel_n64';
-    } else {
-      $('editCoreWrap').hidden = true;
-    }
     showScreen('edit');
     announce('Editing ' + game.title + '. Change the title or system, then save, or delete the game.');
     $('editTitle').focus();
@@ -2915,10 +2923,9 @@
       return;
     }
     var core = systemCore(system);
-    if (system === 'n64') {
-      // Parallel N64 is the default; Mupen is the per-game alternative.
-      core = ($('editCore').value === 'mupen64plus_next') ? 'mupen64plus_next' : 'parallel_n64';
-    }
+    // v1.4.13: N64 always uses Parallel now (Mupen dropped) — the
+    // stored per-game core resolves to Parallel, never Mupen.
+    if (system === 'n64') core = 'parallel_n64';
     if (game.source === 'local') {
       var found = null;
       for (var i = 0; i < localGames.length; i++) {

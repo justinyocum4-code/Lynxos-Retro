@@ -13,6 +13,7 @@ import android.media.AudioFormat
 import android.media.AudioTrack
 import android.os.Bundle
 import android.os.Handler
+import android.os.HandlerThread
 import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.util.Log
@@ -146,8 +147,48 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private var tts: TextToSpeech? = null
     private var pendingSpeak: String? = null
 
-    private var frameBitmap: Bitmap? = null
     private val paint = Paint().apply { isFilterBitmap = false }
+
+    // Video thread (v1.4.13): the canvas draw (lockCanvas /
+    // drawColor / drawBitmap / unlockCanvasAndPost on a full-screen
+    // SurfaceView, ~1920x1200) used to ride on the emulation thread
+    // inside onVideoFrame, plausibly 5-15 ms of the 25 ms frame.
+    // It now runs on a dedicated HandlerThread, "lynxos-ps1-video",
+    // chosen over the UI thread so a slow draw can never stall UI
+    // input/Toast/TTS and the thread's lifecycle is owned here
+    // (start in startLoop, stop in finishPlayer) instead of
+    // depending on the main looper. The emulation thread only does
+    // the cheap setPixels (~0.1-0.3 ms for 320x240) and posts the
+    // draw; if the draw lags a frame, video drops a frame while
+    // audio stays clean, which frameskip already accepts.
+    // Ping-pong bitmaps: the emulation thread writes ONLY the back
+    // bitmap, the video thread draws ONLY the front one, and the
+    // swap happens under videoLock only when no draw is pending or
+    // in flight — so the emulation thread can never overwrite a
+    // bitmap mid-draw. A frame that arrives while a draw is busy
+    // is dropped (its pixels stay in the back bitmap and are
+    // presented by the next swap, so the newest frame still wins).
+    private val videoLock = Object()
+    private var videoBackBitmap: Bitmap? = null
+    private var videoFrontBitmap: Bitmap? = null
+    private var videoFrontReady = false
+    private var videoDrawPending = false
+    private var videoDrawing = false
+    private var videoBackDirty = false
+    private var videoThread: HandlerThread? = null
+    private var videoHandler: Handler? = null
+    private val videoRunning = AtomicBoolean(false)
+    // Per-phase timing (v1.4.13): accumulated per 1 s diag window
+    // and reset by the loop thread when it reports. runNanos is
+    // the whole c.run() call (it includes the onVideoFrame
+    // callback, which runs synchronously inside run()); the
+    // callback nanos are tracked separately so the core-only
+    // average is run minus callback, and the video average is
+    // callback plus the draw-thread time.
+    private val diagRunNanos = AtomicLong(0)
+    private val diagVideoCallbackNanos = AtomicLong(0)
+    private val diagDrawNanos = AtomicLong(0)
+    private val diagPresentedWindow = AtomicInteger(0)
 
     // Video-state diagnostics: frames the core delivered vs frames
     // actually posted to the surface. If the game runs (sound) but
@@ -250,25 +291,61 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
 
         // PS1 speed options, same values already tuned in the browser
         // player (verified in the bundled core): frameskip on auto with
-        // a 45% threshold, and the instruction-cache emulation off.
-        // Everything else keeps the core's default.
+        // a 60% threshold, and the instruction-cache emulation off.
+        // v1.4.13: dithering off, SPU interpolation off, the dynamic
+        // recompiler explicitly on, and both NEON enhancement options
+        // explicitly off — small cumulative savings on top of the
+        // video-thread move. Everything else keeps the core's default.
         override fun variable(key: String): String? = when (key) {
             "pcsx_rearmed_frameskip" -> "auto_threshold"
-            "pcsx_rearmed_frameskip_threshold" -> "45"
+            "pcsx_rearmed_frameskip_threshold" -> "60"
             "pcsx_rearmed_frameskip_interval" -> "3"
             "pcsx_rearmed_icache_emulation" -> "disabled"
+            "pcsx_rearmed_dithering" -> "disabled"
+            "pcsx_rearmed_spu_interpolation" -> "off"
+            "pcsx_rearmed_drc" -> "enabled"
+            "pcsx_rearmed_neon_enhancement_enable" -> "disabled"
+            "pcsx_rearmed_neon_enhancement_texture" -> "disabled"
             else -> null
         }
 
         override fun onVideoFrame(frame: VideoFrame) {
+            // v1.4.13: only the cheap setPixels stays on the
+            // emulation thread; the canvas draw is posted to the
+            // video thread (see videoDrawRunnable). Never block
+            // here waiting for a draw.
+            val cbStart = System.nanoTime()
             framesPresented.incrementAndGet()
-            var bmp = frameBitmap
-            if (bmp == null || bmp.width != frame.width || bmp.height != frame.height) {
-                bmp = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
-                frameBitmap = bmp
+            diagPresentedWindow.incrementAndGet()
+            var back = videoBackBitmap
+            if (back == null || back.width != frame.width || back.height != frame.height) {
+                back = Bitmap.createBitmap(frame.width, frame.height, Bitmap.Config.ARGB_8888)
+                videoBackBitmap = back
             }
-            bmp.setPixels(frame.pixels, 0, frame.width, 0, 0, frame.width, frame.height)
-            drawFrame(bmp)
+            back.setPixels(frame.pixels, 0, frame.width, 0, 0, frame.width, frame.height)
+            val postDraw = synchronized(videoLock) {
+                videoBackDirty = true
+                // Swap only when no draw is pending or in flight:
+                // the video thread owns the front bitmap until its
+                // draw finishes, and the emulation thread must never
+                // overwrite it. A frame arriving mid-draw is dropped
+                // as a presented frame, but its pixels stay in the
+                // back bitmap and the draw runnable re-posts after
+                // finishing, so the newest frame still gets shown.
+                if (!videoDrawPending && !videoDrawing) {
+                    val oldFront = videoFrontBitmap
+                    videoFrontBitmap = back
+                    videoBackBitmap = oldFront
+                    videoFrontReady = true
+                    videoDrawPending = true
+                    videoBackDirty = false
+                    true
+                } else {
+                    false
+                }
+            }
+            if (postDraw) videoHandler?.post(videoDrawRunnable)
+            diagVideoCallbackNanos.addAndGet(System.nanoTime() - cbStart)
         }
 
         override fun onAudio(samples: ShortArray, frames: Int) {
@@ -350,6 +427,90 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         synchronized(audioLock) { audioQueue.clear() }
+    }
+
+    /** The video draw runnable (v1.4.13): runs ONLY on the video
+     * thread, drawing the front (ping-pong) bitmap. Never called
+     * from the emulation thread. If a newer frame landed in the
+     * back bitmap while this draw was running, it re-posts itself
+     * so the newest frame still gets shown. */
+    private val videoDrawRunnable = Runnable {
+        if (!videoRunning.get()) return@Runnable
+        val bmp: Bitmap? = synchronized(videoLock) {
+            if (!videoFrontReady) {
+                videoDrawPending = false
+                null
+            } else {
+                videoDrawing = true
+                videoFrontBitmap
+            }
+        }
+        if (bmp != null) {
+            val drawStart = System.nanoTime()
+            drawFrame(bmp)
+            diagDrawNanos.addAndGet(System.nanoTime() - drawStart)
+            val repost = synchronized(videoLock) {
+                videoDrawing = false
+                videoDrawPending = false
+                // A frame arrived mid-draw: its pixels are in the
+                // back bitmap, so swap it in and draw again rather
+                // than leaving a stale frame on screen.
+                if (videoBackDirty) {
+                    val back = videoBackBitmap
+                    if (back != null) {
+                        val oldFront = videoFrontBitmap
+                        videoFrontBitmap = back
+                        videoBackBitmap = oldFront
+                        videoFrontReady = true
+                        videoDrawPending = true
+                        videoBackDirty = false
+                        true
+                    } else false
+                } else false
+            }
+            if (repost) videoHandler?.post(videoDrawRunnable)
+        }
+    }
+
+    /** Starts the dedicated video thread (v1.4.13). Called from
+     * startLoop, before the emulation thread starts producing
+     * frames; a no-op if it is already running. */
+    private fun startVideoThread() {
+        if (videoRunning.get()) return
+        videoRunning.set(true)
+        val t = HandlerThread("lynxos-ps1-video")
+        t.start()
+        videoThread = t
+        videoHandler = Handler(t.looper)
+    }
+
+    /** Stops the video thread cleanly (v1.4.13): clears any pending
+     * draw first so nothing draws after the surface is destroyed,
+     * then quits and joins. Called from finishPlayer after the
+     * emulation thread has been joined, before the core is closed
+     * — the same stop-the-drain-first care as stopAudioDrain. */
+    private fun stopVideoThread() {
+        videoRunning.set(false)
+        synchronized(videoLock) {
+            videoFrontReady = false
+            videoDrawPending = false
+            videoBackDirty = false
+        }
+        val handler = videoHandler
+        videoHandler = null
+        handler?.removeCallbacks(videoDrawRunnable)
+        val t = videoThread
+        videoThread = null
+        if (t != null) {
+            try {
+                t.quitSafely()
+            } catch (e: Exception) {
+            }
+            try {
+                t.join(500)
+            } catch (e: Exception) {
+            }
+        }
     }
 
     /** Forwards one audio-diagnostics line to the page (same
@@ -534,6 +695,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         setLoadStage("running")
         mainHandler.removeCallbacks(startWatchdog)
         mainHandler.postDelayed(videoCheck, VIDEO_CHECK_MS)
+        // Video thread first (v1.4.13): it must exist before the
+        // emulation thread starts producing frames to post.
+        startVideoThread()
         // Audio diagnostics window (v1.4.12): the frame count in
         // each 1-second window is the real emulation speed.
         diagWindowStartNanos = System.nanoTime()
@@ -580,13 +744,33 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                     val batches = audioBatchesReceived.get()
                     val frames = audioFramesReceived.get()
                     val avgBatch = if (batches > 0) (frames / batches).toInt() else 0
-                    val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz"
+                    // Per-phase timing (v1.4.13): core-only average
+                    // is the whole run() call minus the video
+                    // callback that runs synchronously inside it;
+                    // the video average is the callback plus the
+                    // draw-thread time, per presented frame. The
+                    // presented fps is the rate frames actually
+                    // reached the video thread, vs actualFps which
+                    // counts completed c.run() calls.
+                    val runNanos = diagRunNanos.getAndSet(0)
+                    val cbNanos = diagVideoCallbackNanos.getAndSet(0)
+                    val drawNanos = diagDrawNanos.getAndSet(0)
+                    val presentedWindow = diagPresentedWindow.getAndSet(0)
+                    val coreMs = if (diagFramesRun > 0)
+                        (runNanos - cbNanos).toDouble() / diagFramesRun / 1_000_000.0 else 0.0
+                    val videoMs = if (presentedWindow > 0)
+                        (cbNanos + drawNanos).toDouble() / presentedWindow / 1_000_000.0 else 0.0
+                    val presentedFps = (presentedWindow / elapsedSec).toInt()
+                    val coreMsStr = String.format(Locale.US, "%.1f", coreMs)
+                    val videoMsStr = String.format(Locale.US, "%.1f", videoMs)
+                    val diag = "$gameTitle audio: $actualFps frames a second, $audioUnderrunsTotal underruns, $avgBatch frames per batch, $currentAudioRate Hz, presentedFps=$presentedFps, coreMs=$coreMsStr, videoMs=$videoMsStr"
                     Log.i(TAG, "audio diag: $diag")
                     reportAudioDiag(diag)
                     diagFramesRun = 0
                     diagWindowStartNanos = nowNanos
                 }
                 val spent = System.nanoTime() - t0
+                diagRunNanos.addAndGet(spent)
                 val sleepNanos = frameNanos - spent
                 if (sleepNanos > 0) {
                     try {
@@ -601,6 +785,10 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun drawFrame(bmp: Bitmap) {
+        // v1.4.13: runs ONLY on the video thread now. Never draw
+        // after the surface is gone (surfaceDestroyed clears the
+        // flag; stopVideoThread also clears any pending draw).
+        if (!surfaceReady.get()) return
         val surface = surfaceView.holder.surface
         if (!surface.isValid) return
         val canvas: Canvas = try {
@@ -620,7 +808,12 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
             canvas.drawBitmap(bmp, null,
                 Rect(dx.toInt(), dy.toInt(), (dx + dw).toInt(), (dy + dh).toInt()), paint)
         } finally {
-            surfaceView.holder.unlockCanvasAndPost(canvas)
+            // The surface can die mid-draw (activity finishing);
+            // a failing unlock must not kill the video thread.
+            try {
+                surfaceView.holder.unlockCanvasAndPost(canvas)
+            } catch (e: Exception) {
+            }
         }
         // Only reached when the frame was actually posted: a null
         // canvas or an invalid surface returns before this line.
@@ -934,6 +1127,11 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         mainHandler.removeCallbacks(startWatchdog)
         mainHandler.removeCallbacks(videoCheck)
         try { loopThread?.join(1000) } catch (e: Exception) { }
+        // Stop the video drain before closing the core (v1.4.13):
+        // the emulation thread is joined, so no new frames arrive,
+        // and stopping here guarantees no draw runs after the
+        // surface is destroyed or the core is closed.
+        stopVideoThread()
         try { core?.close() } catch (e: Exception) { Log.w(TAG, "core close failed", e) }
         core = null
         // Stop the audio drain first (v1.4.12): it is the only other
