@@ -34,6 +34,7 @@ import dev.kotlinds.libretrokmp.JoypadButton
 import dev.kotlinds.libretrokmp.LibretroCore
 import dev.kotlinds.libretrokmp.LibretroFrontend
 import dev.kotlinds.libretrokmp.LogLevel
+import dev.kotlinds.libretrokmp.MemoryType
 import dev.kotlinds.libretrokmp.VideoFrame
 import java.io.File
 import java.io.FileOutputStream
@@ -44,16 +45,19 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Native PlayStation player (milestone 1 of the native-player project).
+ * Native player (v1.6.0: PlayStation plus the 2D systems — NES,
+ * SNES, Game Boy, Game Boy Color, Game Boy Advance, Genesis,
+ * Master System, Game Gear, Atari 2600).
  *
- * Runs the prebuilt pcsx_rearmed libretro core as real ARM code through
+ * Runs a prebuilt libretro core as real ARM code through
  * libretro-kmp (bundled JNI bridge, no NDK build on our side). The WebView
  * UI stays in charge of the library and cloud sync; this Activity only
- * plays one PS1 game file, then returns to the library.
+ * plays one game file, then returns to the library. Nintendo DS stays
+ * on the web player (melonDS is too heavy for this player yet).
  *
  * Controls mirror the WebView player exactly: the remote is held sideways,
- * channel-up is Cross, channel-down is Circle, OK is Start, Back tap is
- * Triangle, Back-held chords give Square / L1 / R1, and holding Back alone
+ * channel-up is A, channel-down is B, OK is Start, Back tap is
+ * X, Back-held chords give Y / L / R, mute is Select, and holding Back alone
  * for half a second leaves the game. A standard gamepad (Switch controller)
  * works with its own buttons, no rotation. On a touchscreen device (the
  * tablet) there is also an on-screen touch controller: D-pad bottom-left,
@@ -65,10 +69,23 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         const val EXTRA_GAME_PATH = "gamePath"
         const val EXTRA_GAME_TITLE = "gameTitle"
+        const val EXTRA_GAME_SYSTEM = "system"
         private const val TAG = "NativePlayer"
-        private const val CORE_ASSET = "native/pcsx_rearmed_libretro_android.so"
-        private const val CORE_NAME = "pcsx_rearmed_libretro_android.so"
-        private const val CORE_VERSION = "1"
+        // v1.6.0: one core per system. The 2D cores are the Nov 27
+        // 2026 nightly arm64-v8a builds from the libretro buildbot
+        // (all verified 64-bit ELF before shipping); PS1 keeps its
+        // core here for the (currently menu-hidden) psx path.
+        private const val CORE_VERSION = "2"
+        private fun coreForSystem(system: String): Pair<String, String>? = when (system) {
+            "nes" -> "native/fceumm_libretro_android.so" to "fceumm_libretro_android.so"
+            "snes" -> "native/snes9x_libretro_android.so" to "snes9x_libretro_android.so"
+            "gb", "gbc" -> "native/gambatte_libretro_android.so" to "gambatte_libretro_android.so"
+            "gba" -> "native/mgba_libretro_android.so" to "mgba_libretro_android.so"
+            "segaMD", "segaMS", "segaGG" -> "native/genesis_plus_gx_libretro_android.so" to "genesis_plus_gx_libretro_android.so"
+            "atari2600" -> "native/stella2014_libretro_android.so" to "stella2014_libretro_android.so"
+            "psx" -> "native/pcsx_rearmed_libretro_android.so" to "pcsx_rearmed_libretro_android.so"
+            else -> null
+        }
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val WATCHDOG_CHECK_MS = 30_000L
         private const val WATCHDOG_MAX_IDLE_CHECKS = 4
@@ -128,6 +145,27 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private var backDownTime = 0L
     private var backChordUsed = false
     private var gameTitle = "game"
+    // v1.6.0: which system this launch is for — picks the core, the
+    // core options, the spoken labels and the save file. Set in
+    // onCreate from the intent's "system" extra (the bridge always
+    // sends it); "psx" is the fallback for an old launch with no
+    // extra, which is also the old player's only behaviour.
+    private var gameSystem = "psx"
+
+    /** Plain-language system name for spoken lines. */
+    private fun systemLabel(): String = when (gameSystem) {
+        "nes" -> "Nintendo"
+        "snes" -> "Super Nintendo"
+        "gb" -> "Game Boy"
+        "gbc" -> "Game Boy Color"
+        "gba" -> "Game Boy Advance"
+        "segaMD" -> "Genesis"
+        "segaMS" -> "Master System"
+        "segaGG" -> "Game Gear"
+        "atari2600" -> "Atari 2600"
+        "psx" -> "PlayStation"
+        else -> gameSystem
+    }
     // Read on the main thread by the watchdog, written on the load
     // thread by setLoadStage: volatile so a stage advance is visible
     // to the watchdog without delay.
@@ -158,7 +196,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     // drawColor / drawBitmap / unlockCanvasAndPost on a full-screen
     // SurfaceView, ~1920x1200) used to ride on the emulation thread
     // inside onVideoFrame, plausibly 5-15 ms of the 25 ms frame.
-    // It now runs on a dedicated HandlerThread, "lynxos-ps1-video",
+    // It now runs on a dedicated HandlerThread, "lynxos-native-video",
     // chosen over the UI thread so a slow draw can never stall UI
     // input/Toast/TTS and the thread's lifecycle is owned here
     // (start in startLoop, stop in finishPlayer) instead of
@@ -239,7 +277,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         } else {
             watchdogIdleChecks++
             if (watchdogIdleChecks >= WATCHDOG_MAX_IDLE_CHECKS) {
-                speakAndToast("The PlayStation game is taking too long to start.")
+                speakAndToast("The ${systemLabel()} game is taking too long to start.")
                 mainHandler.postDelayed({
                     if (!running.get() && !closed.get()) {
                         reportOutcome("hang", "The game did not start after two and a half minutes.", hard = true)
@@ -271,7 +309,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                     "No video frames from the game."
                 else
                     "The game screen is not ready."
-                speakAndToast("The PlayStation game is running but no picture has been drawn yet. $reason")
+                speakAndToast("The game is running but no picture has been drawn yet. $reason")
                 reportOutcome("novideo", reason, hard = false)
                 Log.w(TAG, "video check: presented=$presented drawn=$drawn surfaceReady=${surfaceReady.get()}")
             } else {
@@ -297,7 +335,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
      * ones (failures, stops, hangs) overwrite. MainActivity owns
      * the rule; this just forwards. */
     private fun reportOutcome(kind: String, reason: String, hard: Boolean) {
-        try { MainActivity.reportPlayerOutcome("psx", kind, reason, hard) } catch (e: Exception) {
+        try { MainActivity.reportPlayerOutcome(gameSystem, kind, reason, hard) } catch (e: Exception) {
             Log.w(TAG, "report outcome failed", e)
         }
     }
@@ -321,6 +359,15 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         override val saveDirectory: String
             get() = File(filesDir, "native-saves").apply { mkdirs() }.absolutePath
 
+        // Core options, per system. The 2D cores run at full speed
+        // on their defaults — nothing to tune, so they get no
+        // options at all, except one: Genesis Plus GX picks the
+        // emulated hardware from the game file's extension, and the
+        // export cache renames single files to ".bin", which GX
+        // would read as a Mega Drive game. Forcing system_hw here
+        // makes the extension irrelevant (key and values verified
+        // against the shipped .so: "master system", "game gear",
+        // "mega drive / genesis" all present).
         // PS1 speed options, same values already tuned in the browser
         // player (verified in the bundled core): frameskip on auto with
         // a 60% threshold, and the instruction-cache emulation off.
@@ -328,17 +375,28 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         // recompiler explicitly on, and both NEON enhancement options
         // explicitly off — small cumulative savings on top of the
         // video-thread move. Everything else keeps the core's default.
-        override fun variable(key: String): String? = when (key) {
-            "pcsx_rearmed_frameskip" -> "auto_threshold"
-            "pcsx_rearmed_frameskip_threshold" -> "60"
-            "pcsx_rearmed_frameskip_interval" -> "3"
-            "pcsx_rearmed_icache_emulation" -> "disabled"
-            "pcsx_rearmed_dithering" -> "disabled"
-            "pcsx_rearmed_spu_interpolation" -> "off"
-            "pcsx_rearmed_drc" -> "enabled"
-            "pcsx_rearmed_neon_enhancement_enable" -> "disabled"
-            "pcsx_rearmed_neon_enhancement_texture" -> "disabled"
-            else -> null
+        override fun variable(key: String): String? {
+            if (key == "genesis_plus_gx_system_hw") {
+                return when (gameSystem) {
+                    "segaMS" -> "master system"
+                    "segaGG" -> "game gear"
+                    "segaMD" -> "mega drive / genesis"
+                    else -> null
+                }
+            }
+            if (gameSystem != "psx") return null
+            return when (key) {
+                "pcsx_rearmed_frameskip" -> "auto_threshold"
+                "pcsx_rearmed_frameskip_threshold" -> "60"
+                "pcsx_rearmed_frameskip_interval" -> "3"
+                "pcsx_rearmed_icache_emulation" -> "disabled"
+                "pcsx_rearmed_dithering" -> "disabled"
+                "pcsx_rearmed_spu_interpolation" -> "off"
+                "pcsx_rearmed_drc" -> "enabled"
+                "pcsx_rearmed_neon_enhancement_enable" -> "disabled"
+                "pcsx_rearmed_neon_enhancement_texture" -> "disabled"
+                else -> null
+            }
         }
 
         override fun onVideoFrame(frame: VideoFrame) {
@@ -441,7 +499,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                     }
                 }
             }
-        }, "lynxos-ps1-audio")
+        }, "lynxos-native-audio")
         audioThread = t
         t.start()
     }
@@ -512,7 +570,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private fun startVideoThread() {
         if (videoRunning.get()) return
         videoRunning.set(true)
-        val t = HandlerThread("lynxos-ps1-video")
+        val t = HandlerThread("lynxos-native-video")
         t.start()
         videoThread = t
         videoHandler = Handler(t.looper)
@@ -561,6 +619,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         gameTitle = intent.getStringExtra(EXTRA_GAME_TITLE) ?: "game"
+        gameSystem = intent.getStringExtra(EXTRA_GAME_SYSTEM) ?: "psx"
         val gamePath = intent.getStringExtra(EXTRA_GAME_PATH)
         if (gamePath.isNullOrEmpty()) {
             Toast.makeText(this, "No game file to play.", Toast.LENGTH_LONG).show()
@@ -598,16 +657,22 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
             try {
                 setLoadStage("starting the player")
                 setLoadStage("copying the game core")
-                val coreFile = ensureCoreFile()
+                val (coreAsset, coreName) = coreForSystem(gameSystem)
+                    ?: throw IllegalStateException("No native core for $gameSystem.")
+                val coreFile = ensureCoreFile(coreAsset, coreName)
                 val c = LibretroCore(coreFile.absolutePath, frontend)
                 core = c
                 setLoadStage("loading the game")
                 c.loadGame(gamePath)
                 c.setControllerPortDevice(0, Device.JOYPAD)
+                // In-game saves: restore this game's battery save
+                // (if it has one) before the first frame, the same
+                // <title>.srm pattern the N64 bridge uses.
+                loadSaveRam(c)
                 val fps = c.avInfo.timing.fps
                 val sampleRate = c.avInfo.timing.sampleRate.toInt()
                 runOnUiThread { startAudio(sampleRate) }
-                speak("Now playing $gameTitle, PlayStation. " + controlSummary())
+                speak("Now playing $gameTitle, ${systemLabel()}. " + controlSummary())
                 startLoop(fps)
             } catch (e: Throwable) {
                 Log.e(TAG, "Could not start $gameTitle", e)
@@ -631,14 +696,26 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun controlSummary(): String {
+        // Describes THIS player's map: remote held sideways,
+        // channel-up A, channel-down B, OK Start, Back tap X,
+        // Back+OK Y, Back+channel-up L, Back+channel-down R, mute
+        // Select, Back held alone half a second to leave. The
+        // two-button systems (Game Boy, Atari) only need A/B/Start,
+        // so they get the short version; SNES/GBA/Genesis use the
+        // shoulders too. Genesis: RetroPad X is the C button.
         val base = "Hold the remote sideways, top to the left. " +
-            "Channel up is Cross, channel down is Circle. Tap OK for Start. " +
-            "Tap Back is Triangle. Hold Back and press OK for Square, " +
-            "channel up for L1, channel down for R1. " +
-            "Hold Back alone for half a second to leave."
-        return if (packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)) {
-            base + " On this tablet there are also touch buttons on the screen: D-pad bottom left, action buttons bottom right."
-        } else base
+            "Channel up is A, channel down is B. Tap OK for Start. "
+        val leave = "Hold Back alone for half a second to leave."
+        return when (gameSystem) {
+            "psx" -> base + "Tap Back is Triangle. Hold Back and press OK for Square, " +
+                "channel up for L1, channel down for R1. " + leave
+            "snes", "gba" -> base + "Tap Back is X. Hold Back and press OK for Y, " +
+                "channel up for L, channel down for R. " + leave
+            "segaMD", "segaMS", "segaGG" -> base + "Tap Back is C. " + leave
+            else -> base + leave
+        } + if (packageManager.hasSystemFeature(PackageManager.FEATURE_TOUCHSCREEN)) {
+            " On this tablet there are also touch buttons on the screen: D-pad bottom left, action buttons bottom right."
+        } else ""
     }
 
     private fun speak(text: String) {
@@ -654,20 +731,63 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         pendingSpeak = text
     }
 
-    /** Copies the bundled core .so from assets to internal storage (dlopen needs a real file). */
-    private fun ensureCoreFile(): File {
+    /** Copies the bundled core .so from assets to internal storage (dlopen needs a real file).
+     * v1.6.0: one version file per core ("<name>.version") — the old
+     * shared version.txt was written by both native players with
+     * different versions, so each switch re-copied the core. */
+    private fun ensureCoreFile(coreAsset: String, coreName: String): File {
         val dir = File(filesDir, "native-cores")
         dir.mkdirs()
-        val out = File(dir, CORE_NAME)
-        val ver = File(dir, "version.txt")
+        val out = File(dir, coreName)
+        val ver = File(dir, "$coreName.version")
         val current = try { ver.readText() } catch (e: Exception) { "" }
         if (!out.exists() || current != CORE_VERSION) {
-            assets.open(CORE_ASSET).use { input ->
+            assets.open(coreAsset).use { input ->
                 FileOutputStream(out).use { output -> input.copyTo(output) }
             }
             ver.writeText(CORE_VERSION)
         }
         return out
+    }
+
+    /** In-game (battery) saves, the N64 bridge's <title>.srm
+     * pattern: the file is named after the sanitised game title and
+     * lives in filesDir/native-saves next to the PS1 saves. Loaded
+     * right after loadGame (before the first frame), saved when the
+     * player closes. A core with no SAVE_RAM region (Atari 2600 has
+     * no battery saves) simply has nothing to load or store. */
+    private fun saveRamFile(): File {
+        val safe = gameTitle.map {
+            if (it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '.' || it == '_' || it == '-') it else '_'
+        }.joinToString("").ifEmpty { "game" }
+        return File(File(filesDir, "native-saves").apply { mkdirs() }, "$safe.srm")
+    }
+
+    private fun loadSaveRam(c: LibretroCore) {
+        try {
+            if (c.memorySize(MemoryType.SAVE_RAM) <= 0) return
+            val f = saveRamFile()
+            if (!f.exists()) return
+            val bytes = f.readBytes()
+            if (bytes.isNotEmpty() && c.writeMemory(MemoryType.SAVE_RAM, bytes)) {
+                Log.i(TAG, "loaded ${bytes.size} save bytes from ${f.name}")
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "load save failed", e)
+        }
+    }
+
+    private fun saveSaveRam(c: LibretroCore) {
+        try {
+            if (c.memorySize(MemoryType.SAVE_RAM) <= 0) return
+            val bytes = c.readMemory(MemoryType.SAVE_RAM) ?: return
+            if (bytes.isEmpty()) return
+            val f = saveRamFile()
+            f.writeBytes(bytes)
+            Log.i(TAG, "saved ${bytes.size} save bytes to ${f.name}")
+        } catch (e: Exception) {
+            Log.w(TAG, "save save failed", e)
+        }
     }
 
     private fun startAudio(sampleRate: Int) {
@@ -757,9 +877,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                 // rate, underrun count, average batch size — the
                 // numbers that prove whether the static is the core
                 // running slow. The line goes to the page (and
-                // logcat), never spoken. The PS1 rate is fixed
-                // (44100), so unlike N64 there is no rate
-                // renegotiation to do here.
+                // logcat), never spoken. The sample rate is fixed
+                // per core (read from avInfo at load), so unlike
+                // N64 there is no rate renegotiation to do here.
                 diagFramesRun++
                 val nowNanos = System.nanoTime()
                 if (nowNanos - diagWindowStartNanos >= 1_000_000_000L) {
@@ -862,7 +982,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
             (src and InputDevice.SOURCE_JOYSTICK) == InputDevice.SOURCE_JOYSTICK
     }
 
-    /** Remote key -> RetroPad button, applying the sideways rotation. */
+    /** Remote key -> RetroPad button, applying the sideways rotation.
+     * Mute is Select — the same convention the WebView player uses,
+     * so the 2-button systems (Game Boy, Atari) still get a Select. */
     private fun mapRemoteKey(code: Int): Int? = when (code) {
         KeyEvent.KEYCODE_DPAD_UP -> JoypadButton.LEFT
         KeyEvent.KEYCODE_DPAD_DOWN -> JoypadButton.RIGHT
@@ -872,6 +994,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         KeyEvent.KEYCODE_CHANNEL_DOWN -> if (backHeld) JoypadButton.R else JoypadButton.B
         KeyEvent.KEYCODE_DPAD_CENTER, KeyEvent.KEYCODE_ENTER ->
             if (backHeld) JoypadButton.Y else JoypadButton.START
+        KeyEvent.KEYCODE_MUTE -> JoypadButton.SELECT
         else -> null
     }
 
@@ -1049,39 +1172,41 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         dpad.addView(dpadRight)
         root.addView(dpad)
 
-        // Action diamond, bottom-right: Triangle top, Cross
-        // bottom, Square left, Circle right — the PlayStation
-        // layout. Each feeds the RetroPad id the remote produces
-        // for the same button (Cross A, Circle B, Triangle X,
-        // Square Y).
+        // Action diamond, bottom-right. PlayStation layout: Triangle
+        // top, Cross bottom, Square left, Circle right. The 2D
+        // systems use the same diamond but labelled with the
+        // RetroPad names (X top, A bottom, Y left, B right) — the
+        // buttons feed the same RetroPad ids either way (Cross/A,
+        // Circle/B, Triangle/X, Square/Y).
         val actions = RelativeLayout(this)
         actions.layoutParams = FrameLayout.LayoutParams(dp(232), dp(232),
             Gravity.BOTTOM or Gravity.END).apply {
             rightMargin = dp(16)
             bottomMargin = dp(16)
         }
-        val triangle = touchButton("△", "Triangle button") { down ->
+        val isPsx = gameSystem == "psx"
+        val triangle = touchButton(if (isPsx) "△" else "X", if (isPsx) "Triangle button" else "X button") { down ->
             if (down) pressed.add(JoypadButton.X) else pressed.remove(JoypadButton.X)
         }
         triangle.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
             addRule(RelativeLayout.CENTER_HORIZONTAL)
             addRule(RelativeLayout.ALIGN_PARENT_TOP)
         }
-        val cross = touchButton("✕", "Cross button") { down ->
+        val cross = touchButton(if (isPsx) "✕" else "A", if (isPsx) "Cross button" else "A button") { down ->
             if (down) pressed.add(JoypadButton.A) else pressed.remove(JoypadButton.A)
         }
         cross.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
             addRule(RelativeLayout.CENTER_HORIZONTAL)
             addRule(RelativeLayout.ALIGN_PARENT_BOTTOM)
         }
-        val square = touchButton("□", "Square button") { down ->
+        val square = touchButton(if (isPsx) "□" else "Y", if (isPsx) "Square button" else "Y button") { down ->
             if (down) pressed.add(JoypadButton.Y) else pressed.remove(JoypadButton.Y)
         }
         square.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
             addRule(RelativeLayout.CENTER_VERTICAL)
             addRule(RelativeLayout.ALIGN_PARENT_START)
         }
-        val circle = touchButton("○", "Circle button") { down ->
+        val circle = touchButton(if (isPsx) "○" else "B", if (isPsx) "Circle button" else "B button") { down ->
             if (down) pressed.add(JoypadButton.B) else pressed.remove(JoypadButton.B)
         }
         circle.layoutParams = RelativeLayout.LayoutParams(dp(72), dp(72)).apply {
@@ -1166,6 +1291,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         // and stopping here guarantees no draw runs after the
         // surface is destroyed or the core is closed.
         stopVideoThread()
+        // In-game saves first (v1.6.0): the core's battery RAM is
+        // read while the core is still alive — close() unloads it.
+        try { core?.let { saveSaveRam(it) } } catch (e: Exception) { Log.w(TAG, "save on close failed", e) }
         try { core?.close() } catch (e: Exception) { Log.w(TAG, "core close failed", e) }
         core = null
         // Stop the audio drain first (v1.4.12): it is the only other
