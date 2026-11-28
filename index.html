@@ -231,6 +231,14 @@
     return 'nes';
   }
 
+  // v1.6.0: the 2D systems that run on the native player (same
+  // native path as PlayStation). Nintendo DS stays on the web
+  // player; Nintendo 64 has its own native branch below.
+  var NATIVE_2D_SYSTEMS = ['nes', 'snes', 'gb', 'gbc', 'gba', 'segaMD', 'segaMS', 'segaGG', 'atari2600'];
+  function isNative2D(system) {
+    return NATIVE_2D_SYSTEMS.indexOf(system) !== -1;
+  }
+
   // The 12 bundled games — all free homebrew / public domain, verified.
   // genmddj is a Mega Drive music tracker, NOT a game; it is labelled
   // honestly as one wherever it appears.
@@ -768,13 +776,14 @@
   // ---------- Player ----------
 
   function playGame(game) {
-    // PlayStation runs on the native player (real ARM code, not the
-    // browser): export the game file to the app and hand it over.
-    if (game.system === 'psx') {
+    // PlayStation and the 2D systems run on the native player (real
+    // ARM code, not the browser): export the game file to the app
+    // and hand it over. Nintendo DS stays on the web player below.
+    if (game.system === 'psx' || isNative2D(game.system)) {
       showScreen('player');
       setPlayingBridge(true);
       $('nowPlaying').textContent = 'Loading ' + game.title + '…';
-      announce('Loading ' + game.title + ' on the native player. ' + controlSummary('psx'));
+      announce('Loading ' + game.title + ' on the native player. ' + controlSummary(game.system));
       // Extract-once cache: a finished export lives in the app's
       // files, so a game that already played starts straight from
       // the saved copy — no download, no extract, no re-send. Any
@@ -1739,18 +1748,31 @@
       if (single) return { main: single, mainBytes: null, support: [] };
       return null;
     }
+    // 2D systems (v1.6.0): one ROM file. The extension list is per
+    // system because .bin means a Mega Drive game for one system
+    // and an Atari 2600 game for another.
+    var exts2D = {
+      nes: ['nes'], snes: ['sfc', 'smc'], gb: ['gb'], gbc: ['gbc'],
+      gba: ['gba'], segaMD: ['bin', 'md', 'gen', 'smd'],
+      segaMS: ['sms'], segaGG: ['gg'], atari2600: ['bin', 'a26']
+    };
+    if (exts2D[system]) {
+      var rom2D = firstFileWithExt(catalog, exts2D[system]);
+      if (rom2D) return { main: rom2D, mainBytes: null, support: [] };
+      return null;
+    }
     // n64: one ROM file.
     var rom = firstFileWithExt(catalog, ['z64', 'n64', 'v64']);
     if (rom) return { main: rom, mainBytes: null, support: [] };
     return null;
   }
 
-  // Sends a PlayStation or Nintendo 64 game to the native player,
-  // 1 MB at a time through the bridge, with spoken progress. The
-  // bridge launches the player when the last chunk lands. N64
-  // always uses Parallel (Mupen dropped in v1.4.13). An archived
-  // game (.7z/.zip/.rar) is unpacked first and sent as its disc
-  // files instead.
+  // Sends a native-player game (PlayStation, Nintendo 64, or one
+  // of the 2D systems) to the native player, 1 MB at a time
+  // through the bridge, with spoken progress. The bridge launches
+  // the player when the last chunk lands. N64 always uses Parallel
+  // (Mupen dropped in v1.4.13). An archived game (.7z/.zip/.rar)
+  // is unpacked first and sent as its disc files instead.
   function exportGameForNative(game) {
     if (!window.LynxosRetro || !window.LynxosRetro.nativeBegin) {
       return Promise.reject(new Error('This version cannot start the native player.'));
@@ -1812,11 +1834,11 @@
     return next();
   }
 
-  // Unpack and send a PlayStation or Nintendo 64 game to the native
-  // player, 1 MB at a time through the bridge, with spoken progress.
-  // The bridge launches the player when the last chunk lands. N64
-  // always uses Parallel (Mupen dropped in v1.4.13). An archived
-  // game (.7z/.zip/.rar) is unpacked first and its files are
+  // Unpack and send a native-player game to the native player, 1 MB
+  // at a time through the bridge, with spoken progress. The bridge
+  // launches the player when the last chunk lands. N64 always uses
+  // Parallel (Mupen dropped in v1.4.13). An archived game
+  // (.7z/.zip/.rar) is unpacked first and its files are
   // STREAMED to the bridge as the worker posts them (v1.4.14): the
   // old code collected the whole ~500 MB set in memory before
   // sending anything, which OOM-killed the TV's WebView renderer.
@@ -1935,8 +1957,8 @@
     });
   }
 
-  // Start a PlayStation/Nintendo 64 game on the native player: the
-  // normal export (v1.5.2: the synced-unpacked path is gone with
+  // Start a native-player game on the native player: the normal
+  // export (v1.5.2: the synced-unpacked path is gone with
   // the unpack feature).
   function startNativeGame(game) {
     return exportGameForNative(game);
