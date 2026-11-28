@@ -58,15 +58,30 @@ jobs:
           sha256sum app/src/main/assets/native/pcsx_rearmed_libretro_android.so
           ls -la app/src/main/assets/native
 
-      - name: Fetch native N64 core (Parallel only)
-        # v1.4.13: Mupen dropped — Parallel is the only N64 core, so
-        # only parallel_n64 is fetched and bundled now.
+      - name: Fetch native N64 core (Parallel fallback)
+        # v1.5.0: Parallel stays as the fallback N64 core — Mupen
+        # GLES3 is first choice again (see the next step).
         run: |
           mkdir -p app/src/main/assets/native
           curl -sL --retry 3 --retry-delay 5 -o /tmp/parallel_n64.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/parallel_n64_libretro_android.so.zip"
           unzip -t /tmp/parallel_n64.zip
           unzip -o -j /tmp/parallel_n64.zip -d app/src/main/assets/native
           sha256sum app/src/main/assets/native/parallel_n64_libretro_android.so
+          ls -la app/src/main/assets/native
+
+      - name: Fetch native N64 core (Mupen GLES3)
+        # v1.5.0: Mupen is back as the first-choice N64 core — the
+        # GLES3 variant, for GLES 3.0 systems like the Onn box (the
+        # GLES2 variant has graphical issues on such systems).
+        # Parallel stays as the fallback (step above). No pinned
+        # hash: nightly "latest" is fetched with retries + unzip -t,
+        # and the .so hash is logged, never enforced.
+        run: |
+          mkdir -p app/src/main/assets/native
+          curl -sL --retry 3 --retry-delay 5 -o /tmp/mupen64plus_next_gles3.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip"
+          unzip -t /tmp/mupen64plus_next_gles3.zip
+          unzip -o -j /tmp/mupen64plus_next_gles3.zip -d app/src/main/assets/native
+          sha256sum app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so
           ls -la app/src/main/assets/native
 
       - name: Scaffold Android project
@@ -375,8 +390,9 @@ jobs:
                  pass, so its presence means a complete export. */
               /* Which system the export in progress is for ("psx" or
                  "n64") and, for N64, which core to launch
-                 ("parallel" only since v1.4.13 — Mupen dropped).
-                 nativeEnd uses both to pick the player Activity. */
+                 ("mupen" first since v1.5.0; "parallel" is the
+                 fallback). nativeEnd uses both to pick the player
+                 Activity. */
               private String nativeSystem = "";
               private String nativeCore = "";
               /* Multi-file export (archive case): the page unpacks
@@ -961,12 +977,13 @@ jobs:
                   private void launchNativePlayer(File gameFile) {
                       Intent i;
                       if ("n64".equals(nativeSystem)) {
-                          /* v1.4.13: Mupen dropped — Parallel is the
-                             only N64 core, whatever the page asked
-                             for (see also nativeSetCore). */
-                          nativeCore = "parallel";
+                          /* v1.5.0: Mupen GLES3 is the first-choice
+                             N64 core again — ask the player to try
+                             it first; Parallel is the fallback (see
+                             also nativeSetCore). */
+                          nativeCore = "mupen";
                           i = new Intent(MainActivity.this, NativeN64PlayerActivity.class);
-                          i.putExtra("core", "parallel");
+                          i.putExtra("core", "mupen");
                       } else {
                           i = new Intent(MainActivity.this, NativePlayerActivity.class);
                       }
@@ -1020,17 +1037,21 @@ jobs:
                       f.delete();
                   }
                   /* Native N64 player: which core the page picked
-                     ("parallel" only since v1.4.13 — Mupen dropped).
-                     Called right after nativeBegin for N64 games;
-                     nativeEnd uses it to pick the player Activity. */
+                     ("mupen" or "parallel" since v1.5.0 — Mupen
+                     GLES3 first, Parallel fallback). Called right
+                     after nativeBegin for N64 games; nativeEnd uses
+                     it to pick the player Activity. */
                   @JavascriptInterface
                   public void nativeSetCore(String core) {
-                      /* v1.4.13: Mupen dropped — Parallel is the only
-                         N64 core. Coerce anything that is not
-                         "parallel" to "parallel" as a safety net, so
-                         the native side never launches Mupen even if
-                         the page still asks for it. */
-                      nativeCore = "parallel";
+                      /* v1.5.0: Mupen is back — accept "mupen" and
+                         "parallel", and coerce anything else to
+                         "parallel" as a safety net, so the native
+                         side never gets an unknown core name. */
+                      if ("mupen".equals(core) || "parallel".equals(core)) {
+                          nativeCore = core;
+                      } else {
+                          nativeCore = "parallel";
+                      }
                   }
 
                   /* Multi-file export: the page unpacked an archive
