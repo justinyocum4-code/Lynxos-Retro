@@ -409,16 +409,32 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         nativeSetSurface(null)
     }
 
+    /** The fitted game-surface size for a screen of sw x sh: the
+     * picture shape (aspect) fitted inside the screen. Shared by
+     * the creation-time size in onCreate and fitGameSurface() so
+     * the two can never disagree. */
+    private fun fittedSize(sw: Int, sh: Int, aspect: Float): Pair<Int, Int> {
+        // Fit inside the screen: width-limited when the screen is
+        // narrower than the picture shape, height-limited otherwise.
+        return if (sw.toFloat() / sh.toFloat() > aspect) {
+            (sh * aspect).toInt() to sh
+        } else {
+            sw to (sw / aspect).toInt()
+        }
+    }
+
     /** Size the game SurfaceView to the game's picture shape, fitted
      * inside the screen and centered (v1.4.10). The core draws its
      * own 4:3 frame bottom-anchored into whatever window it is
      * given, so a full-screen portrait window left the picture at
      * the bottom with black above it. A window already shaped to
      * the picture fills completely, and centering it puts the black
-     * bars evenly around it instead of all on one side. The fit
-     * runs early (before the core loads) so the EGL surface is
-     * already the right size when the core's GL init runs; it runs
-     * again when the game loads (real aspect from AV geometry) and
+     * bars evenly around it instead of all on one side. The
+     * SurfaceView is sized to the fit at creation (v1.4.14), so
+     * the EGL surface is already the right size when the core's GL
+     * init runs during load — no resize lands inside
+     * retro_load_game or the deferred context_reset. This re-fits
+     * it when the game loads (real aspect from AV geometry) and
      * on every surface size change. The touch overlay is positioned
      * against the full screen and is untouched by this — only the
      * SurfaceView moves. */
@@ -428,17 +444,7 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         val sh = rootLayout.height
         if (sw <= 0 || sh <= 0) return
         val aspect = if (gameAspect > 0) gameAspect else 4f / 3f
-        // Fit inside the screen: width-limited when the screen is
-        // narrower than the picture shape, height-limited otherwise.
-        val w: Int
-        val h: Int
-        if (sw.toFloat() / sh.toFloat() > aspect) {
-            h = sh
-            w = (sh * aspect).toInt()
-        } else {
-            w = sw
-            h = (sw / aspect).toInt()
-        }
+        val (w, h) = fittedSize(sw, sh, aspect)
         val lp = surfaceView.layoutParams as? FrameLayout.LayoutParams
         if (lp != null && lp.width == w && lp.height == h) return
         surfaceView.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
@@ -481,15 +487,25 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         // black is fine — only the SurfaceView's own background
         // kills the hole.
         surfaceView.holder.addCallback(this)
-        root.addView(surfaceView, FrameLayout.LayoutParams(
-            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        // Size the SurfaceView to the fitted 4:3 rect at creation
+        // (v1.4.14): the core's GL init runs during load, inside
+        // nativeLoadGame (retro_load_game + the deferred
+        // context_reset), so the surface must already be the right
+        // size when load starts. The old root.post fit call
+        // resized it from full-screen just after creation, destroying
+        // and recreating the surface — on the TV's slower timing
+        // that destroy could land inside load and kill GL init.
+        // Display metrics are the screen size here (fullscreen TV);
+        // surfaceChanged re-fits against the measured root if they
+        // ever differ, as before. gameAspect is still the 4:3
+        // default at this point (the core reports the real one
+        // only after load).
+        val dm = resources.displayMetrics
+        val startAspect = if (gameAspect > 0) gameAspect else 4f / 3f
+        val (fitW, fitH) = fittedSize(dm.widthPixels, dm.heightPixels, startAspect)
+        root.addView(surfaceView, FrameLayout.LayoutParams(fitW, fitH, Gravity.CENTER))
         setContentView(root)
         addTouchOverlay(root)
-        // First fit, as soon as the screen is measured: the core's
-        // GL init runs during load, so the surface must already be
-        // the right size by then. surfaceChanged re-fits as well,
-        // so a not-yet-measured root here is harmless.
-        root.post { fitGameSurface() }
 
         tts = TextToSpeech(this) { status ->
             if (status == TextToSpeech.SUCCESS) {
