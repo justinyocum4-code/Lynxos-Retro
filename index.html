@@ -248,9 +248,7 @@
     { id: 'segaMS', label: 'Master System', core: 'segaMS' },
     { id: 'segaGG', label: 'Game Gear', core: 'segaGG' },
     { id: 'atari2600', label: 'Atari 2600', core: 'atari2600' },
-    { id: 'n64', label: 'Nintendo 64', core: 'n64' },
-    { id: 'nds', label: 'Nintendo DS', core: 'nds' },
-    { id: 'psx', label: 'PlayStation', core: 'psx' }
+    { id: 'nds', label: 'Nintendo DS', core: 'nds' }
   ];
 
   function systemLabel(id) {
@@ -868,9 +866,15 @@
     // device (newest first), then the bundled games.
     return syncedGames.concat(localGames).concat(BUNDLED);
   }
+  // v1.5.1: Nintendo 64 and PlayStation were removed from the menu
+  // at Justin's request (Nov 27, 2026) — the native players never
+  // worked reliably on the TV. Their games stay in Drive and in
+  // library.json, hidden here, so they can come back.
+  var REMOVED_SYSTEMS = ['n64', 'psx'];
   function filteredGames() {
-    if (currentTab === 'all') return allGames();
-    return allGames().filter(function (g) { return g.system === currentTab; });
+    var visible = allGames().filter(function (g) { return REMOVED_SYSTEMS.indexOf(g.system) === -1; });
+    if (currentTab === 'all') return visible;
+    return visible.filter(function (g) { return g.system === currentTab; });
   }
 
   function sourceTag(game) {
@@ -2615,7 +2619,7 @@
     tvPrepBackfillDone = true;
     var pending = [];
     driveLibrary.forEach(function (rec) {
-      if (rec.source === 'upload' && rec.fileId && rec.unpackedFiles == null) pending.push(rec);
+      if (rec.source === 'upload' && rec.fileId && rec.unpackedFiles == null && REMOVED_SYSTEMS.indexOf(rec.system) === -1) pending.push(rec);
     });
     if (!pending.length) return Promise.resolve();
     announce('Getting your games ready for the TV. ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
