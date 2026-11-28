@@ -434,8 +434,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
      * from the emulation thread. If a newer frame landed in the
      * back bitmap while this draw was running, it re-posts itself
      * so the newest frame still gets shown. */
-    private val videoDrawRunnable = Runnable {
-        if (!videoRunning.get()) return@Runnable
+    private val videoDrawRunnable: Runnable = object : Runnable {
+        override fun run() {
+        if (!videoRunning.get()) return
         val bmp: Bitmap? = synchronized(videoLock) {
             if (!videoFrontReady) {
                 videoDrawPending = false
@@ -468,7 +469,8 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                     } else false
                 } else false
             }
-            if (repost) videoHandler?.post(videoDrawRunnable)
+            if (repost) videoHandler?.post(this)
+        }
         }
     }
 
