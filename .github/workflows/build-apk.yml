@@ -338,6 +338,7 @@ jobs:
           import android.webkit.ValueCallback;
           import android.webkit.WebChromeClient;
           import android.webkit.WebSettings;
+          import android.webkit.RenderProcessGoneDetail;
           import android.webkit.WebView;
           import android.webkit.WebViewClient;
           import java.io.BufferedReader;
@@ -1345,6 +1346,21 @@ jobs:
                               final String u = pendingAuthUrl; pendingAuthUrl = null;
                               forwardAuth(u);
                           }
+                      }
+                      /* v1.4.14 F3: the renderer can be OOM-killed
+                         (e.g. during a ~500 MB archive extraction on
+                         a 3 GB RAM TV). Without this the page dies
+                         silently — permanent blank screen, no
+                         recovery, no announcement. Reload the page
+                         and announce it (Toast + TTS via
+                         announceSpoken, so it is visible on the TV
+                         whose TTS has never spoken). Returning true
+                         means we handled the death. */
+                      @Override
+                      public boolean onRenderProcessGone(WebView view, RenderProcessGoneDetail detail) {
+                          MainActivity.this.announceSpoken("The page ran out of memory and is reloading. Please wait.");
+                          if (view != null) view.reload();
+                          return true;
                       }
                   });
                   /* File picker: the Add Game screen uses an <input
