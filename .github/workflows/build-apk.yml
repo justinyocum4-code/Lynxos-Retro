@@ -58,16 +58,15 @@ jobs:
           sha256sum app/src/main/assets/native/pcsx_rearmed_libretro_android.so
           ls -la app/src/main/assets/native
 
-      - name: Fetch native N64 cores
+      - name: Fetch native N64 core (Parallel only)
+        # v1.4.13: Mupen dropped — Parallel is the only N64 core, so
+        # only parallel_n64 is fetched and bundled now.
         run: |
           mkdir -p app/src/main/assets/native
           curl -sL --retry 3 --retry-delay 5 -o /tmp/parallel_n64.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/parallel_n64_libretro_android.so.zip"
-          curl -sL --retry 3 --retry-delay 5 -o /tmp/mupen64plus_next_gles3.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/mupen64plus_next_gles3_libretro_android.so.zip"
           unzip -t /tmp/parallel_n64.zip
-          unzip -t /tmp/mupen64plus_next_gles3.zip
           unzip -o -j /tmp/parallel_n64.zip -d app/src/main/assets/native
-          unzip -o -j /tmp/mupen64plus_next_gles3.zip -d app/src/main/assets/native
-          sha256sum app/src/main/assets/native/parallel_n64_libretro_android.so app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so
+          sha256sum app/src/main/assets/native/parallel_n64_libretro_android.so
           ls -la app/src/main/assets/native
 
       - name: Scaffold Android project
@@ -374,9 +373,9 @@ jobs:
                  written by nativeEnd after its byte-count checks
                  pass, so its presence means a complete export. */
               /* Which system the export in progress is for ("psx" or
-                 "n64") and, for N64, which core the page picked
-                 ("parallel" or "mupen"). nativeEnd uses both to pick
-                 the player Activity. */
+                 "n64") and, for N64, which core to launch
+                 ("parallel" only since v1.4.13 — Mupen dropped).
+                 nativeEnd uses both to pick the player Activity. */
               private String nativeSystem = "";
               private String nativeCore = "";
               /* Multi-file export (archive case): the page unpacks
@@ -386,6 +385,17 @@ jobs:
               private File nativeMultiDir;
               private File nativeMainFile;
               private boolean nativeMulti = false;
+              /* v1.4.13 atomic export: during a single-file export
+                 nativeGameFile is the "<safe>.bin.tmp" temp file and
+                 nativeFinalGameFile is the cached name it is renamed
+                 to in nativeEnd; during a multi-file export
+                 nativeMultiDir is the "<key>.tmp" temp dir and
+                 nativeMultiFinalDir is the established cache dir it
+                 swaps into place in nativeEnd. nativeCancel only
+                 ever deletes the temp locations, never the
+                 established cache. */
+              private File nativeFinalGameFile;
+              private File nativeMultiFinalDir;
               private long backDownTime = 0;
               private boolean backHeld = false;
               private boolean backChordUsed = false;
@@ -440,12 +450,82 @@ jobs:
               private static String pendingOutcomeKind = null;
               private static String pendingOutcomeReason = null;
               public static synchronized void reportPlayerOutcome(String system, String kind, String reason, boolean hard) {
+                  /* v1.4.13 F3: a failed launch must not fail forever
+                     on the same bad cache — invalidate it so the next
+                     launch re-extracts. Only "failed": never a clean
+                     exit ("stopped") or a hang. The outcome carries
+                     no title, so read it from the launch marker
+                     BEFORE it is cleared below, falling back to the
+                     last launch's stored fields. */
+                  if ("failed".equals(kind)) {
+                      invalidateFailedGameCache(system);
+                  }
                   clearPlayerLaunchMarker();
                   if (hard || pendingOutcomeKind == null) {
                       pendingOutcomeSystem = system;
                       pendingOutcomeKind = kind;
                       pendingOutcomeReason = reason;
                   }
+              }
+              /* v1.4.13 F3: delete one game's extracted cache (the
+                 whole cache dir, so main.txt goes with it). Best
+                 effort; a missing marker or title just means there
+                 is nothing safe to identify, so nothing is deleted. */
+              private static void invalidateFailedGameCache(String system) {
+                  try {
+                      MainActivity a = instance;
+                      if (a == null || system == null) return;
+                      String title = null;
+                      String marker = getPlayerLaunchMarker();
+                      if (marker != null) {
+                          int firstPipe = marker.indexOf('|');
+                          if (firstPipe >= 0 && system.equals(marker.substring(0, firstPipe))) {
+                              title = parseMarkerTitle(marker);
+                          }
+                      }
+                      if ((title == null || title.isEmpty()) && system.equals(a.nativeSystem)) {
+                          title = a.nativeTitle;
+                      }
+                      if (title == null || title.isEmpty()) return;
+                      deleteRecursiveStatic(cacheDirFor(a, title, system));
+                  } catch (Exception ignored) {}
+              }
+              /* Title from a system|core|title|time launch marker
+                 (old 3-field system|title|time markers still parse:
+                 the core is then just empty). Same split rules as
+                 checkSilentPlayerDeath. */
+              private static String parseMarkerTitle(String marker) {
+                  int firstPipe = marker.indexOf('|');
+                  int secondPipe = firstPipe < 0 ? -1 : marker.indexOf('|', firstPipe + 1);
+                  int lastPipe = marker.lastIndexOf('|');
+                  if (firstPipe < 0 || lastPipe <= firstPipe) return null;
+                  if (secondPipe > firstPipe && secondPipe < lastPipe) {
+                      String maybeCore = marker.substring(firstPipe + 1, secondPipe);
+                      if (maybeCore.isEmpty() || "parallel".equals(maybeCore) || "mupen".equals(maybeCore)) {
+                          return marker.substring(secondPipe + 1, lastPipe);
+                      }
+                  }
+                  return marker.substring(firstPipe + 1, lastPipe);
+              }
+              /* Extract-once cache dir for a title/system (same key
+                 the bridge computes: sanitised title + "__" +
+                 system). MainActivity-level copy so the static
+                 outcome path can use it without a bridge instance. */
+              private static File cacheDirFor(MainActivity a, String title, String system) {
+                  String safe = title == null ? "" : title.replaceAll("[^A-Za-z0-9._-]", "_");
+                  if (safe.isEmpty()) safe = "game";
+                  return new File(new File(a.getFilesDir(), "extracted-games"),
+                      safe + "__" + (system == null ? "" : system));
+              }
+              private static void deleteRecursiveStatic(File f) {
+                  if (f == null) return;
+                  if (f.isDirectory()) {
+                      File[] kids = f.listFiles();
+                      if (kids != null) {
+                          for (File kid : kids) deleteRecursiveStatic(kid);
+                      }
+                  }
+                  f.delete();
               }
 
               /* Audio diagnostics (v1.4.11): the N64 player reports
@@ -690,7 +770,15 @@ jobs:
                   public String nativeBegin(String title, String system, long totalBytes) {
                       try {
                           nativeCancel();
-                          /* Single-file exports land straight in the
+                          /* v1.4.13 F5: refuse before writing a byte
+                             when the files-dir volume cannot hold
+                             this export (spoken + visible, and an
+                             error return — never a silent halfway
+                             failure). */
+                          if (!checkFreeSpace(totalBytes, title)) {
+                              return "error: not enough free space to save " + title;
+                          }
+                          /* Single-file exports land in the
                              extract-once cache (filesDir, not
                              cacheDir): after nativeEnd writes
                              main.txt, later launches skip the send. */
@@ -701,7 +789,14 @@ jobs:
                           nativeTitle = title;
                           nativeSystem = system;
                           nativeCore = "";
-                          nativeGameFile = new File(dir, safe + ".bin");
+                          /* v1.4.13 F1: write to a temp file in the
+                             same directory ("<safe>.bin.tmp") and
+                             rename it into place only in nativeEnd
+                             after the byte-count checks — an
+                             interrupted export never corrupts the
+                             good cached copy. */
+                          nativeFinalGameFile = new File(dir, safe + ".bin");
+                          nativeGameFile = new File(dir, safe + ".bin.tmp");
                           nativeOut = new FileOutputStream(nativeGameFile);
                           nativeTotal = totalBytes;
                           nativeWritten = 0;
@@ -709,6 +804,22 @@ jobs:
                       } catch (Exception e) {
                           return "error: " + e.getMessage();
                       }
+                  }
+                  /* v1.4.13 F5: usable space on the files-dir volume
+                     must cover the bytes about to be written plus a
+                     1 MB slack. Returns false (after announcing it,
+                     spoken + visible) when it does not. A non-positive
+                     need — size unknown — cannot be checked, so it
+                     passes; a volume that cannot even be queried
+                     passes too rather than blocking every export. */
+                  private boolean checkFreeSpace(long neededBytes, String what) {
+                      if (neededBytes <= 0) return true;
+                      try {
+                          long usable = getFilesDir().getUsableSpace();
+                          if (usable >= neededBytes + 1048576L) return true;
+                      } catch (Exception ignored) { return true; }
+                      MainActivity.this.announceSpoken("Not enough free space to save " + what + ". Free up space and try again.");
+                      return false;
                   }
                   @JavascriptInterface
                   public String nativeChunk(String base64) {
@@ -737,10 +848,25 @@ jobs:
                                   return "error: no main game file";
                               }
                               /* Complete export: record the play file
-                                 so later launches can use the cache. */
-                              writeMainFile(nativeMultiDir, nativeMainFile.getName());
-                              launchNativePlayer(nativeMainFile);
+                                 (in the temp dir, before the swap) so
+                                 later launches can use the cache. A
+                                 failed record leaves the old cache
+                                 untouched and launches nothing. */
+                              if (!writeMainFile(nativeMultiDir, nativeMainFile.getName(), nativeMainFile.length())) {
+                                  nativeCancel();
+                                  return "error: could not save cache record";
+                              }
+                              /* v1.4.13 F2: swap the temp dir into
+                                 place only now that every file checks
+                                 out. A failed swap leaves the previous
+                                 good cache intact. */
+                              if (!swapMultiDirIntoPlace()) {
+                                  nativeCancel();
+                                  return "error: could not save game files";
+                              }
+                              File playFile = nativeMainFile;
                               clearExportState();
+                              launchNativePlayer(playFile);
                               return "ok";
                           }
                           if (nativeOut == null) return "error: no export in progress";
@@ -750,15 +876,68 @@ jobs:
                               nativeCancel();
                               return "error: incomplete file";
                           }
+                          /* v1.4.13 F1: the byte-count checks above
+                             passed, so rename the temp file into
+                             place now — and check the rename. A
+                             failed rename drops the temp file and
+                             launches nothing; the old cached copy
+                             is untouched. */
+                          File finalFile = nativeFinalGameFile;
+                          if (finalFile == null) {
+                              nativeCancel();
+                              return "error: incomplete file";
+                          }
+                          if (!nativeGameFile.renameTo(finalFile)) {
+                              nativeCancel();
+                              return "error: could not save game file";
+                          }
+                          nativeGameFile = finalFile;
                           /* Complete export: record the play file so
-                             later launches can use the cache. */
-                          writeMainFile(nativeGameFile.getParentFile(), nativeGameFile.getName());
-                          launchNativePlayer(nativeGameFile);
+                             later launches can use the cache. A failed
+                             record launches nothing (the finished file
+                             stays on disk without main.txt, so the next
+                             launch simply re-extracts over it). */
+                          if (!writeMainFile(finalFile.getParentFile(), finalFile.getName(), finalFile.length())) {
+                              clearExportState();
+                              return "error: could not save cache record";
+                          }
+                          File playFile = nativeGameFile;
                           clearExportState();
+                          launchNativePlayer(playFile);
                           return "ok";
                       } catch (Exception e) {
                           return "error: " + e.getMessage();
                       }
+                  }
+                  /* v1.4.13 F2: move the finished temp dir into place
+                     as the established cache. The old cache (if any)
+                     is first renamed aside to "<key>.old"; if the
+                     temp dir then fails to move in, the old cache is
+                     restored. Only after the new dir is in place is
+                     the old one deleted — so a failed attempt leaves
+                     the previous good cache intact. Same filesystem
+                     throughout, so both renames are atomic. */
+                  private boolean swapMultiDirIntoPlace() {
+                      try {
+                          File finalDir = nativeMultiFinalDir;
+                          File tmpDir = nativeMultiDir;
+                          if (finalDir == null || tmpDir == null || nativeMainFile == null) return false;
+                          File root = finalDir.getParentFile();
+                          if (root == null) return false;
+                          File backupDir = new File(root, finalDir.getName() + ".old");
+                          deleteRecursive(backupDir);
+                          if (backupDir.exists()) return false;
+                          boolean hadOld = finalDir.exists();
+                          if (hadOld && !finalDir.renameTo(backupDir)) return false;
+                          if (!tmpDir.renameTo(finalDir)) {
+                              if (hadOld) backupDir.renameTo(finalDir);
+                              return false;
+                          }
+                          nativeMainFile = new File(finalDir, nativeMainFile.getName());
+                          nativeMultiDir = finalDir;
+                          deleteRecursive(backupDir);
+                          return true;
+                      } catch (Exception e) { return false; }
                   }
 
                   /* After a successful launch the export is done:
@@ -767,7 +946,9 @@ jobs:
                      a later nativeCancel must not wipe them. */
                   private void clearExportState() {
                       nativeGameFile = null;
+                      nativeFinalGameFile = null;
                       nativeMultiDir = null;
+                      nativeMultiFinalDir = null;
                       nativeMainFile = null;
                       nativeMulti = false;
                       nativeWritten = 0;
@@ -779,8 +960,12 @@ jobs:
                   private void launchNativePlayer(File gameFile) {
                       Intent i;
                       if ("n64".equals(nativeSystem)) {
+                          /* v1.4.13: Mupen dropped — Parallel is the
+                             only N64 core, whatever the page asked
+                             for (see also nativeSetCore). */
+                          nativeCore = "parallel";
                           i = new Intent(MainActivity.this, NativeN64PlayerActivity.class);
-                          i.putExtra("core", "mupen".equals(nativeCore) ? "mupen" : "parallel");
+                          i.putExtra("core", "parallel");
                       } else {
                           i = new Intent(MainActivity.this, NativePlayerActivity.class);
                       }
@@ -796,13 +981,23 @@ jobs:
                       try {
                           if (nativeOut != null) { nativeOut.close(); nativeOut = null; }
                       } catch (Exception ignored) {}
+                      /* v1.4.13 F1/F2: only the in-progress temp
+                         locations are ever deleted here — the temp
+                         single file ("<safe>.bin.tmp") and the temp
+                         multi dir ("<key>.tmp"). The established
+                         cache dir / final file is never touched, so
+                         a failed or abandoned export (the page's
+                         error path calls this) cannot wipe a good
+                         previous cache. */
                       if (nativeMulti && nativeMultiDir != null) {
                           deleteRecursive(nativeMultiDir);
                       } else if (nativeGameFile != null) {
                           nativeGameFile.delete();
                       }
                       nativeGameFile = null;
+                      nativeFinalGameFile = null;
                       nativeMultiDir = null;
+                      nativeMultiFinalDir = null;
                       nativeMainFile = null;
                       nativeMulti = false;
                       nativeWritten = 0;
@@ -824,12 +1019,17 @@ jobs:
                       f.delete();
                   }
                   /* Native N64 player: which core the page picked
-                     ("parallel" or "mupen"). Called right after
-                     nativeBegin for N64 games; nativeEnd uses it to
-                     pick the player Activity. */
+                     ("parallel" only since v1.4.13 — Mupen dropped).
+                     Called right after nativeBegin for N64 games;
+                     nativeEnd uses it to pick the player Activity. */
                   @JavascriptInterface
                   public void nativeSetCore(String core) {
-                      nativeCore = core == null ? "" : core;
+                      /* v1.4.13: Mupen dropped — Parallel is the only
+                         N64 core. Coerce anything that is not
+                         "parallel" to "parallel" as a safety net, so
+                         the native side never launches Mupen even if
+                         the page still asks for it. */
+                      nativeCore = "parallel";
                   }
 
                   /* Multi-file export: the page unpacked an archive
@@ -843,16 +1043,27 @@ jobs:
                   public String nativeBeginMulti(String title, String system) {
                       try {
                           nativeCancel();
+                          /* v1.4.13 F5: a multi-file export declares
+                             no total size, so require at least 50 MB
+                             free before starting; each file is also
+                             checked against its own size in
+                             nativeBeginFile. */
+                          if (!checkFreeSpace(50L * 1024L * 1024L, title)) {
+                              return "error: not enough free space to save " + title;
+                          }
                           String safe = title.replaceAll("[^A-Za-z0-9._-]", "_");
                           if (safe.isEmpty()) safe = "game";
-                          /* Multi-file exports land straight in the
-                             extract-once cache: a re-extract wipes
-                             the old cache for this game first (it is
-                             stale by definition), and nativeEnd
-                             writes main.txt once every file checks
-                             out, so later launches skip the extract
-                             and the send entirely. */
-                          nativeMultiDir = extractCacheDir(title, system);
+                          /* v1.4.13 F2: no wipe-first — export into a
+                             "<key>.tmp" temp sibling dir and swap it
+                             into place only in nativeEnd, once every
+                             file checks out, so later launches skip
+                             the extract and the send entirely while a
+                             failed attempt leaves the previous good
+                             cache intact. Dropping a stale temp dir
+                             is safe: it was never the established
+                             cache. */
+                          nativeMultiFinalDir = extractCacheDir(title, system);
+                          nativeMultiDir = extractCacheTempDir(title, system);
                           deleteRecursive(nativeMultiDir);
                           nativeMultiDir.mkdirs();
                           nativeTitle = title;
@@ -872,6 +1083,12 @@ jobs:
                           if (nativeOut != null) return "error: previous file not finished";
                           String base = baseNameOf(fileName);
                           if (base.isEmpty()) return "error: bad file name";
+                          /* v1.4.13 F5: refuse this file when the
+                             volume cannot hold it, rather than
+                             failing halfway through the write. */
+                          if (!checkFreeSpace(totalBytes, fileName)) {
+                              return "error: not enough free space to save " + fileName;
+                          }
                           nativeGameFile = new File(nativeMultiDir, base);
                           nativeOut = new FileOutputStream(nativeGameFile);
                           nativeTotal = totalBytes;
@@ -935,25 +1152,71 @@ jobs:
                       File root = new File(getFilesDir(), "extracted-games");
                       return new File(root, cacheKey(title, system));
                   }
+                  /* v1.4.13 F2: temp sibling of the cache dir
+                     ("<key>.tmp") that a multi-file export is built
+                     in before being swapped into place. */
+                  private File extractCacheTempDir(String title, String system) {
+                      File root = new File(getFilesDir(), "extracted-games");
+                      return new File(root, cacheKey(title, system) + ".tmp");
+                  }
                   /* Record the play file after a complete export.
                      Only nativeEnd calls this, after its byte-count
                      checks — so main.txt means "complete". */
-                  private void writeMainFile(File dir, String name) {
+                  /* v1.4.13 F1/F5: main.txt is "name\n<size>" — the
+                     play file name plus its expected byte count.
+                     Returns false instead of silently swallowing a
+                     failure, and announces it (Toast + TTS) so a bad
+                     cache record is loud. */
+                  private boolean writeMainFile(File dir, String name, long size) {
+                      if (dir == null || name == null || name.isEmpty() || size <= 0) {
+                          MainActivity.this.announceSpoken("Could not save the game cache record. The game will need to be exported again next time.");
+                          return false;
+                      }
                       try {
                           FileOutputStream out = new FileOutputStream(new File(dir, "main.txt"));
-                          try { out.write(name.getBytes("UTF-8")); } finally { out.close(); }
-                      } catch (Exception ignored) {}
+                          try { out.write((name + "\n" + size).getBytes("UTF-8")); } finally { out.close(); }
+                          return true;
+                      } catch (Exception e) {
+                          MainActivity.this.announceSpoken("Could not save the game cache record. The game will need to be exported again next time.");
+                          return false;
+                      }
                   }
+                  /* First line of main.txt: the play file name. */
                   private String readMainFile(File dir) {
+                      String[] parts = readMainFileParts(dir);
+                      return parts == null ? "" : parts[0];
+                  }
+                  /* v1.4.13 F1: [name, size] from main.txt, or null
+                     when the record is missing or malformed. An old
+                     record with only a name and no size line returns
+                     null too — it is treated as a cache miss, never
+                     trusted. */
+                  private String[] readMainFileParts(File dir) {
                       try {
-                          java.io.FileInputStream in = new java.io.FileInputStream(new File(dir, "main.txt"));
+                          BufferedReader r = new BufferedReader(new FileReader(new File(dir, "main.txt")));
                           try {
-                              byte[] buf = new byte[512];
-                              int n = in.read(buf);
-                              if (n <= 0) return "";
-                              return new String(buf, 0, n, "UTF-8").trim();
-                          } finally { in.close(); }
-                      } catch (Exception e) { return ""; }
+                              String name = r.readLine();
+                              String sizeLine = r.readLine();
+                              if (name == null || sizeLine == null) return null;
+                              name = name.trim();
+                              long size = Long.parseLong(sizeLine.trim());
+                              if (name.isEmpty() || size <= 0) return null;
+                              return new String[]{name, String.valueOf(size)};
+                          } finally { r.close(); }
+                      } catch (Exception e) { return null; }
+                  }
+                  /* v1.4.13 F1: the cached play file, only when
+                     main.txt names it with a valid size AND the file
+                     on disk is exactly that size. Anything else is a
+                     cache miss — never trusted. */
+                  private File validatedCachedFile(File dir) {
+                      String[] parts = readMainFileParts(dir);
+                      if (parts == null) return null;
+                      File f = new File(dir, parts[0]);
+                      long size;
+                      try { size = Long.parseLong(parts[1]); } catch (Exception e) { return null; }
+                      if (size <= 0 || !f.exists() || f.length() != size) return null;
+                      return f;
                   }
 
                   /* Extract-once cache: returns the play file name
@@ -963,11 +1226,13 @@ jobs:
                   @JavascriptInterface
                   public String nativeCachedMainFile(String title, String system) {
                       try {
-                          File dir = extractCacheDir(title, system);
-                          String main = readMainFile(dir);
-                          if (main.isEmpty()) return "";
-                          File f = new File(dir, main);
-                          return f.exists() ? main : "";
+                          /* v1.4.13 F1: a cache hit needs main.txt to
+                             name the file with a valid size AND the
+                             file on disk to be exactly that size.
+                             A mismatch (or an old size-less record)
+                             is a miss, never trusted. */
+                          File f = validatedCachedFile(extractCacheDir(title, system));
+                          return f == null ? "" : f.getName();
                       } catch (Exception e) {
                           return "";
                       }
@@ -979,14 +1244,18 @@ jobs:
                   @JavascriptInterface
                   public String nativeLaunchCached(String title, String system, String core) {
                       try {
-                          File dir = extractCacheDir(title, system);
-                          String main = readMainFile(dir);
-                          if (main.isEmpty()) return "error: no cached game";
-                          File f = new File(dir, main);
-                          if (!f.exists()) return "error: cached game file is missing";
+                          /* v1.4.13 F1: same size validation as
+                             nativeCachedMainFile — a mismatched or
+                             size-less record is a miss, and the page
+                             falls back to a fresh export. */
+                          File f = validatedCachedFile(extractCacheDir(title, system));
+                          if (f == null) return "error: no cached game";
                           nativeTitle = title;
                           nativeSystem = system;
-                          nativeCore = core == null ? "" : core;
+                          /* v1.4.13: Mupen dropped — cached launches
+                             are Parallel too, whatever core the page
+                             passes in. */
+                          nativeCore = "parallel";
                           /* No export is in progress: clear any stale
                              file references without deleting anything,
                              so a later nativeCancel cannot wipe this
@@ -995,7 +1264,9 @@ jobs:
                              the page's error path.) */
                           try { if (nativeOut != null) nativeOut.close(); } catch (Exception ignored) {}
                           nativeGameFile = null;
+                          nativeFinalGameFile = null;
                           nativeMultiDir = null;
+                          nativeMultiFinalDir = null;
                           nativeMainFile = null;
                           nativeMulti = false;
                           nativeOut = null;
@@ -1428,43 +1699,55 @@ jobs:
                  15 s as a safety net) so it cannot outlive the
                  Activity. */
               private void speakClosedOutcome(String system, String reason) {
-                  final String text = "The " + systemDisplayName(system) + " game closed unexpectedly. " + reason;
-                  try {
-                      Toast.makeText(this, text, Toast.LENGTH_LONG).show();
-                  } catch (Exception ignored) {}
-                  try {
-                      if (closedTts != null) {
-                          try { closedTts.stop(); } catch (Exception ignored) {}
-                          try { closedTts.shutdown(); } catch (Exception ignored) {}
-                          closedTts = null;
-                      }
-                      /* The listener is created inside the
-                         constructor call, so it cannot capture the
-                         local being initialised (javac: "might not
-                         have been initialised"); a holder carries
-                         the instance to onInit instead. */
-                      final TextToSpeech[] holder = new TextToSpeech[1];
-                      final TextToSpeech tts = new TextToSpeech(this, new TextToSpeech.OnInitListener() {
-                          @Override public void onInit(int status) {
-                              TextToSpeech self = holder[0];
-                              if (status == TextToSpeech.SUCCESS && self != null) {
-                                  try { self.speak(text, TextToSpeech.QUEUE_FLUSH, null, "closed-outcome"); }
-                                  catch (Exception ignored) {}
+                  announceSpoken("The " + systemDisplayName(system) + " game closed unexpectedly. " + reason);
+              }
+
+              /* v1.4.13 F5: shared spoken + visible announce path
+                 (Toast + short-lived TTS, the closed-outcome voice
+                 pattern). Posted to the main thread so bridge calls
+                 — which run off the UI thread — can use it too. Used
+                 for cache-record and free-space failures. */
+              private void announceSpoken(final String text) {
+                  mainHandler.post(new Runnable() {
+                      @Override public void run() {
+                          try {
+                              Toast.makeText(MainActivity.this, text, Toast.LENGTH_LONG).show();
+                          } catch (Exception ignored) {}
+                          try {
+                              if (closedTts != null) {
+                                  try { closedTts.stop(); } catch (Exception ignored) {}
+                                  try { closedTts.shutdown(); } catch (Exception ignored) {}
+                                  closedTts = null;
                               }
-                          }
-                      });
-                      holder[0] = tts;
-                      closedTts = tts;
-                      tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
-                          @Override public void onStart(String utteranceId) {}
-                          @Override public void onDone(String utteranceId) { shutdownClosedTts(tts); }
-                          @Override public void onError(String utteranceId) { shutdownClosedTts(tts); }
-                      });
-                      final TextToSpeech t = tts;
-                      mainHandler.postDelayed(new Runnable() {
-                          @Override public void run() { shutdownClosedTts(t); }
-                      }, 15000);
-                  } catch (Exception ignored) {}
+                              /* The listener is created inside the
+                                 constructor call, so it cannot capture the
+                                 local being initialised (javac: "might not
+                                 have been initialised"); a holder carries
+                                 the instance to onInit instead. */
+                              final TextToSpeech[] holder = new TextToSpeech[1];
+                              final TextToSpeech tts = new TextToSpeech(MainActivity.this, new TextToSpeech.OnInitListener() {
+                                  @Override public void onInit(int status) {
+                                      TextToSpeech self = holder[0];
+                                      if (status == TextToSpeech.SUCCESS && self != null) {
+                                          try { self.speak(text, TextToSpeech.QUEUE_FLUSH, null, "announce"); }
+                                          catch (Exception ignored) {}
+                                      }
+                                  }
+                              });
+                              holder[0] = tts;
+                              closedTts = tts;
+                              tts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                                  @Override public void onStart(String utteranceId) {}
+                                  @Override public void onDone(String utteranceId) { shutdownClosedTts(tts); }
+                                  @Override public void onError(String utteranceId) { shutdownClosedTts(tts); }
+                              });
+                              final TextToSpeech t = tts;
+                              mainHandler.postDelayed(new Runnable() {
+                                  @Override public void run() { shutdownClosedTts(t); }
+                              }, 15000);
+                          } catch (Exception ignored) {}
+                      }
+                  });
               }
 
               private void shutdownClosedTts(TextToSpeech tts) {
