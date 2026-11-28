@@ -14,20 +14,6 @@
   .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
   #syncStatus { color: #cccccc; font-size: 16px; margin: 4px 0 16px 0; }
   .note { color: #cccccc; font-size: 16px; }
-  /* F5 (v1.4.7): the last silent-death record, gold and bold so it
-     stands out on the library screen. */
-  #lastPlayerClose { color: #F5C518; font-weight: bold; font-size: 16px; }
-  /* v1.4.11: the crash record is now the full backtrace (up to 32
-     frames plus the load bases), so the block keeps newlines and
-     scrolls instead of pushing the whole library down. */
-  #lastN64Crash { color: #F5C518; font-weight: bold; font-size: 16px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; }
-  #lastN64AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
-  #lastPS1AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
-  /* v1.4.17: the prepare/backfill status line — gold and bold like
-     the other library status lines. Plain <p> on purpose (no live
-     role): the spoken side already goes through #live, and a second
-     live region would read every mark twice. */
-  #tvPrepStatus { color: #F5C518; font-weight: bold; font-size: 16px; }
   .error { color: #ff8080; font-size: 17px; font-weight: bold; }
   .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
   button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
@@ -114,25 +100,6 @@
     <button type="button" id="tvMenuBtn">Menu</button>
     <div role="tablist" aria-label="Game systems" id="systemTabs"></div>
     <p id="gameCount" role="status"></p>
-    <div id="tvPrepStatusWrap" hidden>
-      <p id="tvPrepStatus"></p>
-    </div>
-    <div id="lastPlayerCloseWrap" hidden>
-      <p id="lastPlayerClose" role="status"></p>
-      <button type="button" id="dismissLastCloseBtn">Dismiss</button>
-    </div>
-    <div id="lastN64CrashWrap" hidden>
-      <p id="lastN64Crash" role="status"></p>
-      <button type="button" id="dismissLastCrashBtn">Dismiss</button>
-    </div>
-    <div id="lastN64AudioDiagWrap" hidden>
-      <p id="lastN64AudioDiag" role="status"></p>
-      <button type="button" id="dismissLastAudioDiagBtn">Dismiss</button>
-    </div>
-    <div id="lastPS1AudioDiagWrap" hidden>
-      <p id="lastPS1AudioDiag" role="status"></p>
-      <button type="button" id="dismissLastPS1AudioDiagBtn">Dismiss</button>
-    </div>
     <ul id="gameList" role="list"></ul>
     <p id="emptyState" class="note" hidden></p>
     <div class="actions">
@@ -294,184 +261,8 @@
   // live region: assertive interrupts and is read right away.
   function announceUrgent(text) { $('liveAssertive').textContent = text; }
 
-  // v1.4.17: the prepare/backfill status line — the "status bar"
-  // Justin asked for. Gold, on the library screen, mirroring what
-  // was last announced out loud, so the state exists on screen too.
-  function setTvPrepStatus(text) {
-    var el = $('tvPrepStatus'), wrap = $('tvPrepStatusWrap');
-    if (!el || !wrap) return;
-    el.textContent = text;
-    wrap.hidden = false;
-  }
 
-  // Called by MainActivity when a native player reports an outcome
-  // on its way out. The player's own speech may be silent on the TV,
-  // so the page says it through TalkBack instead. kind: 'failed',
-  // 'stopped', 'hang', 'novideo', 'closed'. Players only report failures,
-  // stops, hangs and no-picture warnings — a normal exit reports
-  // nothing, so this is never called for a game that played fine.
-  // 'closed' is different: MainActivity sends it when the player
-  // died without reporting at all — no reason was ever recorded,
-  // so none is invented; the reason, when present, is the load
-  // stage it died in.
-  window.handlePlayerOutcome = function (system, kind, reason) {
-    var name = system === 'n64' ? 'Nintendo 64' : 'PlayStation';
-    var text = '';
-    if (kind === 'failed') text = 'The ' + name + ' game could not start. ' + (reason || '');
-    else if (kind === 'stopped') text = 'The ' + name + ' game stopped. ' + (reason || '');
-    else if (kind === 'hang') text = 'The ' + name + ' game took too long to start. ' + (reason || '');
-    else if (kind === 'novideo') text = 'The ' + name + ' game was running but no picture was drawn. ' + (reason || '');
-    else if (kind === 'closed') text = 'The ' + name + ' game closed unexpectedly. ' + (reason || '');
-    if (!text) return;
-    if (kind === 'failed' || kind === 'hang') $('nowPlaying').textContent = text;
-    announce(text);
-    announceUrgent(text);
-  };
 
-  // F5 (v1.4.7): visible record of a silent player death. The app
-  // stores "system — title — closed unexpectedly. <reason> <time>"
-  // in SharedPreferences when a player dies without reporting; the
-  // page shows it on the library screen until the next game starts
-  // or the user dismisses it. Prefs-backed, so it survives a
-  // process death.
-  // v1.4.13: Mupen is dropped — N64 always uses Parallel now. The
-  // native side no longer writes "(Mupen)" into these records, but
-  // strip any stale "(Mupen...)" suffix so an old record never
-  // shows it again; the lines just say "Nintendo 64".
-  function withoutMupenCore(record) {
-    return record.replace(/\s*\(Mupen[^)]*\)/g, '');
-  }
-
-  function refreshLastPlayerClose() {
-    try {
-      var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
-      if (!el || !wrap) return;
-      var record = '';
-      if (window.LynxosRetro && window.LynxosRetro.getLastPlayerClose) {
-        record = window.LynxosRetro.getLastPlayerClose() || '';
-      }
-      if (record) {
-        el.textContent = 'Last game: ' + withoutMupenCore(record);
-        wrap.hidden = false;
-      } else {
-        el.textContent = '';
-        wrap.hidden = true;
-      }
-    } catch (e) {}
-  }
-
-  function clearLastPlayerClose() {
-    try {
-      if (window.LynxosRetro && window.LynxosRetro.clearLastPlayerClose) {
-        window.LynxosRetro.clearLastPlayerClose();
-      }
-    } catch (e) {}
-    var el = $('lastPlayerClose'), wrap = $('lastPlayerCloseWrap');
-    if (el) el.textContent = '';
-    if (wrap) wrap.hidden = true;
-  }
-
-  // Crash recorder (v1.4.9): the native bridge writes a crash
-  // report to filesDir/n64-crash.txt when the N64 player dies in
-  // native code. MainActivity speaks a summary on the next launch;
-  // the page shows the details here, next to the Last-game line
-  // but never overwriting it. Dismissing only records the report
-  // as seen — the file itself stays put for later diagnosis, and
-  // a new crash shows again.
-  function refreshLastN64Crash() {
-    try {
-      var el = $('lastN64Crash'), wrap = $('lastN64CrashWrap');
-      if (!el || !wrap) return;
-      var record = '';
-      if (window.LynxosRetro && window.LynxosRetro.getLastN64Crash) {
-        record = window.LynxosRetro.getLastN64Crash() || '';
-      }
-      if (record) {
-        el.textContent = 'Last crash: ' + withoutMupenCore(record);
-        wrap.hidden = false;
-      } else {
-        el.textContent = '';
-        wrap.hidden = true;
-      }
-    } catch (e) {}
-  }
-
-  function clearLastN64Crash() {
-    try {
-      if (window.LynxosRetro && window.LynxosRetro.clearLastN64Crash) {
-        window.LynxosRetro.clearLastN64Crash();
-      }
-    } catch (e) {}
-    var el = $('lastN64Crash'), wrap = $('lastN64CrashWrap');
-    if (el) el.textContent = '';
-    if (wrap) wrap.hidden = true;
-  }
-
-  // Audio diagnostics (v1.4.11): the N64 player reports once a
-  // second — actual frame rate, underrun count, average batch size,
-  // sample rate. The page shows the latest line on the library
-  // screen (it names the game), next to the Last-game line.
-  function refreshLastN64AudioDiag() {
-    try {
-      var el = $('lastN64AudioDiag'), wrap = $('lastN64AudioDiagWrap');
-      if (!el || !wrap) return;
-      var record = '';
-      if (window.LynxosRetro && window.LynxosRetro.getLastN64AudioDiag) {
-        record = window.LynxosRetro.getLastN64AudioDiag() || '';
-      }
-      if (record) {
-        el.textContent = record;
-        wrap.hidden = false;
-      } else {
-        el.textContent = '';
-        wrap.hidden = true;
-      }
-    } catch (e) {}
-  }
-
-  function clearLastN64AudioDiag() {
-    try {
-      if (window.LynxosRetro && window.LynxosRetro.clearLastN64AudioDiag) {
-        window.LynxosRetro.clearLastN64AudioDiag();
-      }
-    } catch (e) {}
-    var el = $('lastN64AudioDiag'), wrap = $('lastN64AudioDiagWrap');
-    if (el) el.textContent = '';
-    if (wrap) wrap.hidden = true;
-  }
-
-  // Audio diagnostics (v1.4.12): the PS1 player reports once a
-  // second — actual frame rate, underrun count, average batch size,
-  // sample rate. The page shows the latest line on the library
-  // screen (it names the game), next to the N64 audio line.
-  function refreshLastPS1AudioDiag() {
-    try {
-      var el = $('lastPS1AudioDiag'), wrap = $('lastPS1AudioDiagWrap');
-      if (!el || !wrap) return;
-      var record = '';
-      if (window.LynxosRetro && window.LynxosRetro.getLastPS1AudioDiag) {
-        record = window.LynxosRetro.getLastPS1AudioDiag() || '';
-      }
-      if (record) {
-        el.textContent = record;
-        wrap.hidden = false;
-      } else {
-        el.textContent = '';
-        wrap.hidden = true;
-      }
-    } catch (e) {}
-  }
-
-  function clearLastPS1AudioDiag() {
-    try {
-      if (window.LynxosRetro && window.LynxosRetro.clearLastPS1AudioDiag) {
-        window.LynxosRetro.clearLastPS1AudioDiag();
-      }
-    } catch (e) {}
-    var el = $('lastPS1AudioDiag'), wrap = $('lastPS1AudioDiagWrap');
-    if (el) el.textContent = '';
-    if (wrap) wrap.hidden = true;
-  }
 
   // Translate a raw upload/save error into plain words, never just
   // "unknown error". Returns the reason to speak and show.
@@ -716,10 +507,6 @@
     $('editScreen').hidden = name !== 'edit';
     $('accountScreen').hidden = name !== 'account';
     $('playerScreen').hidden = name !== 'player';
-    if (name === 'library') refreshLastPlayerClose();
-    if (name === 'library') refreshLastN64Crash();
-    if (name === 'library') refreshLastN64AudioDiag();
-    if (name === 'library') refreshLastPS1AudioDiag();
   }
 
   // ---------- Tabs + library ----------
@@ -981,12 +768,6 @@
   // ---------- Player ----------
 
   function playGame(game) {
-    // F5: a new launch supersedes the old silent-death record; if
-    // this game dies silently, a fresh record replaces it.
-    clearLastPlayerClose();
-    // v1.4.9: same for the crash record — a new launch dismisses
-    // the old report (the file stays put); a new crash shows again.
-    clearLastN64Crash();
     // PlayStation runs on the native player (real ARM code, not the
     // browser): export the game file to the app and hand it over.
     if (game.system === 'psx') {
@@ -1440,9 +1221,9 @@
   // reassembled here into one buffer per file before onFile runs,
   // so the main thread never receives a whole extracted file as one
   // structured-clone copy. With a streamFile, a large file is
-  // never reassembled at all (v1.5.0): its chunks flow through a
-  // byte-stream sink (createByteStreamSink) straight into the
-  // caller's upload, a bounded ~16 MB at a time. onFile may return 'hold' to keep a
+  // never reassembled at all (v1.5.0): its chunks flow through the
+  // caller's byte-stream sink straight into the upload, a bounded
+  // ~16 MB at a time. onFile may return 'hold' to keep a
   // file's bytes for the caller instead of freeing them — used for
   // .cue sheets, which are tiny and must be rewritten once every
   // entry name is known (see exportArchiveForNative). With no
@@ -1517,171 +1298,6 @@
     '  }\n' +
     '  __origPostMessage(msg);\n' +
     '};\n';
-  // Streaming byte sink (v1.5.0) — the tablet backfill crash fix.
-  // The crash: preparing a ~500 MB game for the TV froze and
-  // force-closed the tablet at ~75% extraction. The mechanism was
-  // whole-file retention on the main thread: extractArchive's t:5
-  // handler preallocated a Uint8Array of the file's full size
-  // (~500 MB), the prepare path then built a second whole-file
-  // Blob from it (~500 MB more) for the resumable upload, and the
-  // worker stayed alive holding the archive plus its extracted
-  // tree (~670 MB) until the upload finished — ~1.7 GB in one
-  // renderer process, killed for memory (and the Blob build was a
-  // synchronous whole-file copy on the main thread besides). The
-  // worker also used to post all ~125 of the file's 4 MB chunks in
-  // a tight loop, so a whole file's worth of chunks sat queued in
-  // the main thread's message port before any was consumed.
-  // A sink replaces all three copies with a bounded queue: chunks
-  // are pushed in as they arrive and pulled out by the uploader
-  // one 8 MB piece at a time (getPiece). push() only resolves once
-  // there is room (16 MB cap), which is what throttles the worker
-  // — the main thread acks each chunk only after push() resolves.
-  // The last assembled piece is kept (8 MB) so a piece Google only
-  // partly accepted can be re-served from the resumed byte offset
-  // instead of failing. Nothing here ever holds the whole file:
-  // the biggest single copy is one 8 MB upload piece. The caller
-  // assigns sink.startUpload (a function returning the upload
-  // promise); the sink itself only moves bytes. onActivity, when
-  // set by the uploader, is called on every push and every piece
-  // served, so the uploader's stall timer sees extraction as
-  // activity rather than a dead connection.
-  var STREAM_BUFFER_MAX = 16 * 1024 * 1024;
-  var STREAM_BUFFER_LOW = 8 * 1024 * 1024;
-  function createByteStreamSink(size) {
-    var queue = []; // Uint8Array chunks not yet consumed, in order
-    var queuedBytes = 0;
-    var bufStart = 0; // absolute offset of queue[0][0]
-    var ended = false;
-    var streamErr = null;
-    var waiters = []; // getPiece calls waiting for bytes
-    var roomWaiters = []; // push() calls waiting for room
-    var lastPiece = null; // {start, bytes} of the last assembled piece, for rewind
-    var sink = {
-      size: size,
-      type: 'application/octet-stream',
-      onActivity: null,
-      lastActivity: Date.now(),
-      push: push,
-      end: end,
-      fail: fail,
-      getPiece: getPiece,
-      bufferedBytes: function () { return queuedBytes; },
-      waitingForBytes: function () { return waiters.length > 0; },
-      blockedOnRoom: function () { return roomWaiters.length > 0; }
-    };
-    function poke() {
-      sink.lastActivity = Date.now();
-      if (typeof sink.onActivity === 'function') { try { sink.onActivity(); } catch (e) {} }
-    }
-    function freeRoom() {
-      if (queuedBytes <= STREAM_BUFFER_LOW && roomWaiters.length) {
-        var rs = roomWaiters; roomWaiters = [];
-        rs.forEach(function (r) { r(); });
-      }
-    }
-    function pumpWaiters() {
-      if (!waiters.length) return;
-      var pending = waiters; waiters = [];
-      pending.forEach(function (w) { tryTake(w); });
-    }
-    // Try to satisfy one waiting getPiece; re-queue it when the
-    // bytes are not there yet and the stream has not ended.
-    function tryTake(w) {
-      if (streamErr) { w.reject(streamErr); return; }
-      var fromLast = 0;
-      if (w.start < bufStart) {
-        // A rewind into the piece just served (Google confirmed
-        // only part of it): serve its tail from the kept copy.
-        if (!lastPiece || w.start < lastPiece.start ||
-            w.start >= lastPiece.start + lastPiece.bytes.length) {
-          w.reject(new Error('Upload stream cannot go back that far.'));
-          return;
-        }
-        fromLast = Math.min(w.len, lastPiece.start + lastPiece.bytes.length - w.start);
-      }
-      var fromQueue = w.len - fromLast;
-      var queueStart = Math.max(w.start, bufStart);
-      var available = bufStart + queuedBytes - queueStart;
-      if (available < fromQueue) {
-        if (ended) { w.reject(new Error('Upload stream ended early.')); return; }
-        waiters.push(w);
-        return;
-      }
-      // Drop any bytes before the requested start (cannot happen in
-      // the sequential flow; kept only so the accounting stays exact).
-      var gap = queueStart - bufStart;
-      if (gap > 0) {
-        var g = gap;
-        while (g > 0 && queue.length) {
-          var h = queue[0];
-          if (h.length <= g) { queue.shift(); g -= h.length; }
-          else { queue[0] = h.subarray(g); g = 0; }
-        }
-        queuedBytes -= gap;
-        bufStart = queueStart;
-      }
-      // Assemble the piece: tail of the last piece (rewind) plus
-      // bytes taken off the front of the queue. At most one upload
-      // piece (8 MB) is copied here, never the whole file.
-      var out = new Uint8Array(w.len);
-      var at = 0;
-      if (fromLast > 0) {
-        out.set(lastPiece.bytes.subarray(w.start - lastPiece.start,
-          w.start - lastPiece.start + fromLast), 0);
-        at = fromLast;
-      }
-      var need = fromQueue;
-      var consumed = 0;
-      while (need > 0) {
-        var head = queue[0];
-        var take = Math.min(need, head.length);
-        out.set(head.subarray(0, take), at);
-        at += take; need -= take; consumed += take;
-        if (take >= head.length) queue.shift();
-        else queue[0] = head.subarray(take);
-      }
-      bufStart += consumed;
-      queuedBytes -= consumed;
-      lastPiece = { start: w.start, bytes: out };
-      poke();
-      freeRoom();
-      w.resolve(new Blob([out]));
-    }
-    // Store one worker chunk. Resolves at once while the queue is
-    // under the cap, otherwise when consumption has freed room —
-    // the caller acks the worker only on resolution, which is the
-    // backpressure that bounds main-thread memory.
-    function push(chunk) {
-      if (streamErr) return Promise.reject(streamErr);
-      if (!chunk || !chunk.length) return Promise.resolve();
-      queue.push(chunk);
-      queuedBytes += chunk.length;
-      poke();
-      pumpWaiters();
-      if (queuedBytes <= STREAM_BUFFER_MAX) return Promise.resolve();
-      return new Promise(function (res) { roomWaiters.push(res); });
-    }
-    function end() {
-      ended = true;
-      pumpWaiters();
-    }
-    function fail(err) {
-      streamErr = err || new Error('Upload stream failed.');
-      ended = true;
-      var rs = roomWaiters; roomWaiters = [];
-      rs.forEach(function (r) { r(); });
-      pumpWaiters();
-    }
-    function getPiece(start, end) {
-      return new Promise(function (resolve, reject) {
-        var len = end - start;
-        if (len <= 0) { reject(new Error('Bad upload piece.')); return; }
-        if (streamErr) { reject(streamErr); return; }
-        tryTake({ start: start, len: len, resolve: resolve, reject: reject });
-      });
-    }
-    return sink;
-  }
 
   function extractArchive(blob, type, title, onProgress, onFile, streamFile) {
     var base = 'assets/emulatorjs/data/compression/';
@@ -1895,7 +1511,7 @@
             }
           } else if (d.t === 5) {
             // A large file, chunked by the worker into 4 MB pieces
-            // (v1.4.15). With a streamFile (v1.5.0, prepare path),
+            // (v1.4.15). With a streamFile (v1.5.0),
             // the chunks flow through a byte-stream sink straight
             // into the Drive upload — never reassembled, never a
             // whole-file Blob — and the worker is acked (t:6) only
@@ -2146,17 +1762,6 @@
       return readBlobHead(blob).then(function (head) {
         var type = archiveTypeOf(head);
         if (!type) return exportSingleFileForNative(game, blob);
-        // v1.4.16: the TV never unpacks a PlayStation/Nintendo 64
-        // archive — the renderer runs out of memory doing it, every
-        // time. The tablet unpacks it and syncs the unpacked game
-        // instead (see prepareGameForTv); until then, say so plainly
-        // instead of dying on the unpack.
-        if (IS_TV) {
-          if (game.source === 'synced') {
-            throw new Error('This game still needs to be unpacked on the tablet first. Open Lynxos Retro on the tablet so it can get the game ready, then tap Sync now here and try again.');
-          }
-          throw new Error('This game is only on the TV. Add it on the tablet instead, so it can be unpacked there, then it will play on the TV.');
-        }
         return exportArchiveForNative(game, blob, type);
       });
     });
@@ -2330,45 +1935,13 @@
     });
   }
 
-  // Start a PlayStation/Nintendo 64 game on the native player: from
-  // the synced unpacked files when the tablet has prepared them,
-  // otherwise the normal export (which on the TV refuses to unpack
-  // an archive — see exportGameForNative).
+  // Start a PlayStation/Nintendo 64 game on the native player: the
+  // normal export (v1.5.2: the synced-unpacked path is gone with
+  // the unpack feature).
   function startNativeGame(game) {
-    if (game.unpackedFiles && game.unpackedFiles.length) {
-      return playFromSyncedUnpacked(game);
-    }
     return exportGameForNative(game);
   }
 
-  // ---------- Unpacked games synced to the TV (v1.4.16) ----------
-  // The TV's WebView renderer runs out of memory unpacking a ~500 MB
-  // PlayStation/Nintendo 64 archive in the browser (v1.4.13/1.4.14/
-  // 1.4.15 all proved it — the extractor itself holds the whole game
-  // file while it works, so no amount of chunking the messages
-  // fixes it). So the TV never unpacks those archives again. The
-  // tablet unpacks the game once — right after it is added, and for
-  // older games on the next sync — uploads the unpacked files to
-  // Drive, and records them in library.json. The TV then downloads
-  // the unpacked files and sends them straight through the bridge,
-  // which writes the extract-once cache and launches the player.
-  // The record for a prepared game:
-  //   unpackedFiles: [{ name, size, fileId }] — the unpacked set,
-  //     name is the basename as it lands in the cache dir;
-  //   unpackedMain: the play file's name (the .cue, or the single
-  //     disc/ROM file).
-  // unpackedFiles null means "never prepared"; an empty list means
-  // "checked — a single file, nothing to unpack".
-
-  var preparingGames = {};   // record id -> true while a prepare runs
-  var tvPrepBackfillDone = false;
-
-  function findDriveRecord(recId) {
-    for (var i = 0; i < driveLibrary.length; i++) {
-      if (driveLibrary[i].id === recId) return driveLibrary[i];
-    }
-    return null;
-  }
 
   // The unpacked main file for a game, or null when the tablet has
   // not unpacked it (yet).
@@ -2380,351 +1953,8 @@
     return null;
   }
 
-  // The play file inside an extracted set: the native pick for
-  // PlayStation/Nintendo 64, the biggest file for anything else
-  // (a web archive holds one ROM and maybe a readme).
-  function pickUnpackedMain(system, catalog) {
-    if (system === 'psx' || system === 'n64') {
-      var picked = pickNativeFiles(system, catalog);
-      if (!picked) return null;
-      return { main: picked.main, mainBytes: picked.mainBytes || null };
-    }
-    var best = null, bestSize = -1;
-    Object.keys(catalog).forEach(function (name) {
-      var size = (catalog[name] && catalog[name].size) || 0;
-      if (size > bestSize) { bestSize = size; best = name; }
-    });
-    return best ? { main: best, mainBytes: null } : null;
-  }
 
-  // Drive file name for one unpacked file: the record id keeps it
-  // unique, the basename keeps it readable.
-  function unpackedDriveName(recId, entryName) {
-    return recId + '-' + baseNameOf(entryName);
-  }
 
-  // Keep the library's in-memory game for a prepared record in step
-  // with library.json, so tapping Play right after a prepare uses
-  // the unpacked set instead of the stale copy from the last sync.
-  function setSyncedGameUnpacked(recId, files, main) {
-    for (var i = 0; i < syncedGames.length; i++) {
-      if (syncedGames[i].id === 'drive-' + recId) {
-        syncedGames[i].unpackedFiles = files;
-        syncedGames[i].unpackedMain = main;
-        return;
-      }
-    }
-  }
-
-  // Unpack one synced game and upload its unpacked files to Drive,
-  // recording them on the game's library record. `blob` is the
-  // archive itself when the caller still has it (right after adding);
-  // otherwise the archive is fetched from Drive. Never rejects —
-  // a failure is announced in plain words and the game is left for
-  // the next run. The tablet does this for every system; the TV
-  // only for web systems (a PlayStation/Nintendo 64 archive would
-  // run out of memory here, and the tablet prepares those).
-  function prepareGameForTv(recId, blob) {
-    if (preparingGames[recId]) return Promise.resolve();
-    preparingGames[recId] = true;
-    var uploaded = [];   // unpacked files already in Drive, for cleanup on failure
-    var uploadStartAnnounced = false; // v1.4.17: say "Uploading…" once per prepare
-    function done() { delete preparingGames[recId]; }
-    function cleanupUploads() {
-      var chain = Promise.resolve();
-      uploaded.forEach(function (f) {
-        chain = chain.then(function () { return driveDeleteFile(f.fileId).catch(function () {}); });
-      });
-      return chain;
-    }
-    function fail(err) {
-      return cleanupUploads().then(function () {
-        done();
-        var rec = findDriveRecord(recId);
-        var title = rec ? rec.title : 'that game';
-        var text = 'Could not get ' + title + ' ready for the TV. ' + (err && err.message ? err.message : '');
-        announce(text);
-        announceUrgent(text);
-        setTvPrepStatus(text);
-      });
-    }
-    var rec = findDriveRecord(recId);
-    if (!rec || rec.source !== 'upload' || !rec.fileId || rec.unpackedFiles != null) {
-      done();
-      return Promise.resolve();
-    }
-    // The TV never unpacks PlayStation/Nintendo 64 here — the
-    // tablet does those. Leave the record unmarked so the tablet's
-    // next sync picks it up.
-    if (IS_TV && (rec.system === 'psx' || rec.system === 'n64')) {
-      done();
-      return Promise.resolve();
-    }
-    var title = rec.title;
-    var system = rec.system;
-    announce('Unpacking ' + title + ' for the TV.');
-    setTvPrepStatus('Getting ' + title + ' ready for the TV — unpacking.');
-    // v1.4.17: one upload's progress callback. The uploader itself
-    // announces the 25/50/75 marks out loud (report()); this mirrors
-    // them onto the status line, so the screen shows what was said.
-    // A fresh callback per file, so a second large file gets its own
-    // marks instead of inheriting the first file's.
-    function uploadProgressCallback() {
-      var uploadAnnounced = { 25: false, 50: false, 75: false };
-      return function (percent) {
-        if (percent >= 100) {
-          setTvPrepStatus('Getting ' + title + ' ready for the TV — upload done, finishing up.');
-          return;
-        }
-        [25, 50, 75].forEach(function (mark) {
-          if (percent >= mark && !uploadAnnounced[mark]) {
-            uploadAnnounced[mark] = true;
-            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading, ' + mark + ' percent.');
-          }
-        });
-      };
-    }
-    // v1.5.0: the streaming upload for one large extracted file.
-    // Returns the byte-stream sink extractArchive feeds chunk by
-    // chunk; the sink's startUpload runs the resumable upload
-    // (uploadWithProgressFromSource) serialized behind earlier
-    // files, pulling one 8 MB piece at a time, and records the file
-    // in Drive when it lands. The main thread never holds the whole
-    // file: at most ~16 MB buffered in the sink plus one 8 MB piece.
-    // The 25/50/75% marks and the "Uploading ... now." announcement
-    // are unchanged — the uploader announces the marks itself
-    // (report()) and the callback above mirrors them onto the
-    // status line, exactly as the Blob path did.
-    function createDriveUploadStream(entryName, size) {
-      var driveName = unpackedDriveName(recId, entryName);
-      var sink = createByteStreamSink(size);
-      sink.startUpload = function () {
-        return uploadWithProgressFromSource(driveName, sink, title, uploadProgressCallback()).then(function (fileId) {
-          uploaded.push({ name: baseNameOf(entryName), size: size, fileId: fileId });
-        });
-      };
-      return sink;
-    }
-    var blobPromise = blob ? Promise.resolve(blob) : resolveGameBlob(driveRecordToGame(rec), function () {});
-    return blobPromise.then(function (got) {
-      if (!got) throw new Error('Could not load ' + title + '.');
-      return readBlobHead(got).then(function (head) {
-        var type = archiveTypeOf(head);
-        if (!type) {
-          // A single file — nothing to unpack. Record the empty set
-          // so this game is never checked again.
-          var single = findDriveRecord(recId);
-          if (single) {
-            single.unpackedFiles = [];
-            single.unpackedMain = null;
-            setSyncedGameUnpacked(recId, [], null);
-            return writeDriveLibrary().then(function () { setTvPrepStatus(title + ' is ready for the TV.'); done(); });
-          }
-          done();
-          return;
-        }
-        var announced = { 25: false, 50: false, 75: false };
-        return extractArchive(got, type, title, function (percent) {
-          [25, 50, 75].forEach(function (mark) {
-            if (percent >= mark && !announced[mark]) {
-              announced[mark] = true;
-              announce('Unpacking ' + title + ', ' + mark + ' percent.');
-              setTvPrepStatus('Getting ' + title + ' ready for the TV — unpacking, ' + mark + ' percent.');
-            }
-          });
-        }, function (name, bytes, size) {
-          // The .cue is tiny and held: it is rewritten to the real
-          // entry basenames (the v1.4.13 case fix) once every name
-          // is known, and uploaded after extraction. Every other
-          // SMALL file (4 MB or under, arriving whole as t:2) goes
-          // up the moment it arrives, so at most one extracted file
-          // is live here at a time. Large files never reach this
-          // callback — they stream through the streamFile sink
-          // below (v1.5.0), which is the backfill crash fix.
-          if (extOf(name) === 'cue') return 'hold';
-          // v1.4.17: the upload starts here, and the first 25% of a
-          // ~500 MB file is a long silence on a slow connection —
-          // say so out loud now, instead of waiting for the first
-          // milestone. The uploader announces the 25/50/75 marks
-          // itself (report()); the callback mirrors them onto the
-          // status line.
-          if (!uploadStartAnnounced) {
-            uploadStartAnnounced = true;
-            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading.');
-            announce('Uploading ' + title + ' now.');
-          }
-          var fileBlob = new Blob([bytes]);
-          var driveName = unpackedDriveName(recId, name);
-          return uploadWithProgress(driveName, fileBlob, title, uploadProgressCallback()).then(function (fileId) {
-            uploaded.push({ name: baseNameOf(name), size: size, fileId: fileId });
-          });
-        }, function (name, size) {
-          // v1.5.0: large files (over 4 MB, arriving as t:5 chunks)
-          // stream to Drive through a byte-stream sink instead of
-          // arriving whole here — this is the backfill crash fix.
-          // .cue sheets are tiny and always arrive as t:2, so they
-          // never reach this callback; the null return is only a
-          // safety net (a null falls back to the old reassembly).
-          // The "Uploading ... now." announcement fires here, at the
-          // first chunk of the first large file, exactly where
-          // onFile used to fire it.
-          if (extOf(name) === 'cue') return null;
-          if (!uploadStartAnnounced) {
-            uploadStartAnnounced = true;
-            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading.');
-            announce('Uploading ' + title + ' now.');
-          }
-          return createDriveUploadStream(name, size);
-        }).then(function (catalog) {
-          var picked = pickUnpackedMain(system, catalog);
-          if (!picked) {
-            throw new Error('No playable game file inside ' + title + '.');
-          }
-          var chain = Promise.resolve();
-          if (picked.mainBytes) {
-            // The rewritten .cue: upload it now, under its own name.
-            var cueBlob = new Blob([picked.mainBytes]);
-            chain = chain.then(function () {
-              return uploadWithProgress(unpackedDriveName(recId, picked.main), cueBlob, title, uploadProgressCallback()).then(function (fileId) {
-                uploaded.push({ name: baseNameOf(picked.main), size: picked.mainBytes.length, fileId: fileId });
-              });
-            });
-          }
-          return chain.then(function () {
-            var live = findDriveRecord(recId);
-            if (!live) return cleanupUploads().then(function () { done(); });
-            live.unpackedFiles = uploaded;
-            live.unpackedMain = baseNameOf(picked.main);
-            setSyncedGameUnpacked(recId, uploaded, baseNameOf(picked.main));
-            return writeDriveLibrary().then(function () {
-              done();
-              setTvPrepStatus(title + ' is ready for the TV.');
-              announce(title + ' is ready for the TV.');
-            });
-          });
-        });
-      });
-    }).catch(function (err) {
-      return fail(err);
-    });
-  }
-
-  // Once per launch, get every synced game ready for the TV: any
-  // uploaded game the tablet has not unpacked yet is unpacked and
-  // its files uploaded in the background. Runs on the tablet only —
-  // the TV cannot unpack PlayStation/Nintendo 64, and its web games
-  // are prepared when they are added instead.
-  function backfillUnpackedForTv() {
-    if (tvPrepBackfillDone || IS_TV || !syncConfigured || !currentUser) return Promise.resolve();
-    tvPrepBackfillDone = true;
-    var pending = [];
-    driveLibrary.forEach(function (rec) {
-      if (rec.source === 'upload' && rec.fileId && rec.unpackedFiles == null && REMOVED_SYSTEMS.indexOf(rec.system) === -1) pending.push(rec);
-    });
-    if (!pending.length) return Promise.resolve();
-    announce('Getting your games ready for the TV. ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
-    setTvPrepStatus('Getting your games ready for the TV — ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
-    var chain = Promise.resolve();
-    var doneCount = 0;
-    pending.forEach(function (rec) {
-      chain = chain.then(function () {
-        return prepareGameForTv(rec.id, null).then(function () { doneCount++; });
-      });
-    });
-    return chain.then(function () {
-      if (doneCount) {
-        setTvPrepStatus('All games are ready for the TV.');
-        announce('Your games are ready for the TV.');
-      }
-    });
-  }
-
-  // Play a PlayStation/Nintendo 64 game from the unpacked files the
-  // tablet already synced to Drive. Each file downloads straight
-  // into the bridge session, 1 MB at a time, so the TV holds one
-  // file's download and one chunk — never an archive, never an
-  // extraction. The bridge writes the extract-once cache and
-  // launches the player, exactly as the old export did.
-  function playFromSyncedUnpacked(game) {
-    var CHUNK = 1024 * 1024;
-    if (!window.LynxosRetro || !window.LynxosRetro.nativeBeginMulti ||
-        !window.LynxosRetro.nativeBeginFile || !window.LynxosRetro.nativeEndFile ||
-        !window.LynxosRetro.nativeSetMainFile) {
-      return Promise.reject(new Error('This version cannot start the native player.'));
-    }
-    var main = game.unpackedMain;
-    var mainFile = null;
-    var support = [];
-    (game.unpackedFiles || []).forEach(function (f) {
-      if (f.name === main) mainFile = f;
-      else support.push(f);
-    });
-    if (!mainFile) return Promise.reject(new Error('Could not start ' + game.title + '. The unpacked game is incomplete.'));
-    $('nowPlaying').textContent = 'Getting ' + game.title + ' ready for the TV…';
-    announce('Getting ' + game.title + ' ready for the TV.');
-    var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
-    if (begin !== 'ok') return Promise.reject(new Error(begin));
-    if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
-      window.LynxosRetro.nativeSetCore('parallel');
-    }
-    var announced = { 25: false, 50: false, 75: false };
-    var total = 0;
-    (game.unpackedFiles || []).forEach(function (f) { total += f.size || 0; });
-    var sentBytes = 0;
-    function announceAt(percent) {
-      [25, 50, 75].forEach(function (mark) {
-        if (percent >= mark && !announced[mark]) {
-          announced[mark] = true;
-          $('nowPlaying').textContent = 'Getting ' + game.title + ' ready, ' + mark + ' percent.';
-          announce('Getting ' + game.title + ' ready, ' + mark + ' percent.');
-        }
-      });
-    }
-    function sendBlob(name, blob) {
-      var b = window.LynxosRetro.nativeBeginFile(name, blob.size);
-      if (b !== 'ok') throw new Error(b);
-      var offset = 0;
-      function next() {
-        if (offset >= blob.size) {
-          var end = window.LynxosRetro.nativeEndFile();
-          if (end !== 'ok') throw new Error(end);
-          return Promise.resolve();
-        }
-        var slice = blob.slice(offset, offset + CHUNK);
-        return blobToBase64Timed(slice, 30000,
-            new Error('Getting ' + game.title + ' ready stalled while sending.')).then(function (b64) {
-          var r = window.LynxosRetro.nativeChunk(b64);
-          if (r !== 'ok') throw new Error(r);
-          offset += slice.size;
-          sentBytes += slice.size;
-          if (total > 0) announceAt(Math.floor(sentBytes / total * 100));
-          return next();
-        });
-      }
-      return next();
-    }
-    function sendFile(entry) {
-      // The entry's own name in the download announcements, so a
-      // multi-file set reports each file instead of repeating the
-      // game title for every one.
-      return downloadWithProgress(entry.fileId, entry.name, function () {}).then(function (blob) {
-        return sendBlob(entry.name, blob);
-      });
-    }
-    var chain = Promise.resolve();
-    support.forEach(function (entry) {
-      chain = chain.then(function () { return sendFile(entry); });
-    });
-    chain = chain.then(function () { return sendFile(mainFile); });
-    return chain.then(function () {
-      var m = window.LynxosRetro.nativeSetMainFile(main);
-      if (m !== 'ok') throw new Error(m);
-      $('nowPlaying').textContent = 'Sending done, starting ' + game.title + '.';
-      announce('Sending done, starting ' + game.title + '.');
-      var end = window.LynxosRetro.nativeEnd();
-      if (end !== 'ok') throw new Error(end);
-    });
-  }
 
   // TV remote Back: close the side menu if it is open, leave the
   // player if in one, otherwise exit the app.
@@ -3179,9 +2409,6 @@
       syncedGames = driveLibrary.map(driveRecordToGame);
       renderList();
       announce('Library synced. ' + syncedGames.length + ' synced games.');
-      // v1.4.16: once per launch, get any not-yet-prepared games
-      // ready for the TV in the background (tablet only).
-      backfillUnpackedForTv();
     }).catch(function (err) {
       announce('Sync did not work: ' + (err && err.message ? err.message : 'unknown error'));
     });
@@ -3416,24 +2643,6 @@
     });
   }
 
-  // v1.5.0: the same resumable upload, fed by a pull source instead
-  // of a Blob — the prepare path's byte-stream sink. A source is
-  // { size, type, getPiece(start, end) -> Promise<Blob>,
-  // onActivity } (see createByteStreamSink): the uploader pulls one
-  // 8 MB piece at a time and never holds the whole file. There is
-  // no single-shot fallback here — a stream has no whole file to
-  // send in one request, so a session that cannot be opened fails
-  // loudly instead of silently falling back to the crash path.
-  function uploadWithProgressFromSource(fileName, source, title, onProgress) {
-    return ensureDriveFolder().then(function () {
-      return ensureDriveToken();
-    }).then(function () {
-      return openUploadSession(fileName, source);
-    }).then(function (sessionUri) {
-      if (!sessionUri) return Promise.reject(new Error('Could not start the upload. Try again.'));
-      return uploadResumableSource(sessionUri, fileName, source, title, onProgress);
-    });
-  }
 
   // Open a resumable-upload session. Resolves the session address, or
   // null when the address cannot be read (fallback trigger). Rejects
@@ -3968,12 +3177,6 @@
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
         announceUrgent('Added ' + title + ' to your cloud library.');
-        // v1.4.16: unpack it right away in the background, so the
-        // game is ready for the TV before anyone taps Play. The file
-        // is still in hand here, so no re-download. On the TV,
-        // PlayStation/Nintendo 64 archives skip this — the tablet
-        // unpacks those instead.
-        prepareGameForTv(rec.id, file);
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
         showAddProgress(false);
@@ -4240,14 +3443,6 @@
     });
     buildTabs();
     renderList();
-    refreshLastPlayerClose();
-    $('dismissLastCloseBtn').addEventListener('click', clearLastPlayerClose);
-    refreshLastN64Crash();
-    $('dismissLastCrashBtn').addEventListener('click', clearLastN64Crash);
-    refreshLastN64AudioDiag();
-    $('dismissLastAudioDiagBtn').addEventListener('click', clearLastN64AudioDiag);
-    refreshLastPS1AudioDiag();
-    $('dismissLastPS1AudioDiagBtn').addEventListener('click', clearLastPS1AudioDiag);
     initDrive();
     updateSyncStatus();
     updateAccountStatus();
