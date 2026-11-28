@@ -6,15 +6,15 @@ on:
       version_name:
         description: 'Version name (e.g. 1.0.0)'
         required: false
-        default: '1.4.12'
+        default: '1.6.0'
       version_code:
         description: 'Version code (whole number, bump every build)'
         required: false
-        default: '36'
+        default: '47'
       release_notes:
         description: 'Release notes'
         required: false
-        default: 'First release'
+        default: 'All systems now use the native player — cleaner sound with no static and steady speed. Nintendo DS stays on the web player for now.'
 
 jobs:
   build:
@@ -82,6 +82,28 @@ jobs:
           unzip -t /tmp/mupen64plus_next_gles3.zip
           unzip -o -j /tmp/mupen64plus_next_gles3.zip -d app/src/main/assets/native
           sha256sum app/src/main/assets/native/mupen64plus_next_gles3_libretro_android.so
+          ls -la app/src/main/assets/native
+
+      - name: Fetch native 2D cores
+        # v1.6.0: NES, SNES, Game Boy / Color, Game Boy Advance,
+        # Genesis / Master System / Game Gear, Atari 2600 now run on
+        # the native player too (one libretro core per system, picked
+        # by NativePlayerActivity from the game's system id). Nintendo
+        # DS stays on the web player — melonDS is too heavy for this
+        # player yet. All six are the arm64-v8a nightly builds, the
+        # same architecture as the PS1/N64 cores above (a 32-bit core
+        # cannot load in this 64-bit app process). No pinned hash:
+        # nightly "latest" is fetched with retries + unzip -t, and
+        # each .so hash is logged, never enforced (the v1.4.5 lesson:
+        # rolling nightly checksum pins broke runs #34/#35).
+        run: |
+          mkdir -p app/src/main/assets/native
+          for core in fceumm gambatte snes9x mgba genesis_plus_gx stella2014; do
+            curl -sL --retry 3 --retry-delay 5 -o /tmp/${core}.zip "https://buildbot.libretro.com/nightly/android/latest/arm64-v8a/${core}_libretro_android.so.zip"
+            unzip -t /tmp/${core}.zip
+            unzip -o -j /tmp/${core}.zip -d app/src/main/assets/native
+            sha256sum app/src/main/assets/native/${core}_libretro_android.so
+          done
           ls -la app/src/main/assets/native
 
       - name: Scaffold Android project
@@ -986,6 +1008,11 @@ jobs:
                           i.putExtra("core", "mupen");
                       } else {
                           i = new Intent(MainActivity.this, NativePlayerActivity.class);
+                          /* v1.6.0: the native player picks its core
+                             from the game's system, so the system
+                             rides along (N64 carries "core" instead,
+                             above). */
+                          i.putExtra("system", nativeSystem);
                       }
                       i.putExtra("gamePath", gameFile.getAbsolutePath());
                       i.putExtra("gameTitle", nativeTitle);
