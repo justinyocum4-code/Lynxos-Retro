@@ -227,8 +227,9 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private var watchdogIdleChecks = 0
     private var watchdogLastStage = "starting the player"
 
-    private val startWatchdog = Runnable {
-        if (running.get() || closed.get()) return@Runnable
+    private val startWatchdog = object : Runnable {
+        override fun run() {
+        if (running.get() || closed.get()) return
         if (loadStage != watchdogLastStage) {
             // The load advanced a stage since the last check: it is
             // still working, so the idle clock restarts.
@@ -245,11 +246,12 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                         finishPlayer()
                     }
                 }, 5000L)
-                return@Runnable
+                return
             }
             speakAndToast("Still loading $gameTitle. Please wait.")
         }
-        mainHandler.postDelayed(startWatchdog, WATCHDOG_CHECK_MS)
+        mainHandler.postDelayed(this, WATCHDOG_CHECK_MS)
+        }
     }
 
     // Video check, 5 s after the frame loop starts: the game is
