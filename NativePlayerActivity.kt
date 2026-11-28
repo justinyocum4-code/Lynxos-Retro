@@ -70,7 +70,8 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         private const val CORE_NAME = "pcsx_rearmed_libretro_android.so"
         private const val CORE_VERSION = "1"
         private const val BACK_HOLD_EXIT_MS = 500L
-        private const val START_WATCHDOG_MS = 30_000L
+        private const val WATCHDOG_CHECK_MS = 30_000L
+        private const val WATCHDOG_MAX_IDLE_CHECKS = 4
         private const val VIDEO_CHECK_MS = 5_000L
         private const val TRIANGLE_TAP_MS = 100L
         // Audio queue cap (v1.4.12): batches wait here only briefly
@@ -127,6 +128,10 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
     private var backDownTime = 0L
     private var backChordUsed = false
     private var gameTitle = "game"
+    // Read on the main thread by the watchdog, written on the load
+    // thread by setLoadStage: volatile so a stage advance is visible
+    // to the watchdog without delay.
+    @Volatile
     private var loadStage = "starting the player"
 
     // Load-stage breadcrumb that survives a process death: the
@@ -203,23 +208,48 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
         if (backHeld && !backChordUsed) finishPlayer()
     }
 
-    // Start watchdog, same shape as the N64 player: if the frame
-    // loop has not started 30 s after the core thread starts, the
-    // thread is hung inside a blocking loadGame call (a hang is not
-    // an exception, so the try/catch never fires). The finish is
-    // delayed 5 s after the spoken warning and guarded on running
-    // still being false: finishPlayer stops TTS, so finishing
+    // Start watchdog (v1.4.14), same shape as the N64 player but
+    // progress-aware: the TV is much slower than the tablet, so a
+    // load that is still working must NOT be killed at 30 s.
+    // Instead of one fixed wall-clock kill, this checks every
+    // 30 s whether the load has visibly progressed — the load
+    // thread advances loadStage ("starting the player" ->
+    // "copying the game core" -> "loading the game" -> "running")
+    // as it works, and any advance restarts the idle clock. A
+    // check with no advance announces "still loading" (Toast +
+    // TTS, the TV's own speech may be silent) and counts one idle
+    // check; four idle checks in a row — 120 s with no observable
+    // progress at all — still means a genuinely stuck load, so the
+    // old warning + 5 s delayed finish fires. The finish is
+    // delayed 5 s after the warning and guarded on running still
+    // being false: finishPlayer stops TTS, so finishing
     // immediately would cut the warning off unheard.
+    private var watchdogIdleChecks = 0
+    private var watchdogLastStage = "starting the player"
+
     private val startWatchdog = Runnable {
-        if (!running.get()) {
-            speakAndToast("The PlayStation game is taking too long to start.")
-            mainHandler.postDelayed({
-                if (!running.get()) {
-                    reportOutcome("hang", "The game did not start within 30 seconds.", hard = true)
-                    finishPlayer()
-                }
-            }, 5000L)
+        if (running.get() || closed.get()) return@Runnable
+        if (loadStage != watchdogLastStage) {
+            // The load advanced a stage since the last check: it is
+            // still working, so the idle clock restarts.
+            watchdogLastStage = loadStage
+            watchdogIdleChecks = 0
+            Log.i(TAG, "watchdog: load progressing, stage=$loadStage")
+        } else {
+            watchdogIdleChecks++
+            if (watchdogIdleChecks >= WATCHDOG_MAX_IDLE_CHECKS) {
+                speakAndToast("The PlayStation game is taking too long to start.")
+                mainHandler.postDelayed({
+                    if (!running.get() && !closed.get()) {
+                        reportOutcome("hang", "The game did not start after two and a half minutes.", hard = true)
+                        finishPlayer()
+                    }
+                }, 5000L)
+                return@Runnable
+            }
+            speakAndToast("Still loading $gameTitle. Please wait.")
         }
+        mainHandler.postDelayed(startWatchdog, WATCHDOG_CHECK_MS)
     }
 
     // Video check, 5 s after the frame loop starts: the game is
@@ -595,7 +625,7 @@ class NativePlayerActivity : Activity(), SurfaceHolder.Callback {
                 }
             }
         }.start()
-        mainHandler.postDelayed(startWatchdog, START_WATCHDOG_MS)
+        mainHandler.postDelayed(startWatchdog, WATCHDOG_CHECK_MS)
     }
 
     private fun controlSummary(): String {
