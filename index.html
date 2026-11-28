@@ -23,6 +23,11 @@
   #lastN64Crash { color: #F5C518; font-weight: bold; font-size: 16px; white-space: pre-wrap; word-break: break-all; max-height: 240px; overflow-y: auto; }
   #lastN64AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
   #lastPS1AudioDiag { color: #F5C518; font-weight: bold; font-size: 16px; }
+  /* v1.4.17: the prepare/backfill status line — gold and bold like
+     the other library status lines. Plain <p> on purpose (no live
+     role): the spoken side already goes through #live, and a second
+     live region would read every mark twice. */
+  #tvPrepStatus { color: #F5C518; font-weight: bold; font-size: 16px; }
   .error { color: #ff8080; font-size: 17px; font-weight: bold; }
   .ok { color: #7dff8a; font-size: 17px; font-weight: bold; }
   button { font-family: sans-serif; font-size: 20px; min-height: 56px; padding: 12px 18px; margin: 6px 6px 6px 0; border-radius: 12px; border: 2px solid #F5C518; background: #1a1a1a; color: #ffffff; cursor: pointer; }
@@ -109,6 +114,9 @@
     <button type="button" id="tvMenuBtn">Menu</button>
     <div role="tablist" aria-label="Game systems" id="systemTabs"></div>
     <p id="gameCount" role="status"></p>
+    <div id="tvPrepStatusWrap" hidden>
+      <p id="tvPrepStatus"></p>
+    </div>
     <div id="lastPlayerCloseWrap" hidden>
       <p id="lastPlayerClose" role="status"></p>
       <button type="button" id="dismissLastCloseBtn">Dismiss</button>
@@ -287,6 +295,16 @@
   // Failures must reach the user even if TalkBack missed the polite
   // live region: assertive interrupts and is read right away.
   function announceUrgent(text) { $('liveAssertive').textContent = text; }
+
+  // v1.4.17: the prepare/backfill status line — the "status bar"
+  // Justin asked for. Gold, on the library screen, mirroring what
+  // was last announced out loud, so the state exists on screen too.
+  function setTvPrepStatus(text) {
+    var el = $('tvPrepStatus'), wrap = $('tvPrepStatusWrap');
+    if (!el || !wrap) return;
+    el.textContent = text;
+    wrap.hidden = false;
+  }
 
   // Called by MainActivity when a native player reports an outcome
   // on its way out. The player's own speech may be silent on the TV,
@@ -2105,6 +2123,7 @@
     if (preparingGames[recId]) return Promise.resolve();
     preparingGames[recId] = true;
     var uploaded = [];   // unpacked files already in Drive, for cleanup on failure
+    var uploadStartAnnounced = false; // v1.4.17: say "Uploading…" once per prepare
     function done() { delete preparingGames[recId]; }
     function cleanupUploads() {
       var chain = Promise.resolve();
@@ -2121,6 +2140,7 @@
         var text = 'Could not get ' + title + ' ready for the TV. ' + (err && err.message ? err.message : '');
         announce(text);
         announceUrgent(text);
+        setTvPrepStatus(text);
       });
     }
     var rec = findDriveRecord(recId);
@@ -2138,6 +2158,27 @@
     var title = rec.title;
     var system = rec.system;
     announce('Unpacking ' + title + ' for the TV.');
+    setTvPrepStatus('Getting ' + title + ' ready for the TV — unpacking.');
+    // v1.4.17: one upload's progress callback. The uploader itself
+    // announces the 25/50/75 marks out loud (report()); this mirrors
+    // them onto the status line, so the screen shows what was said.
+    // A fresh callback per file, so a second large file gets its own
+    // marks instead of inheriting the first file's.
+    function uploadProgressCallback() {
+      var uploadAnnounced = { 25: false, 50: false, 75: false };
+      return function (percent) {
+        if (percent >= 100) {
+          setTvPrepStatus('Getting ' + title + ' ready for the TV — upload done, finishing up.');
+          return;
+        }
+        [25, 50, 75].forEach(function (mark) {
+          if (percent >= mark && !uploadAnnounced[mark]) {
+            uploadAnnounced[mark] = true;
+            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading, ' + mark + ' percent.');
+          }
+        });
+      };
+    }
     var blobPromise = blob ? Promise.resolve(blob) : resolveGameBlob(driveRecordToGame(rec), function () {});
     return blobPromise.then(function (got) {
       if (!got) throw new Error('Could not load ' + title + '.');
@@ -2151,7 +2192,7 @@
             single.unpackedFiles = [];
             single.unpackedMain = null;
             setSyncedGameUnpacked(recId, [], null);
-            return writeDriveLibrary().then(function () { done(); });
+            return writeDriveLibrary().then(function () { setTvPrepStatus(title + ' is ready for the TV.'); done(); });
           }
           done();
           return;
@@ -2162,6 +2203,7 @@
             if (percent >= mark && !announced[mark]) {
               announced[mark] = true;
               announce('Unpacking ' + title + ', ' + mark + ' percent.');
+              setTvPrepStatus('Getting ' + title + ' ready for the TV — unpacking, ' + mark + ' percent.');
             }
           });
         }, function (name, bytes, size) {
@@ -2171,9 +2213,20 @@
           // file goes up the moment it arrives, so at most one
           // extracted file is live here at a time.
           if (extOf(name) === 'cue') return 'hold';
+          // v1.4.17: the upload starts here, and the first 25% of a
+          // ~500 MB file is a long silence on a slow connection —
+          // say so out loud now, instead of waiting for the first
+          // milestone. The uploader announces the 25/50/75 marks
+          // itself (report()); the callback mirrors them onto the
+          // status line.
+          if (!uploadStartAnnounced) {
+            uploadStartAnnounced = true;
+            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading.');
+            announce('Uploading ' + title + ' now.');
+          }
           var fileBlob = new Blob([bytes]);
           var driveName = unpackedDriveName(recId, name);
-          return uploadWithProgress(driveName, fileBlob, title, function () {}).then(function (fileId) {
+          return uploadWithProgress(driveName, fileBlob, title, uploadProgressCallback()).then(function (fileId) {
             uploaded.push({ name: baseNameOf(name), size: size, fileId: fileId });
           });
         }).then(function (catalog) {
@@ -2186,7 +2239,7 @@
             // The rewritten .cue: upload it now, under its own name.
             var cueBlob = new Blob([picked.mainBytes]);
             chain = chain.then(function () {
-              return uploadWithProgress(unpackedDriveName(recId, picked.main), cueBlob, title, function () {}).then(function (fileId) {
+              return uploadWithProgress(unpackedDriveName(recId, picked.main), cueBlob, title, uploadProgressCallback()).then(function (fileId) {
                 uploaded.push({ name: baseNameOf(picked.main), size: picked.mainBytes.length, fileId: fileId });
               });
             });
@@ -2199,6 +2252,7 @@
             setSyncedGameUnpacked(recId, uploaded, baseNameOf(picked.main));
             return writeDriveLibrary().then(function () {
               done();
+              setTvPrepStatus(title + ' is ready for the TV.');
               announce(title + ' is ready for the TV.');
             });
           });
@@ -2223,6 +2277,7 @@
     });
     if (!pending.length) return Promise.resolve();
     announce('Getting your games ready for the TV. ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
+    setTvPrepStatus('Getting your games ready for the TV — ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
     var chain = Promise.resolve();
     var doneCount = 0;
     pending.forEach(function (rec) {
@@ -2231,7 +2286,10 @@
       });
     });
     return chain.then(function () {
-      if (doneCount) announce('Your games are ready for the TV.');
+      if (doneCount) {
+        setTvPrepStatus('All games are ready for the TV.');
+        announce('Your games are ready for the TV.');
+      }
     });
   }
 
