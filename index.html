@@ -987,7 +987,7 @@
           }
         }
       } catch (e) {}
-      exportGameForNative(game).then(function () {
+      startNativeGame(game).then(function () {
         // The native player Activity is now in front.
       }).catch(function (err) {
         setPlayingBridge(false);
@@ -1027,7 +1027,7 @@
           }
         }
       } catch (e) {}
-      exportGameForNative(game).then(function () {
+      startNativeGame(game).then(function () {
         // The native player Activity is now in front.
       }).catch(function (err) {
         setPlayingBridge(false);
@@ -1185,17 +1185,24 @@
     if (game.romUrl) return Promise.resolve(game.romUrl);
     if (game.storagePath) {
       if (!currentUser) return Promise.reject(new Error('Not signed in.'));
-      var key = cloudCacheKey(game.storagePath);
-      // A cache-read failure must never stop play: it just means
-      // download instead. A download failure still reaches playGame.
-      return idbGet(key).catch(function () { return null; }).then(function (blob) {
-        if (blob) return URL.createObjectURL(blob);
-        return downloadWithProgress(game.storagePath, game.title, onProgress || function () {}).then(function (downloaded) {
-          // Cache it for next time; a cache failure must never stop play.
-          idbPut(key, downloaded).catch(function () {});
-          return URL.createObjectURL(downloaded);
+      // v1.4.16: if the tablet already unpacked this game, play the
+      // unpacked main file instead of the archive — no in-browser
+      // extraction at play time. Any failure here falls back to the
+      // archive below, so a bad unpacked file never blocks play.
+      var unpacked = unpackedMainFile(game);
+      if (unpacked) {
+        var ukey = cloudCacheKey(unpacked.fileId);
+        return idbGet(ukey).catch(function () { return null; }).then(function (blob) {
+          if (blob) return URL.createObjectURL(blob);
+          return downloadWithProgress(unpacked.fileId, game.title, onProgress || function () {}).then(function (downloaded) {
+            idbPut(ukey, downloaded).catch(function () {});
+            return URL.createObjectURL(downloaded);
+          });
+        }).catch(function () {
+          return resolveGameUrlArchive(game, onProgress);
         });
-      });
+      }
+      return resolveGameUrlArchive(game, onProgress);
     }
     if (game.idbKey) {
       return idbGet(game.idbKey).then(function (blob) {
@@ -1204,6 +1211,22 @@
       });
     }
     return Promise.resolve(null);
+  }
+
+  // The archive path of resolveGameUrl above, factored out so the
+  // unpacked-file attempt can fall back to it.
+  function resolveGameUrlArchive(game, onProgress) {
+    var key = cloudCacheKey(game.storagePath);
+    // A cache-read failure must never stop play: it just means
+    // download instead. A download failure still reaches playGame.
+    return idbGet(key).catch(function () { return null; }).then(function (blob) {
+      if (blob) return URL.createObjectURL(blob);
+      return downloadWithProgress(game.storagePath, game.title, onProgress || function () {}).then(function (downloaded) {
+        // Cache it for next time; a cache failure must never stop play.
+        idbPut(key, downloaded).catch(function () {});
+        return URL.createObjectURL(downloaded);
+      });
+    });
   }
 
   // Same sources as resolveGameUrl, but returns the file itself so the
@@ -1800,6 +1823,17 @@
       return readBlobHead(blob).then(function (head) {
         var type = archiveTypeOf(head);
         if (!type) return exportSingleFileForNative(game, blob);
+        // v1.4.16: the TV never unpacks a PlayStation/Nintendo 64
+        // archive — the renderer runs out of memory doing it, every
+        // time. The tablet unpacks it and syncs the unpacked game
+        // instead (see prepareGameForTv); until then, say so plainly
+        // instead of dying on the unpack.
+        if (IS_TV) {
+          if (game.source === 'synced') {
+            throw new Error('This game still needs to be unpacked on the tablet first. Open Lynxos Retro on the tablet so it can get the game ready, then tap Sync now here and try again.');
+          }
+          throw new Error('This game is only on the TV. Add it on the tablet instead, so it can be unpacked there, then it will play on the TV.');
+        }
         return exportArchiveForNative(game, blob, type);
       });
     });
@@ -1970,6 +2004,321 @@
         var end = window.LynxosRetro.nativeEnd();
         if (end !== 'ok') throw new Error(end);
       });
+    });
+  }
+
+  // Start a PlayStation/Nintendo 64 game on the native player: from
+  // the synced unpacked files when the tablet has prepared them,
+  // otherwise the normal export (which on the TV refuses to unpack
+  // an archive — see exportGameForNative).
+  function startNativeGame(game) {
+    if (game.unpackedFiles && game.unpackedFiles.length) {
+      return playFromSyncedUnpacked(game);
+    }
+    return exportGameForNative(game);
+  }
+
+  // ---------- Unpacked games synced to the TV (v1.4.16) ----------
+  // The TV's WebView renderer runs out of memory unpacking a ~500 MB
+  // PlayStation/Nintendo 64 archive in the browser (v1.4.13/1.4.14/
+  // 1.4.15 all proved it — the extractor itself holds the whole game
+  // file while it works, so no amount of chunking the messages
+  // fixes it). So the TV never unpacks those archives again. The
+  // tablet unpacks the game once — right after it is added, and for
+  // older games on the next sync — uploads the unpacked files to
+  // Drive, and records them in library.json. The TV then downloads
+  // the unpacked files and sends them straight through the bridge,
+  // which writes the extract-once cache and launches the player.
+  // The record for a prepared game:
+  //   unpackedFiles: [{ name, size, fileId }] — the unpacked set,
+  //     name is the basename as it lands in the cache dir;
+  //   unpackedMain: the play file's name (the .cue, or the single
+  //     disc/ROM file).
+  // unpackedFiles null means "never prepared"; an empty list means
+  // "checked — a single file, nothing to unpack".
+
+  var preparingGames = {};   // record id -> true while a prepare runs
+  var tvPrepBackfillDone = false;
+
+  function findDriveRecord(recId) {
+    for (var i = 0; i < driveLibrary.length; i++) {
+      if (driveLibrary[i].id === recId) return driveLibrary[i];
+    }
+    return null;
+  }
+
+  // The unpacked main file for a game, or null when the tablet has
+  // not unpacked it (yet).
+  function unpackedMainFile(game) {
+    if (!game.unpackedFiles || !game.unpackedFiles.length || !game.unpackedMain) return null;
+    for (var i = 0; i < game.unpackedFiles.length; i++) {
+      if (game.unpackedFiles[i].name === game.unpackedMain) return game.unpackedFiles[i];
+    }
+    return null;
+  }
+
+  // The play file inside an extracted set: the native pick for
+  // PlayStation/Nintendo 64, the biggest file for anything else
+  // (a web archive holds one ROM and maybe a readme).
+  function pickUnpackedMain(system, catalog) {
+    if (system === 'psx' || system === 'n64') {
+      var picked = pickNativeFiles(system, catalog);
+      if (!picked) return null;
+      return { main: picked.main, mainBytes: picked.mainBytes || null };
+    }
+    var best = null, bestSize = -1;
+    Object.keys(catalog).forEach(function (name) {
+      var size = (catalog[name] && catalog[name].size) || 0;
+      if (size > bestSize) { bestSize = size; best = name; }
+    });
+    return best ? { main: best, mainBytes: null } : null;
+  }
+
+  // Drive file name for one unpacked file: the record id keeps it
+  // unique, the basename keeps it readable.
+  function unpackedDriveName(recId, entryName) {
+    return recId + '-' + baseNameOf(entryName);
+  }
+
+  // Keep the library's in-memory game for a prepared record in step
+  // with library.json, so tapping Play right after a prepare uses
+  // the unpacked set instead of the stale copy from the last sync.
+  function setSyncedGameUnpacked(recId, files, main) {
+    for (var i = 0; i < syncedGames.length; i++) {
+      if (syncedGames[i].id === 'drive-' + recId) {
+        syncedGames[i].unpackedFiles = files;
+        syncedGames[i].unpackedMain = main;
+        return;
+      }
+    }
+  }
+
+  // Unpack one synced game and upload its unpacked files to Drive,
+  // recording them on the game's library record. `blob` is the
+  // archive itself when the caller still has it (right after adding);
+  // otherwise the archive is fetched from Drive. Never rejects —
+  // a failure is announced in plain words and the game is left for
+  // the next run. The tablet does this for every system; the TV
+  // only for web systems (a PlayStation/Nintendo 64 archive would
+  // run out of memory here, and the tablet prepares those).
+  function prepareGameForTv(recId, blob) {
+    if (preparingGames[recId]) return Promise.resolve();
+    preparingGames[recId] = true;
+    var uploaded = [];   // unpacked files already in Drive, for cleanup on failure
+    function done() { delete preparingGames[recId]; }
+    function cleanupUploads() {
+      var chain = Promise.resolve();
+      uploaded.forEach(function (f) {
+        chain = chain.then(function () { return driveDeleteFile(f.fileId).catch(function () {}); });
+      });
+      return chain;
+    }
+    function fail(err) {
+      return cleanupUploads().then(function () {
+        done();
+        var rec = findDriveRecord(recId);
+        var title = rec ? rec.title : 'that game';
+        var text = 'Could not get ' + title + ' ready for the TV. ' + (err && err.message ? err.message : '');
+        announce(text);
+        announceUrgent(text);
+      });
+    }
+    var rec = findDriveRecord(recId);
+    if (!rec || rec.source !== 'upload' || !rec.fileId || rec.unpackedFiles != null) {
+      done();
+      return Promise.resolve();
+    }
+    // The TV never unpacks PlayStation/Nintendo 64 here — the
+    // tablet does those. Leave the record unmarked so the tablet's
+    // next sync picks it up.
+    if (IS_TV && (rec.system === 'psx' || rec.system === 'n64')) {
+      done();
+      return Promise.resolve();
+    }
+    var title = rec.title;
+    var system = rec.system;
+    announce('Unpacking ' + title + ' for the TV.');
+    var blobPromise = blob ? Promise.resolve(blob) : resolveGameBlob(driveRecordToGame(rec), function () {});
+    return blobPromise.then(function (got) {
+      if (!got) throw new Error('Could not load ' + title + '.');
+      return readBlobHead(got).then(function (head) {
+        var type = archiveTypeOf(head);
+        if (!type) {
+          // A single file — nothing to unpack. Record the empty set
+          // so this game is never checked again.
+          var single = findDriveRecord(recId);
+          if (single) {
+            single.unpackedFiles = [];
+            single.unpackedMain = null;
+            setSyncedGameUnpacked(recId, [], null);
+            return writeDriveLibrary().then(function () { done(); });
+          }
+          done();
+          return;
+        }
+        var announced = { 25: false, 50: false, 75: false };
+        return extractArchive(got, type, title, function (percent) {
+          [25, 50, 75].forEach(function (mark) {
+            if (percent >= mark && !announced[mark]) {
+              announced[mark] = true;
+              announce('Unpacking ' + title + ', ' + mark + ' percent.');
+            }
+          });
+        }, function (name, bytes, size) {
+          // The .cue is tiny and held: it is rewritten to the real
+          // entry basenames (the v1.4.13 case fix) once every name
+          // is known, and uploaded after extraction. Every other
+          // file goes up the moment it arrives, so at most one
+          // extracted file is live here at a time.
+          if (extOf(name) === 'cue') return 'hold';
+          var fileBlob = new Blob([bytes]);
+          var driveName = unpackedDriveName(recId, name);
+          return uploadWithProgress(driveName, fileBlob, title, function () {}).then(function (fileId) {
+            uploaded.push({ name: baseNameOf(name), size: size, fileId: fileId });
+          });
+        }).then(function (catalog) {
+          var picked = pickUnpackedMain(system, catalog);
+          if (!picked) {
+            throw new Error('No playable game file inside ' + title + '.');
+          }
+          var chain = Promise.resolve();
+          if (picked.mainBytes) {
+            // The rewritten .cue: upload it now, under its own name.
+            var cueBlob = new Blob([picked.mainBytes]);
+            chain = chain.then(function () {
+              return uploadWithProgress(unpackedDriveName(recId, picked.main), cueBlob, title, function () {}).then(function (fileId) {
+                uploaded.push({ name: baseNameOf(picked.main), size: picked.mainBytes.length, fileId: fileId });
+              });
+            });
+          }
+          return chain.then(function () {
+            var live = findDriveRecord(recId);
+            if (!live) return cleanupUploads().then(function () { done(); });
+            live.unpackedFiles = uploaded;
+            live.unpackedMain = baseNameOf(picked.main);
+            setSyncedGameUnpacked(recId, uploaded, baseNameOf(picked.main));
+            return writeDriveLibrary().then(function () {
+              done();
+              announce(title + ' is ready for the TV.');
+            });
+          });
+        });
+      });
+    }).catch(function (err) {
+      return fail(err);
+    });
+  }
+
+  // Once per launch, get every synced game ready for the TV: any
+  // uploaded game the tablet has not unpacked yet is unpacked and
+  // its files uploaded in the background. Runs on the tablet only —
+  // the TV cannot unpack PlayStation/Nintendo 64, and its web games
+  // are prepared when they are added instead.
+  function backfillUnpackedForTv() {
+    if (tvPrepBackfillDone || IS_TV || !syncConfigured || !currentUser) return Promise.resolve();
+    tvPrepBackfillDone = true;
+    var pending = [];
+    driveLibrary.forEach(function (rec) {
+      if (rec.source === 'upload' && rec.fileId && rec.unpackedFiles == null) pending.push(rec);
+    });
+    if (!pending.length) return Promise.resolve();
+    announce('Getting your games ready for the TV. ' + pending.length + (pending.length === 1 ? ' game' : ' games') + ' to prepare.');
+    var chain = Promise.resolve();
+    var doneCount = 0;
+    pending.forEach(function (rec) {
+      chain = chain.then(function () {
+        return prepareGameForTv(rec.id, null).then(function () { doneCount++; });
+      });
+    });
+    return chain.then(function () {
+      if (doneCount) announce('Your games are ready for the TV.');
+    });
+  }
+
+  // Play a PlayStation/Nintendo 64 game from the unpacked files the
+  // tablet already synced to Drive. Each file downloads straight
+  // into the bridge session, 1 MB at a time, so the TV holds one
+  // file's download and one chunk — never an archive, never an
+  // extraction. The bridge writes the extract-once cache and
+  // launches the player, exactly as the old export did.
+  function playFromSyncedUnpacked(game) {
+    var CHUNK = 1024 * 1024;
+    if (!window.LynxosRetro || !window.LynxosRetro.nativeBeginMulti ||
+        !window.LynxosRetro.nativeBeginFile || !window.LynxosRetro.nativeEndFile ||
+        !window.LynxosRetro.nativeSetMainFile) {
+      return Promise.reject(new Error('This version cannot start the native player.'));
+    }
+    var main = game.unpackedMain;
+    var mainFile = null;
+    var support = [];
+    (game.unpackedFiles || []).forEach(function (f) {
+      if (f.name === main) mainFile = f;
+      else support.push(f);
+    });
+    if (!mainFile) return Promise.reject(new Error('Could not start ' + game.title + '. The unpacked game is incomplete.'));
+    $('nowPlaying').textContent = 'Getting ' + game.title + ' ready for the TV…';
+    announce('Getting ' + game.title + ' ready for the TV.');
+    var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
+    if (begin !== 'ok') return Promise.reject(new Error(begin));
+    if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
+      window.LynxosRetro.nativeSetCore('parallel');
+    }
+    var announced = { 25: false, 50: false, 75: false };
+    var total = 0;
+    (game.unpackedFiles || []).forEach(function (f) { total += f.size || 0; });
+    var sentBytes = 0;
+    function announceAt(percent) {
+      [25, 50, 75].forEach(function (mark) {
+        if (percent >= mark && !announced[mark]) {
+          announced[mark] = true;
+          $('nowPlaying').textContent = 'Getting ' + game.title + ' ready, ' + mark + ' percent.';
+          announce('Getting ' + game.title + ' ready, ' + mark + ' percent.');
+        }
+      });
+    }
+    function sendBlob(name, blob) {
+      var b = window.LynxosRetro.nativeBeginFile(name, blob.size);
+      if (b !== 'ok') throw new Error(b);
+      var offset = 0;
+      function next() {
+        if (offset >= blob.size) {
+          var end = window.LynxosRetro.nativeEndFile();
+          if (end !== 'ok') throw new Error(end);
+          return Promise.resolve();
+        }
+        var slice = blob.slice(offset, offset + CHUNK);
+        return blobToBase64Timed(slice, 30000,
+            new Error('Getting ' + game.title + ' ready stalled while sending.')).then(function (b64) {
+          var r = window.LynxosRetro.nativeChunk(b64);
+          if (r !== 'ok') throw new Error(r);
+          offset += slice.size;
+          sentBytes += slice.size;
+          if (total > 0) announceAt(Math.floor(sentBytes / total * 100));
+          return next();
+        });
+      }
+      return next();
+    }
+    function sendFile(entry) {
+      // The entry's own name in the download announcements, so a
+      // multi-file set reports each file instead of repeating the
+      // game title for every one.
+      return downloadWithProgress(entry.fileId, entry.name, function () {}).then(function (blob) {
+        return sendBlob(entry.name, blob);
+      });
+    }
+    var chain = Promise.resolve();
+    support.forEach(function (entry) {
+      chain = chain.then(function () { return sendFile(entry); });
+    });
+    chain = chain.then(function () { return sendFile(mainFile); });
+    return chain.then(function () {
+      var m = window.LynxosRetro.nativeSetMainFile(main);
+      if (m !== 'ok') throw new Error(m);
+      $('nowPlaying').textContent = 'Sending done, starting ' + game.title + '.';
+      announce('Sending done, starting ' + game.title + '.');
+      var end = window.LynxosRetro.nativeEnd();
+      if (end !== 'ok') throw new Error(end);
     });
   }
 
@@ -2408,6 +2757,11 @@
       source: 'synced',
       romUrl: rec.source === 'url' ? rec.romUrl : null,
       storagePath: rec.source === 'upload' ? rec.fileId : null,
+      // v1.4.16: the unpacked files the tablet synced for the TV
+      // ({ name, size, fileId } per file) and the play file's name.
+      // Null when the tablet has not prepared this game yet.
+      unpackedFiles: rec.unpackedFiles || null,
+      unpackedMain: rec.unpackedMain || null,
       addedAt: rec.addedAt
     };
   }
@@ -2421,6 +2775,9 @@
       syncedGames = driveLibrary.map(driveRecordToGame);
       renderList();
       announce('Library synced. ' + syncedGames.length + ' synced games.');
+      // v1.4.16: once per launch, get any not-yet-prepared games
+      // ready for the TV in the background (tablet only).
+      backfillUnpackedForTv();
     }).catch(function (err) {
       announce('Sync did not work: ' + (err && err.message ? err.message : 'unknown error'));
     });
@@ -3144,18 +3501,26 @@
       setAddProgress(0, title);
       setStatus(status, 'Uploading ' + title + ', 0 percent.', '');
       announce('Uploading ' + title + ', 0 percent.');
+      var rec = {
+        title: title, system: system, core: core,
+        source: 'upload', fileId: null, romUrl: null
+      };
       uploadWithProgress(fileName, file, title, function (percent) {
         setAddProgress(percent, title);
       }).then(function (fileId) {
         showAddProgress(false);
-        return addDriveRecord({
-          title: title, system: system, core: core,
-          source: 'upload', fileId: fileId, romUrl: null
-        });
+        rec.fileId = fileId;
+        return addDriveRecord(rec);
       }).then(function () {
         setStatus(status, 'Added ' + title + ' to your cloud library.', 'ok');
         announce('Added ' + title + ' to your cloud library.');
         announceUrgent('Added ' + title + ' to your cloud library.');
+        // v1.4.16: unpack it right away in the background, so the
+        // game is ready for the TV before anyone taps Play. The file
+        // is still in hand here, so no re-download. On the TV,
+        // PlayStation/Nintendo 64 archives skip this — the tablet
+        // unpacks those instead.
+        prepareGameForTv(rec.id, file);
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
       }).catch(function (err) {
         showAddProgress(false);
@@ -3282,9 +3647,24 @@
         announce('Could not find that game in your cloud library.');
         return;
       }
+      var oldSystem = rec.system;
       rec.title = title;
       rec.system = system;
       rec.core = core;
+      // v1.4.16: the unpacked files were extracted for the old
+      // system — a PlayStation set is not a Nintendo 64 game. Drop
+      // them (and their Drive copies) so the tablet prepares the
+      // game again for its new system.
+      if (oldSystem !== system) {
+        var oldUnpacked = rec.unpackedFiles || [];
+        rec.unpackedFiles = null;
+        rec.unpackedMain = null;
+        oldUnpacked.forEach(function (f) {
+          if (!f.fileId) return;
+          idbDelete('cloud:' + f.fileId).catch(function () {});
+          driveDeleteFile(f.fileId).catch(function () {});
+        });
+      }
       writeDriveLibrary().then(function () {
         announce('Saved ' + title + '.');
         syncLibrary().then(function () { showScreen('library'); selectTab(system); });
@@ -3337,10 +3717,23 @@
       if (game.storagePath) idbDelete('cloud:' + game.storagePath).catch(function () {});
       // And its extracted cache, for the same reason.
       try { if (window.LynxosRetro && window.LynxosRetro.nativeDeleteCache) window.LynxosRetro.nativeDeleteCache(game.title, game.system); } catch (e) {}
+      // v1.4.16: and the unpacked files it synced for the TV, plus
+      // their downloaded copies. Best effort: a failure here never
+      // blocks the delete itself.
+      var removeUnpacked = Promise.resolve();
+      (game.unpackedFiles || []).forEach(function (f) {
+        if (!f.fileId) return;
+        idbDelete('cloud:' + f.fileId).catch(function () {});
+        removeUnpacked = removeUnpacked.then(function () {
+          return driveDeleteFile(f.fileId).catch(function () {});
+        });
+      });
       var removeFile = game.storagePath
         ? driveDeleteFile(game.storagePath)
         : Promise.resolve();
       removeFile.then(function () {
+        return removeUnpacked;
+      }).then(function () {
         driveLibrary = driveLibrary.filter(function (r) { return r.id !== recId; });
         return writeDriveLibrary();
       }).then(function () {
