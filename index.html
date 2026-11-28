@@ -1435,7 +1435,10 @@
   // with transfer lists (see the worker shim below) and are
   // reassembled here into one buffer per file before onFile runs,
   // so the main thread never receives a whole extracted file as one
-  // structured-clone copy. onFile may return 'hold' to keep a
+  // structured-clone copy. With a streamFile, a large file is
+  // never reassembled at all (v1.5.0): its chunks flow through a
+  // byte-stream sink (createByteStreamSink) straight into the
+  // caller's upload, a bounded ~16 MB at a time. onFile may return 'hold' to keep a
   // file's bytes for the caller instead of freeing them — used for
   // .cue sheets, which are tiny and must be rewritten once every
   // entry name is known (see exportArchiveForNative). With no
@@ -1456,10 +1459,20 @@
   // installed at script load, before any extraction runs, and the
   // C code calls the global postMessage, so it goes through the
   // wrapper. t:1/t:4 pass through untouched.
+  // (c) v1.5.0 — backpressure: the chunks of one file used to be
+  // posted in a tight loop, so all ~125 of a ~500 MB file's chunks
+  // sat queued in the main thread's message port at once (~500 MB
+  // held before a single byte was consumed) on top of the
+  // reassembled copy. Now one chunk is posted at a time and the
+  // next waits for the main thread's t:6 ack, so the main thread
+  // only ever holds what it has room to consume. t:1 is held back
+  // until the chunk queue has drained, so it still means "every
+  // byte delivered", exactly as before.
   var WORKER_SHIM = '\n' +
     'var __origOnMessage = onmessage;\n' +
     'onmessage = function (e) {\n' +
     '  var d = e.data;\n' +
+    '  if (d && d.t === 6) { __ackChunk(); return; }\n' +
     '  if (d && typeof d.arrayBuffer === "function") {\n' +
     '    d.arrayBuffer().then(function (buf) { __origOnMessage({ data: new Uint8Array(buf) }); })\n' +
     '      .catch(function (err) { throw err; });\n' +
@@ -1469,20 +1482,204 @@
     '};\n' +
     'var __origPostMessage = self.postMessage.bind(self);\n' +
     'var __FILE_CHUNK = 4 * 1024 * 1024;\n' +
+    'var __chunkJobs = [];\n' +
+    'var __chunkBusy = false;\n' +
+    'var __t1Pending = false;\n' +
+    'function __sendNextChunk() {\n' +
+    '  if (!__chunkJobs.length) {\n' +
+    '    __chunkBusy = false;\n' +
+    '    if (__t1Pending) { __t1Pending = false; __origPostMessage({ t: 1 }); }\n' +
+    '    return;\n' +
+    '  }\n' +
+    '  var job = __chunkJobs[0];\n' +
+    '  if (job.next >= job.total) { __chunkJobs.shift(); __sendNextChunk(); return; }\n' +
+    '  var i = job.next++;\n' +
+    '  var off = i * __FILE_CHUNK;\n' +
+    '  var chunk = job.data.slice(off, Math.min(job.data.length, off + __FILE_CHUNK));\n' +
+    '  __chunkBusy = true;\n' +
+    '  __origPostMessage({ t: 5, file: job.file, size: job.size, index: i, total: job.total, offset: off, data: chunk }, [chunk.buffer]);\n' +
+    '}\n' +
+    'function __ackChunk() { if (!__chunkBusy) return; __chunkBusy = false; __sendNextChunk(); }\n' +
     'self.postMessage = function (msg) {\n' +
+    '  if (msg && msg.t === 1) {\n' +
+    '    if (__chunkJobs.length || __chunkBusy) { __t1Pending = true; return; }\n' +
+    '    __origPostMessage(msg);\n' +
+    '    return;\n' +
+    '  }\n' +
     '  if (msg && msg.t === 2 && msg.data && msg.data.length > __FILE_CHUNK) {\n' +
-    '    var data = msg.data;\n' +
-    '    var total = Math.ceil(data.length / __FILE_CHUNK);\n' +
-    '    for (var i = 0; i < total; i++) {\n' +
-    '      var off = i * __FILE_CHUNK;\n' +
-    '      var chunk = data.slice(off, Math.min(data.length, off + __FILE_CHUNK));\n' +
-    '      __origPostMessage({ t: 5, file: msg.file, size: msg.size || data.length, index: i, total: total, offset: off, data: chunk }, [chunk.buffer]);\n' +
-    '    }\n' +
+    '    __chunkJobs.push({ data: msg.data, file: msg.file, size: msg.size || msg.data.length, total: Math.ceil(msg.data.length / __FILE_CHUNK), next: 0 });\n' +
+    '    if (!__chunkBusy) __sendNextChunk();\n' +
     '    return;\n' +
     '  }\n' +
     '  __origPostMessage(msg);\n' +
     '};\n';
-  function extractArchive(blob, type, title, onProgress, onFile) {
+  // Streaming byte sink (v1.5.0) — the tablet backfill crash fix.
+  // The crash: preparing a ~500 MB game for the TV froze and
+  // force-closed the tablet at ~75% extraction. The mechanism was
+  // whole-file retention on the main thread: extractArchive's t:5
+  // handler preallocated a Uint8Array of the file's full size
+  // (~500 MB), the prepare path then built a second whole-file
+  // Blob from it (~500 MB more) for the resumable upload, and the
+  // worker stayed alive holding the archive plus its extracted
+  // tree (~670 MB) until the upload finished — ~1.7 GB in one
+  // renderer process, killed for memory (and the Blob build was a
+  // synchronous whole-file copy on the main thread besides). The
+  // worker also used to post all ~125 of the file's 4 MB chunks in
+  // a tight loop, so a whole file's worth of chunks sat queued in
+  // the main thread's message port before any was consumed.
+  // A sink replaces all three copies with a bounded queue: chunks
+  // are pushed in as they arrive and pulled out by the uploader
+  // one 8 MB piece at a time (getPiece). push() only resolves once
+  // there is room (16 MB cap), which is what throttles the worker
+  // — the main thread acks each chunk only after push() resolves.
+  // The last assembled piece is kept (8 MB) so a piece Google only
+  // partly accepted can be re-served from the resumed byte offset
+  // instead of failing. Nothing here ever holds the whole file:
+  // the biggest single copy is one 8 MB upload piece. The caller
+  // assigns sink.startUpload (a function returning the upload
+  // promise); the sink itself only moves bytes. onActivity, when
+  // set by the uploader, is called on every push and every piece
+  // served, so the uploader's stall timer sees extraction as
+  // activity rather than a dead connection.
+  var STREAM_BUFFER_MAX = 16 * 1024 * 1024;
+  var STREAM_BUFFER_LOW = 8 * 1024 * 1024;
+  function createByteStreamSink(size) {
+    var queue = []; // Uint8Array chunks not yet consumed, in order
+    var queuedBytes = 0;
+    var bufStart = 0; // absolute offset of queue[0][0]
+    var ended = false;
+    var streamErr = null;
+    var waiters = []; // getPiece calls waiting for bytes
+    var roomWaiters = []; // push() calls waiting for room
+    var lastPiece = null; // {start, bytes} of the last assembled piece, for rewind
+    var sink = {
+      size: size,
+      type: 'application/octet-stream',
+      onActivity: null,
+      lastActivity: Date.now(),
+      push: push,
+      end: end,
+      fail: fail,
+      getPiece: getPiece,
+      bufferedBytes: function () { return queuedBytes; },
+      waitingForBytes: function () { return waiters.length > 0; },
+      blockedOnRoom: function () { return roomWaiters.length > 0; }
+    };
+    function poke() {
+      sink.lastActivity = Date.now();
+      if (typeof sink.onActivity === 'function') { try { sink.onActivity(); } catch (e) {} }
+    }
+    function freeRoom() {
+      if (queuedBytes <= STREAM_BUFFER_LOW && roomWaiters.length) {
+        var rs = roomWaiters; roomWaiters = [];
+        rs.forEach(function (r) { r(); });
+      }
+    }
+    function pumpWaiters() {
+      if (!waiters.length) return;
+      var pending = waiters; waiters = [];
+      pending.forEach(function (w) { tryTake(w); });
+    }
+    // Try to satisfy one waiting getPiece; re-queue it when the
+    // bytes are not there yet and the stream has not ended.
+    function tryTake(w) {
+      if (streamErr) { w.reject(streamErr); return; }
+      var fromLast = 0;
+      if (w.start < bufStart) {
+        // A rewind into the piece just served (Google confirmed
+        // only part of it): serve its tail from the kept copy.
+        if (!lastPiece || w.start < lastPiece.start ||
+            w.start >= lastPiece.start + lastPiece.bytes.length) {
+          w.reject(new Error('Upload stream cannot go back that far.'));
+          return;
+        }
+        fromLast = Math.min(w.len, lastPiece.start + lastPiece.bytes.length - w.start);
+      }
+      var fromQueue = w.len - fromLast;
+      var queueStart = Math.max(w.start, bufStart);
+      var available = bufStart + queuedBytes - queueStart;
+      if (available < fromQueue) {
+        if (ended) { w.reject(new Error('Upload stream ended early.')); return; }
+        waiters.push(w);
+        return;
+      }
+      // Drop any bytes before the requested start (cannot happen in
+      // the sequential flow; kept only so the accounting stays exact).
+      var gap = queueStart - bufStart;
+      if (gap > 0) {
+        var g = gap;
+        while (g > 0 && queue.length) {
+          var h = queue[0];
+          if (h.length <= g) { queue.shift(); g -= h.length; }
+          else { queue[0] = h.subarray(g); g = 0; }
+        }
+        queuedBytes -= gap;
+        bufStart = queueStart;
+      }
+      // Assemble the piece: tail of the last piece (rewind) plus
+      // bytes taken off the front of the queue. At most one upload
+      // piece (8 MB) is copied here, never the whole file.
+      var out = new Uint8Array(w.len);
+      var at = 0;
+      if (fromLast > 0) {
+        out.set(lastPiece.bytes.subarray(w.start - lastPiece.start,
+          w.start - lastPiece.start + fromLast), 0);
+        at = fromLast;
+      }
+      var need = fromQueue;
+      var consumed = 0;
+      while (need > 0) {
+        var head = queue[0];
+        var take = Math.min(need, head.length);
+        out.set(head.subarray(0, take), at);
+        at += take; need -= take; consumed += take;
+        if (take >= head.length) queue.shift();
+        else queue[0] = head.subarray(take);
+      }
+      bufStart += consumed;
+      queuedBytes -= consumed;
+      lastPiece = { start: w.start, bytes: out };
+      poke();
+      freeRoom();
+      w.resolve(new Blob([out]));
+    }
+    // Store one worker chunk. Resolves at once while the queue is
+    // under the cap, otherwise when consumption has freed room —
+    // the caller acks the worker only on resolution, which is the
+    // backpressure that bounds main-thread memory.
+    function push(chunk) {
+      if (streamErr) return Promise.reject(streamErr);
+      if (!chunk || !chunk.length) return Promise.resolve();
+      queue.push(chunk);
+      queuedBytes += chunk.length;
+      poke();
+      pumpWaiters();
+      if (queuedBytes <= STREAM_BUFFER_MAX) return Promise.resolve();
+      return new Promise(function (res) { roomWaiters.push(res); });
+    }
+    function end() {
+      ended = true;
+      pumpWaiters();
+    }
+    function fail(err) {
+      streamErr = err || new Error('Upload stream failed.');
+      ended = true;
+      var rs = roomWaiters; roomWaiters = [];
+      rs.forEach(function (r) { r(); });
+      pumpWaiters();
+    }
+    function getPiece(start, end) {
+      return new Promise(function (resolve, reject) {
+        var len = end - start;
+        if (len <= 0) { reject(new Error('Bad upload piece.')); return; }
+        if (streamErr) { reject(streamErr); return; }
+        tryTake({ start: start, len: len, resolve: resolve, reject: reject });
+      });
+    }
+    return sink;
+  }
+
+  function extractArchive(blob, type, title, onProgress, onFile, streamFile) {
     var base = 'assets/emulatorjs/data/compression/';
     var scriptPromise;
     if (type === '7z') {
@@ -1548,23 +1745,48 @@
           // extracted file as one structured-clone copy. Installed
           // here, before unrar runs; rec() calls the global
           // postMessage, so it goes through this wrapper.
+          // v1.5.0: one chunk at a time, waiting for the main
+          // thread's t:6 ack (see WORKER_SHIM) — the tight loop
+          // queued a whole ~500 MB file in the main thread's
+          // message port before it was consumed. t:1 is held until
+          // the chunk queue drains, so it still means "every byte
+          // delivered".
           'var __origPostMessage = self.postMessage.bind(self);\n' +
           'var __FILE_CHUNK = 4 * 1024 * 1024;\n' +
+          'var __chunkJobs = [];\n' +
+          'var __chunkBusy = false;\n' +
+          'var __t1Pending = false;\n' +
+          'function __sendNextChunk() {\n' +
+          '  if (!__chunkJobs.length) {\n' +
+          '    __chunkBusy = false;\n' +
+          '    if (__t1Pending) { __t1Pending = false; __origPostMessage({ t: 1 }); }\n' +
+          '    return;\n' +
+          '  }\n' +
+          '  var job = __chunkJobs[0];\n' +
+          '  if (job.next >= job.total) { __chunkJobs.shift(); __sendNextChunk(); return; }\n' +
+          '  var i = job.next++;\n' +
+          '  var off = i * __FILE_CHUNK;\n' +
+          '  var chunk = job.data.slice(off, Math.min(job.data.length, off + __FILE_CHUNK));\n' +
+          '  __chunkBusy = true;\n' +
+          '  __origPostMessage({ t: 5, file: job.file, size: job.size, index: i, total: job.total, offset: off, data: chunk }, [chunk.buffer]);\n' +
+          '}\n' +
+          'function __ackChunk() { if (!__chunkBusy) return; __chunkBusy = false; __sendNextChunk(); }\n' +
           'self.postMessage = function (msg) {\n' +
+          '  if (msg && msg.t === 1) {\n' +
+          '    if (__chunkJobs.length || __chunkBusy) { __t1Pending = true; return; }\n' +
+          '    __origPostMessage(msg);\n' +
+          '    return;\n' +
+          '  }\n' +
           '  if (msg && msg.t === 2 && msg.data && msg.data.length > __FILE_CHUNK) {\n' +
-          '    var data = msg.data;\n' +
-          '    var total = Math.ceil(data.length / __FILE_CHUNK);\n' +
-          '    for (var i = 0; i < total; i++) {\n' +
-          '      var off = i * __FILE_CHUNK;\n' +
-          '      var chunk = data.slice(off, Math.min(data.length, off + __FILE_CHUNK));\n' +
-          '      __origPostMessage({ t: 5, file: msg.file, size: msg.size || data.length, index: i, total: total, offset: off, data: chunk }, [chunk.buffer]);\n' +
-          '    }\n' +
+          '    __chunkJobs.push({ data: msg.data, file: msg.file, size: msg.size || msg.data.length, total: Math.ceil(msg.data.length / __FILE_CHUNK), next: 0 });\n' +
+          '    if (!__chunkBusy) __sendNextChunk();\n' +
           '    return;\n' +
           '  }\n' +
           '  __origPostMessage(msg);\n' +
           '};\n' +
           'onmessage = function(data) {\n' +
           '  var d = data.data;\n' +
+          '  if (d && d.t === 6) { __ackChunk(); return; }\n' +
           '  var p = (d && typeof d.arrayBuffer === "function") ? d.arrayBuffer().then(function(b){ return new Uint8Array(b); }) : Promise.resolve(d);\n' +
           '  p.then(function(bytes){ dataToPass.push({ name: "test.rar", content: bytes }); dataResolve(); });\n' +
           '};\n';
@@ -1600,17 +1822,47 @@
         // (no file, no progress, no done) for 60 s, it is stuck
         // and the player must say so instead of sitting on
         // "Extracting..." forever. Any message resets the timer.
+        // v1.5.0: once t:1 has arrived, every byte is delivered and
+        // the stall watchdog must not fire while uploads finish.
+        var extractionDone = false;
+        // v1.5.0: the sink whose upload is currently in flight, if
+        // any. While one is active the watchdog must tell a stuck
+        // worker apart from a slow upload: it only fails when the
+        // upload is waiting for bytes, nothing is buffered, the
+        // worker is not throttled on room, and nothing has moved
+        // for 60 s. In every other active-stream state (bytes
+        // buffered, worker throttled, activity recent) it re-arms
+        // and the uploader's own pause/resume owns the stall.
+        var activeStream = null;
         function armStallTimer() {
+          if (extractionDone) return;
           if (stallTimer !== null) clearTimeout(stallTimer);
           stallTimer = setTimeout(function () {
+            if (activeStream && (!activeStream.waitingForBytes() ||
+                activeStream.blockedOnRoom() || activeStream.bufferedBytes() > 0 ||
+                Date.now() - activeStream.lastActivity < 60000)) {
+              armStallTimer();
+              return;
+            }
             finish(new Error('Extracting ' + title + ' stalled.'));
           }, 60000);
+        }
+        // v1.5.0: the worker's job ends the moment t:1 arrives — all
+        // bytes are delivered by then — so terminate it there instead
+        // of keeping it alive (archive + extracted tree, ~670 MB for
+        // a ~500 MB game) through the whole upload/send that follows.
+        // finish() still waits for the chain before resolving.
+        var workerTerminated = false;
+        function terminateWorker() {
+          if (workerTerminated) return;
+          workerTerminated = true;
+          try { worker.terminate(); } catch (e) {}
         }
         function finish(err, result) {
           if (done) return;
           done = true;
           if (stallTimer !== null) clearTimeout(stallTimer);
-          try { worker.terminate(); } catch (e) {}
+          terminateWorker();
           if (err) reject(err); else resolve(result);
         }
         worker.onmessage = function (e) {
@@ -1639,15 +1891,22 @@
             }
           } else if (d.t === 5) {
             // A large file, chunked by the worker into 4 MB pieces
-            // (v1.4.15): copy each piece into a destination buffer
-            // preallocated at the file's full size, so the pieces
-            // never sit alongside a second whole copy. When the
-            // last piece lands, the file goes through exactly the
-            // same onFile path as a t:2 file — including the .cue
-            // hold-back, which never applies here (cues are tiny
-            // and always arrive as t:2). The chunk buffers are
-            // freed once copied in; the destination is freed by
-            // onFile once sent, exactly as before.
+            // (v1.4.15). With a streamFile (v1.5.0, prepare path),
+            // the chunks flow through a byte-stream sink straight
+            // into the Drive upload — never reassembled, never a
+            // whole-file Blob — and the worker is acked (t:6) only
+            // once the sink has room, which bounds the main thread
+            // to ~16 MB of this file plus one 8 MB upload piece.
+            // Without one (the play path), the old behaviour stands:
+            // copy each piece into a destination buffer preallocated
+            // at the file's full size, so the pieces never sit
+            // alongside a second whole copy. When the last piece
+            // lands, the file goes through exactly the same onFile
+            // path as a t:2 file — including the .cue hold-back,
+            // which never applies here (cues are tiny and always
+            // arrive as t:2). The chunk buffers are freed once
+            // copied in; the destination is freed by onFile once
+            // sent, exactly as before.
             var cname = d.file;
             var pend = pendingFiles[cname];
             if (!pend) {
@@ -1655,9 +1914,47 @@
                 finish(new Error('Could not unpack ' + title + '.'));
                 return;
               }
-              pend = { size: d.size, total: d.total, received: 0, dest: new Uint8Array(d.size) };
-              pendingFiles[cname] = pend;
               catalog[cname] = { size: d.size, bytes: null };
+              var sink = null;
+              if (typeof streamFile === 'function') {
+                try { sink = streamFile(cname, d.size); } catch (e) { finish(e); return; }
+              }
+              if (sink) {
+                pend = { size: d.size, total: d.total, received: 0, sink: sink };
+                pendingFiles[cname] = pend;
+                // The upload runs serialized behind earlier files'
+                // work, exactly like onFile did. activeStream marks
+                // it for the stall watchdog (above), which stays
+                // armed through the upload and tells a stuck worker
+                // apart from a slow one instead of being suspended.
+                (function (s) {
+                  chain = chain.then(function () {
+                    activeStream = s;
+                    return Promise.resolve(s.startUpload()).then(function (r) {
+                      activeStream = null;
+                      return r;
+                    }, function (err) {
+                      activeStream = null;
+                      throw err;
+                    });
+                  }).catch(function (err) { finish(err); });
+                })(sink);
+              } else {
+                pend = { size: d.size, total: d.total, received: 0, dest: new Uint8Array(d.size) };
+                pendingFiles[cname] = pend;
+              }
+            }
+            if (pend.sink) {
+              var isLastChunk = (d.index === pend.total - 1);
+              pend.received++;
+              if (isLastChunk) delete pendingFiles[cname];
+              (function (chunk, idx, last, p) {
+                Promise.resolve(p.sink.push(chunk)).then(function () {
+                  if (last) { try { p.sink.end(); } catch (e) {} }
+                  try { worker.postMessage({ t: 6, file: cname, index: idx }); } catch (e) {}
+                }, function (err) { finish(err); });
+              })(d.data, d.index, isLastChunk, pend);
+              return;
             }
             var off = (typeof d.offset === 'number') ? d.offset : d.index * 4194304;
             pend.dest.set(d.data, off);
@@ -1680,8 +1977,12 @@
             // Extraction is done: the stall watchdog no longer
             // applies (the remaining work is sending, which has its
             // own per-chunk timeouts). Resolve once the last file's
-            // send has finished.
+            // send has finished. v1.5.0: the worker is terminated
+            // here, the moment its bytes are all delivered, rather
+            // than kept alive through the uploads that follow.
+            extractionDone = true;
             if (stallTimer !== null) { clearTimeout(stallTimer); stallTimer = null; }
+            terminateWorker();
             chain.then(function () { finish(null, catalog); }).catch(function (err) { finish(err); });
           }
         };
@@ -2179,6 +2480,27 @@
         });
       };
     }
+    // v1.5.0: the streaming upload for one large extracted file.
+    // Returns the byte-stream sink extractArchive feeds chunk by
+    // chunk; the sink's startUpload runs the resumable upload
+    // (uploadWithProgressFromSource) serialized behind earlier
+    // files, pulling one 8 MB piece at a time, and records the file
+    // in Drive when it lands. The main thread never holds the whole
+    // file: at most ~16 MB buffered in the sink plus one 8 MB piece.
+    // The 25/50/75% marks and the "Uploading ... now." announcement
+    // are unchanged — the uploader announces the marks itself
+    // (report()) and the callback above mirrors them onto the
+    // status line, exactly as the Blob path did.
+    function createDriveUploadStream(entryName, size) {
+      var driveName = unpackedDriveName(recId, entryName);
+      var sink = createByteStreamSink(size);
+      sink.startUpload = function () {
+        return uploadWithProgressFromSource(driveName, sink, title, uploadProgressCallback()).then(function (fileId) {
+          uploaded.push({ name: baseNameOf(entryName), size: size, fileId: fileId });
+        });
+      };
+      return sink;
+    }
     var blobPromise = blob ? Promise.resolve(blob) : resolveGameBlob(driveRecordToGame(rec), function () {});
     return blobPromise.then(function (got) {
       if (!got) throw new Error('Could not load ' + title + '.');
@@ -2210,8 +2532,11 @@
           // The .cue is tiny and held: it is rewritten to the real
           // entry basenames (the v1.4.13 case fix) once every name
           // is known, and uploaded after extraction. Every other
-          // file goes up the moment it arrives, so at most one
-          // extracted file is live here at a time.
+          // SMALL file (4 MB or under, arriving whole as t:2) goes
+          // up the moment it arrives, so at most one extracted file
+          // is live here at a time. Large files never reach this
+          // callback — they stream through the streamFile sink
+          // below (v1.5.0), which is the backfill crash fix.
           if (extOf(name) === 'cue') return 'hold';
           // v1.4.17: the upload starts here, and the first 25% of a
           // ~500 MB file is a long silence on a slow connection —
@@ -2229,6 +2554,23 @@
           return uploadWithProgress(driveName, fileBlob, title, uploadProgressCallback()).then(function (fileId) {
             uploaded.push({ name: baseNameOf(name), size: size, fileId: fileId });
           });
+        }, function (name, size) {
+          // v1.5.0: large files (over 4 MB, arriving as t:5 chunks)
+          // stream to Drive through a byte-stream sink instead of
+          // arriving whole here — this is the backfill crash fix.
+          // .cue sheets are tiny and always arrive as t:2, so they
+          // never reach this callback; the null return is only a
+          // safety net (a null falls back to the old reassembly).
+          // The "Uploading ... now." announcement fires here, at the
+          // first chunk of the first large file, exactly where
+          // onFile used to fire it.
+          if (extOf(name) === 'cue') return null;
+          if (!uploadStartAnnounced) {
+            uploadStartAnnounced = true;
+            setTvPrepStatus('Getting ' + title + ' ready for the TV — uploading.');
+            announce('Uploading ' + title + ' now.');
+          }
+          return createDriveUploadStream(name, size);
         }).then(function (catalog) {
           var picked = pickUnpackedMain(system, catalog);
           if (!picked) {
@@ -3070,6 +3412,25 @@
     });
   }
 
+  // v1.5.0: the same resumable upload, fed by a pull source instead
+  // of a Blob — the prepare path's byte-stream sink. A source is
+  // { size, type, getPiece(start, end) -> Promise<Blob>,
+  // onActivity } (see createByteStreamSink): the uploader pulls one
+  // 8 MB piece at a time and never holds the whole file. There is
+  // no single-shot fallback here — a stream has no whole file to
+  // send in one request, so a session that cannot be opened fails
+  // loudly instead of silently falling back to the crash path.
+  function uploadWithProgressFromSource(fileName, source, title, onProgress) {
+    return ensureDriveFolder().then(function () {
+      return ensureDriveToken();
+    }).then(function () {
+      return openUploadSession(fileName, source);
+    }).then(function (sessionUri) {
+      if (!sessionUri) return Promise.reject(new Error('Could not start the upload. Try again.'));
+      return uploadResumableSource(sessionUri, fileName, source, title, onProgress);
+    });
+  }
+
   // Open a resumable-upload session. Resolves the session address, or
   // null when the address cannot be read (fallback trigger). Rejects
   // for a real failure such as the sign-in being gone.
@@ -3105,9 +3466,27 @@
 
   // Send the file piece by piece to an open session. Pauses on any
   // drop or stall and resumes from the last piece Google confirmed.
+  // Kept as the Blob entry point: it wraps the Blob as a pull
+  // source and hands off to uploadResumableSource, which is the
+  // real loop. Behaviour for Blob callers is unchanged.
   function uploadResumable(sessionUri, fileName, file, title, onProgress) {
+    return uploadResumableSource(sessionUri, fileName, {
+      size: file.size,
+      type: file.type || 'application/octet-stream',
+      getPiece: function (start, end) { return Promise.resolve(file.slice(start, end)); }
+    }, title, onProgress);
+  }
+
+  // The resumable-upload loop, fed by a pull source
+  // { size, type, getPiece(start, end) -> Promise<Blob>,
+  // onActivity }: getPiece is async, so a streaming source can wait
+  // for bytes that have not arrived yet, while a Blob source
+  // answers at once. Pieces stay sequential — one in flight — so a
+  // resume can only ever rewind into the piece just sent, which a
+  // streaming source keeps for exactly that.
+  function uploadResumableSource(sessionUri, fileName, source, title, onProgress) {
     return new Promise(function (resolve, reject) {
-      var total = file.size;
+      var total = source.size;
       var confirmed = 0; // bytes Google has confirmed receiving
       var lastMilestone = 0;
       var paused = false;
@@ -3117,6 +3496,11 @@
       var retryTimer = null;
       var stallTimer = null;
       var lastMove = Date.now();
+      // v1.5.0: a streaming source reports activity as bytes arrive,
+      // so a slow extraction does not look like a stalled upload.
+      if (source && typeof source === 'object') {
+        try { source.onActivity = function () { lastMove = Date.now(); }; } catch (e) {}
+      }
       var authTries = 0;
       var rejectFn = reject;
 
@@ -3202,7 +3586,7 @@
         if (cancelled) return;
         lastMove = Date.now();
         if (sessionGone) {
-          openUploadSession(fileName, file).then(function (uri) {
+          openUploadSession(fileName, source).then(function (uri) {
             if (cancelled) return;
             if (!uri) { finishErr(new Error('The upload session expired. Try adding the game again.')); return; }
             sessionUri = uri;
@@ -3257,12 +3641,18 @@
           return;
         }
         lastMove = Date.now();
-        var end = Math.min(confirmed + RESUMABLE_CHUNK, total);
-        var piece = file.slice(confirmed, end);
-        var xhr = new XMLHttpRequest();
-        currentXhr = xhr;
-        xhr.open('PUT', sessionUri);
-        xhr.setRequestHeader('Content-Type', file.type || 'application/octet-stream');
+        var end = Math.min(confirmed + (source.chunkSize || RESUMABLE_CHUNK), total);
+        // v1.5.0: the piece is pulled, not sliced — a streaming
+        // source waits here for bytes still being extracted, while a
+        // Blob source answers at once. The rest of the send is
+        // unchanged, inside the pull's callback.
+        source.getPiece(confirmed, end).then(function (piece) {
+          if (cancelled) return;
+          lastMove = Date.now();
+          var xhr = new XMLHttpRequest();
+          currentXhr = xhr;
+          xhr.open('PUT', sessionUri);
+          xhr.setRequestHeader('Content-Type', source.type || 'application/octet-stream');
         xhr.setRequestHeader('Content-Range', 'bytes ' + confirmed + '-' + (end - 1) + '/' + total);
         xhr.upload.onprogress = function (e) {
           lastMove = Date.now();
@@ -3299,10 +3689,11 @@
             finishErr(new Error((detail.error && detail.error.message) || ('Cloud upload failed, status ' + xhr.status + '.')));
           }
         };
-        xhr.onerror = function () { currentXhr = null; if (!cancelled) pause(); };
-        xhr.ontimeout = function () { currentXhr = null; if (!cancelled) pause(); };
-        xhr.timeout = 0;
-        xhr.send(piece);
+          xhr.onerror = function () { currentXhr = null; if (!cancelled) pause(); };
+          xhr.ontimeout = function () { currentXhr = null; if (!cancelled) pause(); };
+          xhr.timeout = 0;
+          xhr.send(piece);
+        }, function (err) { if (!cancelled) finishErr(err); });
       }
 
       stallTimer = setInterval(function () {

@@ -275,6 +275,12 @@ static EGLContext g_context = EGL_NO_CONTEXT;
 static pthread_mutex_t g_gl_mutex = PTHREAD_MUTEX_INITIALIZER;
 static struct retro_hw_render_callback g_hw;
 static bool g_hw_active;
+/* The context version create_gl_context_locked really created (2 or
+ * 3). Declared here (v1.5.0) so the crash handler below can name it
+ * — it used to live with prewarm_gl, after the handler. The ES3 set
+ * is only checked on a real ES3 context: on an ES2 context those
+ * names legitimately resolve to NULL. */
+static int g_gl_actual_version = 2;
 static int g_hw_gl_version = 2;
 /* Deferred context_reset (v1.4.9): context_reset must run AFTER
  * retro_load_game returns, once the core's first_context_reset is
@@ -527,6 +533,17 @@ static void crash_handler(int sig, siginfo_t *info, void *ucontext) {
         crash_write_hex(info ? (uintptr_t)info->si_addr : 0);
         crash_write_str("\ncore ");
         crash_write_str(g_crash_core[0] ? g_crash_core : "(none)");
+        /* v1.5.0: name the GLES version actually created alongside
+           the core, so a future failure reads e.g. "mupen GLES3".
+           g_hw_active is only true once the context exists, so a
+           crash before any context was created carries no version
+           (rather than a misleading default). Folded into the
+           "core" line because MainActivity's crash-summary parser
+           displays that line and ignores unknown ones. */
+        if (g_hw_active) {
+            crash_write_str(" GLES");
+            crash_write_dec(g_gl_actual_version);
+        }
         crash_write_str("\ntitle ");
         crash_write_str(g_title[0] ? g_title : "(none)");
         crash_write_str("\nstep ");
@@ -891,11 +908,8 @@ static bool prewarm_syms(const char **syms, size_t count) {
     return true;
 }
 
-/* The context version create_gl_context_locked really created (2 or
- * 3 — the ES3 request falls back to ES2 when the device has no ES3
- * config). The ES3 set is only checked on a real ES3 context: on an
- * ES2 context those names legitimately resolve to NULL. */
-static int g_gl_actual_version = 2;
+/* The context version create_gl_context_locked really created is in
+ * g_gl_actual_version (declared with the EGL state above, v1.5.0). */
 
 static bool prewarm_gl(void) {
     if (!prewarm_syms(PREWARM_SYMS_ES2,
@@ -1044,6 +1058,17 @@ static bool handle_set_hw_render(void *data) {
     switch (cb->context_type) {
         case RETRO_HW_CONTEXT_OPENGLES2:
             version = 2;
+            break;
+        case RETRO_HW_CONTEXT_OPENGL_CORE:
+            /* v1.5.0: desktop GL 3.x core profile — the closest
+               this bridge can build is an ES 3.0 context. The
+               shipped Mupen GLES3 build asks for OPENGLES3
+               (verified by disassembly of its .so: glsm stores 4,
+               RETRO_HW_CONTEXT_OPENGLES3, into the hw_render
+               struct), so this case never fires for it; it is a
+               safety net for a core that asks for a core profile
+               instead of failing it cleanly. */
+            version = 3;
             break;
         case RETRO_HW_CONTEXT_OPENGLES3:
             version = 3;

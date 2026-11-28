@@ -36,8 +36,8 @@ import java.util.concurrent.atomic.AtomicLong
 /**
  * Native Nintendo 64 player (milestone M1 of the native-player project).
  *
- * Runs the prebuilt N64 libretro core (parallel_n64 only — Mupen
- * was dropped in v1.4.13) as real ARM code through a
+ * Runs a prebuilt N64 libretro core (v1.5.0: Mupen64Plus-Next
+ * GLES3 first, Parallel N64 as fallback) as real ARM code through a
  * custom JNI bridge (lynxos_n64_jni.c) with EGL: the core renders
  * straight into this Activity's SurfaceView. libretro-kmp cannot run
  * N64 cores — it has no hardware-render support — so this player does
@@ -66,11 +66,16 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
     companion object {
         const val EXTRA_GAME_PATH = "gamePath"
         const val EXTRA_GAME_TITLE = "gameTitle"
-        const val EXTRA_CORE = "core" // "parallel" only (v1.4.13: Mupen dropped; any other value coerces to Parallel)
+        const val EXTRA_CORE = "core" // "mupen" (first choice, v1.5.0) or "parallel" (fallback); any other value coerces to Mupen
         private const val TAG = "LynxosN64"
+        private const val CORE_MUPEN_ASSET = "native/mupen64plus_next_gles3_libretro_android.so"
+        private const val CORE_MUPEN_NAME = "mupen64plus_next_gles3_libretro_android.so"
         private const val CORE_PARALLEL_ASSET = "native/parallel_n64_libretro_android.so"
         private const val CORE_PARALLEL_NAME = "parallel_n64_libretro_android.so"
-        private const val CORE_VERSION = "1"
+        // v1.5.0: bumped so a stale v1.4.12-era core file already in
+        // native-cores is re-copied from assets on the next launch
+        // of that core.
+        private const val CORE_VERSION = "2"
         private const val BACK_HOLD_EXIT_MS = 500L
         private const val START_WATCHDOG_MS = 30_000L
         private const val VIDEO_CHECK_MS = 5_000L
@@ -455,13 +460,27 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         super.onCreate(savedInstanceState)
         gameTitle = intent.getStringExtra(EXTRA_GAME_TITLE) ?: "game"
         val gamePath = intent.getStringExtra(EXTRA_GAME_PATH)
-        // Parallel-only (v1.4.13): Mupen was dropped. Any "core"
-        // extra that is not Parallel coerces to Parallel — the last
-        // line of defense (MainActivity also forces "parallel" and
-        // the page lost the picker).
-        val coreChoice = when (intent.getStringExtra(EXTRA_CORE)) {
+        // v1.5.0: Mupen first, Parallel fallback. MainActivity sends
+        // "mupen" (first choice) or "parallel"; anything else
+        // coerces to Mupen.
+        val requestedCore = when (intent.getStringExtra(EXTRA_CORE)) {
             "parallel" -> "parallel"
-            else -> "parallel"
+            else -> "mupen"
+        }
+        // Next-launch fallback (v1.5.0): if the previous launch of
+        // this game on Mupen died silently (native crash — the
+        // process died, so no outcome was ever reported), start
+        // with Parallel this time. The MainActivity launch marker
+        // cannot be used here: it is overwritten with THIS launch
+        // before the player starts, and the page clears the
+        // Last-game line before launching — so the player keeps its
+        // own attempt record (see recordCoreAttempt /
+        // previousLaunchDiedSilently). A clean exit or a reported
+        // outcome clears it; only a silent death leaves it behind.
+        var coreChoice = requestedCore
+        if (requestedCore == "mupen" && previousLaunchDiedSilently("mupen", gameTitle)) {
+            Log.i(TAG, "previous Mupen launch of $gameTitle died silently; starting with Parallel")
+            coreChoice = "parallel"
         }
         if (gamePath.isNullOrEmpty()) {
             Toast.makeText(this, "No game file to play.", Toast.LENGTH_LONG).show()
@@ -532,20 +551,45 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 if (!surfaceReady.await(5, TimeUnit.SECONDS)) {
                     throw IllegalStateException("The game screen was not ready.")
                 }
-                setLoadStage("copying the game core")
-                val coreFile = ensureCoreFile(coreChoice)
-                val systemDir = File(filesDir, "native-system").apply { mkdirs() }.absolutePath
-                val saveDir = File(filesDir, "native-saves").apply { mkdirs() }.absolutePath
-                setLoadStage("loading the game core")
-                if (!nativeLoadCore(coreFile.absolutePath, systemDir, saveDir)) {
-                    throw IllegalStateException(lastErrorOr("The Nintendo 64 game core could not be loaded."))
+                // v1.5.0: Mupen first, Parallel fallback IN-PROCESS.
+                // A core that fails cleanly (copy / load / options /
+                // game load) is torn down (nativeClose + nativeInit —
+                // nativeClose drops the JNI activity ref, so the
+                // retry re-inits) and the other core is tried in the
+                // same launch. A native crash kills the process, so
+                // it cannot fall back here — the next launch reads
+                // the attempt record instead (see onCreate).
+                val attempts = if (coreChoice == "mupen") listOf("mupen", "parallel") else listOf("parallel")
+                var loadedCore: String? = null
+                var lastReason = ""
+                for (core in attempts) {
+                    if (tryLoadCore(core, gamePath)) {
+                        loadedCore = core
+                        break
+                    }
+                    lastReason = lastErrorOr("")
+                    if (core != attempts.last()) {
+                        val next = attempts[attempts.indexOf(core) + 1]
+                        Log.i(TAG, coreDisplay(core) + " failed (" + lastReason + "); falling back to " + coreDisplay(next))
+                        speakAndToast(coreDisplay(core) + " could not start this game. Trying " + coreDisplay(next) + ".")
+                        try {
+                            nativeClose()
+                        } catch (e: Exception) {
+                            Log.w(TAG, "close after failed core", e)
+                        }
+                        if (!nativeInit(this)) {
+                            lastReason = lastErrorOr("The Nintendo 64 player could not start.")
+                            break
+                        }
+                    }
                 }
-                setLoadStage("setting game options")
-                applyCoreOptions(coreChoice)
-                setLoadStage("loading the game")
-                if (!nativeLoadGame(gamePath, gameTitle)) {
-                    throw IllegalStateException(lastErrorOr("The game could not be loaded."))
-                }
+                val effectiveCore = loadedCore ?: throw IllegalStateException(
+                    if (attempts.size > 1) {
+                        "Mupen and Parallel could not start the game." + if (lastReason.isNotEmpty()) " $lastReason" else ""
+                    } else {
+                        lastErrorOr("The game could not be loaded.")
+                    }
+                )
                 // The game's real picture shape is known now (AV
                 // geometry); re-fit the screen to it. Most games are
                 // 4:3, the default used for the first fit, so this
@@ -560,7 +604,11 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
                 val fps = nativeGetFps().let { if (it > 0) it else 60.0 }
                 val sampleRate = nativeGetSampleRate().let { if (it > 0) it.toInt() else 44100 }
                 runOnUiThread { startAudio(sampleRate) }
-                speak("Now playing $gameTitle, Nintendo 64. " + controlSummary())
+                // Name the core aloud only when a fallback picked it
+                // (in-process or next-launch): a plain Mupen launch
+                // speaks exactly as before.
+                val fellBack = effectiveCore != requestedCore
+                speak("Now playing $gameTitle, Nintendo 64" + (if (fellBack) ", " + coreDisplay(effectiveCore) + " core" else "") + ". " + controlSummary())
                 running.set(true)
                 setLoadStage("running")
                 mainHandler.removeCallbacks(startWatchdog)
@@ -722,15 +770,93 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         pendingSpeak = text
     }
 
+    /** Display name for a core id ("mupen" -> "Mupen"), used in
+     * spoken / reported outcomes so a failure names the core tried. */
+    private fun coreDisplay(core: String): String {
+        return if (core == "mupen") "Mupen" else "Parallel"
+    }
+
+    // Next-launch fallback record (v1.5.0): "core|title|timeMillis"
+    // in the same "lynxos-retro" prefs the player already uses for
+    // its load-stage / bridge-step breadcrumbs. Written when a core
+    // attempt starts, cleared on any clean end (finishPlayer — a
+    // reported outcome always ends there). Only a silent death
+    // (native crash: the process dies, finishPlayer never runs)
+    // leaves it behind, so its presence means "the previous launch
+    // of this game on this core died without saying anything". The
+    // title sits between the first and last "|" so a "|" inside a
+    // game title cannot break the parse.
+    private fun recordCoreAttempt(core: String) {
+        try {
+            getSharedPreferences("lynxos-retro", MODE_PRIVATE).edit()
+                .putString("n64LastCoreAttempt", "$core|$gameTitle|${System.currentTimeMillis()}").apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun clearCoreAttempt() {
+        try {
+            getSharedPreferences("lynxos-retro", MODE_PRIVATE).edit()
+                .remove("n64LastCoreAttempt").apply()
+        } catch (e: Exception) {
+        }
+    }
+
+    private fun previousLaunchDiedSilently(core: String, title: String): Boolean {
+        return try {
+            val rec = getSharedPreferences("lynxos-retro", MODE_PRIVATE)
+                .getString("n64LastCoreAttempt", null) ?: return false
+            val firstPipe = rec.indexOf('|')
+            val lastPipe = rec.lastIndexOf('|')
+            firstPipe > 0 && lastPipe > firstPipe &&
+                rec.substring(0, firstPipe) == core &&
+                rec.substring(firstPipe + 1, lastPipe) == title
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** One load attempt with one core: copy the .so, load it, set
+     * its options, load the game. Returns false on any clean
+     * failure (the reason is in nativeGetLastError); a native crash
+     * kills the process instead of returning. Any Throwable from
+     * the copy or the option calls is a clean failure too, so the
+     * caller can fall back to the other core. */
+    private fun tryLoadCore(core: String, gamePath: String): Boolean {
+        return try {
+            setLoadStage("copying the " + coreDisplay(core) + " game core")
+            val coreFile = ensureCoreFile(core)
+            recordCoreAttempt(core)
+            val systemDir = File(filesDir, "native-system").apply { mkdirs() }.absolutePath
+            val saveDir = File(filesDir, "native-saves").apply { mkdirs() }.absolutePath
+            setLoadStage("loading the " + coreDisplay(core) + " game core")
+            if (!nativeLoadCore(coreFile.absolutePath, systemDir, saveDir)) {
+                Log.w(TAG, coreDisplay(core) + " core failed to load: " + lastErrorOr(""))
+                return false
+            }
+            setLoadStage("setting " + coreDisplay(core) + " game options")
+            applyCoreOptions(core)
+            setLoadStage("loading the game")
+            if (!nativeLoadGame(gamePath, gameTitle)) {
+                Log.w(TAG, coreDisplay(core) + " game load failed: " + lastErrorOr(""))
+                return false
+            }
+            true
+        } catch (e: Throwable) {
+            Log.w(TAG, coreDisplay(core) + " load attempt failed", e)
+            false
+        }
+    }
+
     /** Copies the bundled core .so from assets to internal storage (dlopen needs a real file). */
     private fun ensureCoreFile(coreChoice: String): File {
-        // Parallel-only (v1.4.13): Mupen dropped. coreChoice is
-        // coerced to "parallel" in onCreate; warn if anything else
-        // ever arrives here.
-        if (coreChoice != "parallel") Log.w(TAG, "ignoring non-Parallel core choice: $coreChoice")
         val dir = File(filesDir, "native-cores")
         dir.mkdirs()
-        val (asset, name) = CORE_PARALLEL_ASSET to CORE_PARALLEL_NAME
+        val (asset, name) = if (coreChoice == "mupen") {
+            CORE_MUPEN_ASSET to CORE_MUPEN_NAME
+        } else {
+            CORE_PARALLEL_ASSET to CORE_PARALLEL_NAME
+        }
         val out = File(dir, name)
         val ver = File(dir, "version.txt")
         val current = try { ver.readText() } catch (e: Exception) { "" }
@@ -747,10 +873,24 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
      * Every key and value below was verified against the core's own
      * libretro_core_options.h and the shipped .so. */
     private fun applyCoreOptions(core: String) {
-        // Parallel-only (v1.4.13): the Mupen branch is gone. `core`
-        // is coerced to "parallel" in onCreate; warn if anything
-        // else ever arrives here.
-        if (core != "parallel") Log.w(TAG, "ignoring non-Parallel core choice: $core")
+        if (core == "mupen") {
+            // v1.5.0: every key and value verified against the
+            // shipped mupen64plus_next_gles3 .so (strings-grep of
+            // the downloaded buildbot file, sha256 41e3733b…) and
+            // upstream libretro_core_options.h. NOTE:
+            // ThreadedRenderer takes "True"/"False" — the core
+            // parses it with strcmp(value, "True") — NOT
+            // "enabled"/"disabled", which would silently parse as
+            // off. There is no "gfxplugin-accuracy" key in Mupen
+            // (that is a Parallel-only key); the fast-plugin lever
+            // here is rdp-plugin gliden64.
+            nativeSetOption("mupen64plus-43screensize", "320x240")
+            nativeSetOption("mupen64plus-rdp-plugin", "gliden64")
+            nativeSetOption("mupen64plus-rsp-plugin", "hle")
+            nativeSetOption("mupen64plus-cpucore", "dynamic_recompiler")
+            nativeSetOption("mupen64plus-ThreadedRenderer", "True")
+            return
+        }
         nativeSetOption("parallel-n64-gfxplugin", "glide64")
         nativeSetOption("parallel-n64-gfxplugin-accuracy", "low")
         nativeSetOption("parallel-n64-rspplugin", "hle")
@@ -1248,6 +1388,11 @@ class NativeN64PlayerActivity : Activity(), SurfaceHolder.Callback {
         // already recorded): clear the launch marker so MainActivity
         // does not announce this return as a silent crash.
         try { MainActivity.clearPlayerLaunchMarker() } catch (e: Exception) { }
+        // v1.5.0: this was a clean end, not a silent death — clear
+        // the core-attempt record so the next launch retries the
+        // first-choice core. A native crash never reaches here, so
+        // its record survives for the next-launch fallback.
+        clearCoreAttempt()
         running.set(false)
         mainHandler.removeCallbacks(exitRunnable)
         mainHandler.removeCallbacks(startWatchdog)
