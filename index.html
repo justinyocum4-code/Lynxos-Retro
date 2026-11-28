@@ -40,6 +40,16 @@
   .game-tag { display: inline-block; font-size: 15px; color: #F5C518; border: 1px solid #F5C518; border-radius: 8px; padding: 2px 8px; margin-top: 8px; }
   .game-note { display: block; font-size: 16px; color: #ffcc66; margin-top: 6px; }
   .actions { margin: 20px 0; }
+  /* TV side menu (v1.4.14, Fix 5): the Menu button is hidden on
+     the tablet, where the top tabs stay. On TV the panel replaces
+     the tabs and the Add / Sync / Account row. */
+  #tvMenuBtn { display: none; }
+  #tvMenuPanel { position: fixed; left: 0; top: 0; bottom: 0; width: min(620px, 88vw); background: #000000; border-right: 3px solid #F5C518; z-index: 60; overflow-y: auto; padding: 28px; }
+  #tvMenuPanel h2 { margin-top: 0; }
+  #tvMenuList { list-style: none; margin: 0 0 16px 0; padding: 0; }
+  #tvMenuList li { margin: 0 0 8px 0; }
+  #tvMenuList button { display: block; width: 100%; text-align: left; margin: 0; }
+  #tvMenuList button[aria-current="true"] { background: #F5C518; color: #000000; font-weight: bold; }
   label { display: block; font-size: 19px; font-weight: bold; margin: 16px 0 6px 0; }
   input[type="text"], input[type="email"], input[type="password"], input[type="url"], select { width: 100%; max-width: 560px; font-size: 19px; padding: 12px; border-radius: 10px; border: 2px solid #888888; background: #1a1a1a; color: #ffffff; }
   input[type="file"] { font-size: 18px; color: #ffffff; }
@@ -68,6 +78,11 @@
   body.tv #libraryScreen:not([hidden]) { display: flex; flex-direction: column; }
   body.tv #libraryScreen .actions { order: -1; }
   body.tv .tv-only { display: block; }
+  /* TV side menu: the Menu button sits top-left; the top tabs and
+     the Add / Sync / Account row are hidden — they live in the panel. */
+  body.tv #tvMenuBtn { display: block; align-self: flex-start; }
+  body.tv #systemTabs { display: none; }
+  body.tv #libraryScreen .actions { display: none; }
   /* Full-screen player on TV: the game fills the whole TV. */
   body.tv #playerScreen:not([hidden]) { position: fixed; inset: 0; z-index: 10; background: #000000; padding: 0; }
   body.tv #playerScreen .actions, body.tv #playerScreen .note { display: none; }
@@ -91,6 +106,7 @@
 
   <!-- Library -->
   <main id="libraryScreen" aria-label="Game library">
+    <button type="button" id="tvMenuBtn">Menu</button>
     <div role="tablist" aria-label="Game systems" id="systemTabs"></div>
     <p id="gameCount" role="status"></p>
     <div id="lastPlayerCloseWrap" hidden>
@@ -119,6 +135,15 @@
     <p class="note">Controls: hold the remote sideways, top to the left. The D-pad moves: right arrow is up, down arrow is forward, left arrow is down, up arrow is back. Channel up is A, channel down is B. Tap OK for Start and pause. Tap Back to roll. Hold Back and press OK for Y, channel up for L, channel down for R. Double tap channel down to hold run on or off. PlayStation: channel up is Cross, channel down is Circle, tap Back is Triangle, hold Back and press OK for Square, channel up for L1, channel down for R1. Hold Back alone for half a second to leave a game. Or pair a Bluetooth gamepad. Quick save is 1, quick load is 2.</p>
     <p class="note">The games included here are free homebrew and public-domain games, released free by their authors. No commercial games are included.</p>
   </main>
+
+  <!-- TV side menu (v1.4.14, Fix 5): the system tabs and the Add /
+       Sync / Account buttons, as a dialog. TV only — the Menu
+       button that opens it is hidden on the tablet. -->
+  <div id="tvMenuPanel" role="dialog" aria-modal="true" aria-label="Menu" hidden>
+    <h2>Menu</h2>
+    <ul role="list" id="tvMenuList"></ul>
+    <button type="button" id="tvMenuCloseBtn">Close menu</button>
+  </div>
 
   <!-- Add a game -->
   <section id="addScreen" hidden aria-label="Add a game">
@@ -641,7 +666,9 @@
       } else if (dir === 'up') {
         var up = nearestCard(ae, 'up');
         ev.preventDefault();
-        if (up) up.focus(); else focusSelectedTab();
+        // On TV the tabs are in the side panel, so Up from the top
+        // row reaches the Menu button instead of a hidden tab.
+        if (up) up.focus(); else if (IS_TV) focusTvMenuBtn(); else focusSelectedTab();
       } else if (dir === 'down') {
         var down = nearestCard(ae, 'down');
         if (down) { ev.preventDefault(); down.focus(); }
@@ -705,6 +732,7 @@
       });
       tabs.appendChild(b);
     });
+    buildTvMenu();
     var sel = $('addSystem');
     sel.innerHTML = '';
     SYSTEMS.filter(function (s) { return s.id !== 'all'; }).forEach(function (sys) {
@@ -729,6 +757,92 @@
     renderList();
     var count = filteredGames().length;
     announce(systemLabel(id) + ' games. ' + count + (count === 1 ? ' game.' : ' games.'));
+  }
+
+  // ---------- TV side menu (v1.4.14, Fix 5) ----------
+
+  // On TV the library's navigation — the system tabs across the top
+  // plus Add a game / Sync now / Account — lives in a side panel
+  // opened from a Menu button, following the Lynxos Store's TV
+  // side-menu pattern: a real visible Menu button top-left, the menu
+  // as a proper dialog TalkBack can reach (role="dialog",
+  // aria-modal, inert background while open, open/close announced
+  // via the live region), list semantics, scroll-into-view on focus,
+  // and no focus yanks (focus only moves on the user's own open or
+  // close action, never on a background update). The tablet keeps
+  // the top tabs exactly as they are.
+  function tvMenuOpen() {
+    return !$('tvMenuPanel').hidden;
+  }
+  function buildTvMenu() {
+    if (!IS_TV) return;
+    var list = $('tvMenuList');
+    list.innerHTML = '';
+    SYSTEMS.forEach(function (sys) {
+      var li = document.createElement('li');
+      li.setAttribute('role', 'listitem');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = sys.label;
+      if (sys.id === currentTab) b.setAttribute('aria-current', 'true');
+      b.addEventListener('click', function () {
+        closeTvMenu(false, true);
+        selectTab(sys.id);
+      });
+      b.addEventListener('focus', function () {
+        try { b.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+      });
+      li.appendChild(b);
+      list.appendChild(li);
+    });
+    [
+      { label: 'Add a game', run: goAddGame },
+      { label: 'Sync now', run: doSync },
+      { label: 'Account', run: goAccount }
+    ].forEach(function (item) {
+      var li = document.createElement('li');
+      li.setAttribute('role', 'listitem');
+      var b = document.createElement('button');
+      b.type = 'button';
+      b.textContent = item.label;
+      b.addEventListener('click', function () {
+        closeTvMenu(false, true);
+        item.run();
+      });
+      b.addEventListener('focus', function () {
+        try { b.scrollIntoView({ block: 'nearest' }); } catch (e) {}
+      });
+      li.appendChild(b);
+      list.appendChild(li);
+    });
+  }
+  function openTvMenu() {
+    if (!IS_TV || tvMenuOpen()) return;
+    buildTvMenu();
+    var panel = $('tvMenuPanel');
+    panel.hidden = false;
+    var lib = $('libraryScreen');
+    try { lib.inert = true; } catch (e) {}
+    lib.setAttribute('aria-hidden', 'true');
+    announce('Menu open.');
+    var first = panel.querySelector('#tvMenuList button');
+    if (first) first.focus();
+  }
+  function closeTvMenu(returnFocus, silent) {
+    if (!tvMenuOpen()) return;
+    $('tvMenuPanel').hidden = true;
+    var lib = $('libraryScreen');
+    try { lib.inert = false; } catch (e) {}
+    lib.removeAttribute('aria-hidden');
+    // Picking an item closes silently so the destination's own
+    // announcement (the system and game count, the sync status) is
+    // what Justin hears, not "Menu closed" over it.
+    if (!silent) announce('Menu closed.');
+    if (returnFocus) focusTvMenuBtn();
+  }
+  function focusTvMenuBtn() {
+    var btn = $('tvMenuBtn');
+    if (btn) btn.focus();
   }
 
   function allGames() {
@@ -1269,9 +1383,20 @@
   }
 
   // Unpack an archive blob with the bundled EmulatorJS extractor
-  // for its type. Resolves with { fileName: Uint8Array, ... }.
+  // for its type. Streams each file to onFile(name, bytes, size) as
+  // the worker posts it (t:2), one file at a time, so the main
+  // thread never holds the whole extracted set at once: peak memory
+  // is one file plus one send chunk (plus the archive bytes, which
+  // are transferred to the worker and freed here). onFile may return
+  // 'hold' to keep a file's bytes for the caller instead of freeing
+  // them — used for .cue sheets, which are tiny and must be
+  // rewritten once every entry name is known (see
+  // exportArchiveForNative). With no onFile, the old behaviour
+  // applies and every file's bytes are kept.
+  // Resolves with a catalog { fileName: { size, bytes } }; bytes is
+  // null for streamed files and set only for held ones.
   // onProgress(percent, fileName) reports the worker's t:4 progress.
-  function extractArchive(blob, type, title, onProgress) {
+  function extractArchive(blob, type, title, onProgress, onFile) {
     var base = 'assets/emulatorjs/data/compression/';
     var scriptPromise;
     if (type === '7z') {
@@ -1333,7 +1458,7 @@
       var scriptText = parts[0];
       var bytes = parts[1];
       return new Promise(function (resolve, reject) {
-        var files = {};
+        var catalog = {};
         var worker;
         try {
           worker = new Worker(URL.createObjectURL(new Blob([scriptText], { type: 'application/javascript' })));
@@ -1343,6 +1468,12 @@
         }
         var done = false;
         var stallTimer = null;
+        // Files are sent one at a time, in worker order: each t:2
+        // waits for the previous file's onFile work to finish
+        // before it starts, so at most one extracted file is live
+        // here. A failure in onFile (for example the bridge refusing
+        // a file) rejects the whole extraction at once.
+        var chain = Promise.resolve();
         // Extraction stall watchdog: if the worker posts nothing
         // (no file, no progress, no done) for 60 s, it is stuck
         // and the player must say so instead of sitting on
@@ -1369,16 +1500,42 @@
               onProgress(Math.floor(d.current / d.total * 100), d.name || '');
             }
           } else if (d.t === 2) {
-            files[d.file] = d.data;
+            var name = d.file;
+            var data = d.data;
+            var size = d.size || (data ? data.length : 0);
+            catalog[name] = { size: size, bytes: null };
+            if (typeof onFile === 'function') {
+              chain = chain.then(function () {
+                return Promise.resolve(onFile(name, data, size)).then(function (held) {
+                  // Held files stay in the catalog; every other
+                  // file's bytes are freed here, once sent.
+                  if (held === 'hold') catalog[name].bytes = data;
+                });
+              }).catch(function (err) { finish(err); });
+            } else {
+              catalog[name].bytes = data;
+            }
           } else if (d.t === 1) {
-            finish(null, files);
+            // Extraction is done: the stall watchdog no longer
+            // applies (the remaining work is sending, which has its
+            // own per-chunk timeouts). Resolve once the last file's
+            // send has finished.
+            if (stallTimer !== null) { clearTimeout(stallTimer); stallTimer = null; }
+            chain.then(function () { finish(null, catalog); }).catch(function (err) { finish(err); });
           }
         };
         worker.onerror = function () {
           finish(new Error('Could not unpack ' + title + '.'));
         };
         armStallTimer();
-        worker.postMessage(bytes);
+        // Hand the archive bytes to the worker: transfer (not copy)
+        // frees the main thread's copy, which used to sit in memory
+        // for the whole extraction alongside the extracted set.
+        try {
+          worker.postMessage(bytes, [bytes.buffer]);
+        } catch (e) {
+          worker.postMessage(bytes);
+        }
       });
     });
   }
@@ -1458,21 +1615,30 @@
   }
 
   // Pick the files a native core can play out of an unpacked
-  // archive. Returns { main, mainBytes, support } or null:
-  // main is the file the player starts from, support the extra
-  // files that must sit next to it (the .bin a .cue names).
-  function pickNativeFiles(system, files) {
+  // archive. catalog is extractArchive's catalog: { name: { size,
+  // bytes } }, where bytes is present only for files the caller
+  // held back (.cue sheets) — streamed files have bytes null,
+  // because they are already on the bridge. Returns { main,
+  // mainBytes, support } or null: main is the file the player
+  // starts from, support the extra files that must sit next to it
+  // (the .bin a .cue names); mainBytes is set only when the main
+  // file still has to be sent (a rewritten .cue), and null when it
+  // was already streamed during extraction.
+  function pickNativeFiles(system, catalog) {
     if (system === 'psx') {
-      var cues = filesWithExt(files, ['cue']);
+      var cues = filesWithExt(catalog, ['cue']);
       for (var i = 0; i < cues.length; i++) {
         var cueName = cues[i];
-        var cueText = bytesToLatin1(files[cueName]);
+        // A .cue with no held bytes cannot be read; skip it rather
+        // than crashing on the missing bytes.
+        if (!catalog[cueName].bytes) continue;
+        var cueText = bytesToLatin1(catalog[cueName].bytes);
         var refs = cueReferencedFiles(cueText);
         var support = [];
         var refToEntry = {};
         refs.forEach(function (ref) {
           var want = baseNameOf(ref).toLowerCase();
-          Object.keys(files).forEach(function (name) {
+          Object.keys(catalog).forEach(function (name) {
             if (baseNameOf(name).toLowerCase() === want && support.indexOf(name) < 0) {
               support.push(name);
               // F4: remember the actual entry basename for this
@@ -1490,13 +1656,13 @@
           };
         }
       }
-      var single = firstFileWithExt(files, ['chd', 'pbp', 'iso', 'bin', 'img']);
-      if (single) return { main: single, mainBytes: files[single], support: [] };
+      var single = firstFileWithExt(catalog, ['chd', 'pbp', 'iso', 'bin', 'img']);
+      if (single) return { main: single, mainBytes: null, support: [] };
       return null;
     }
     // n64: one ROM file.
-    var rom = firstFileWithExt(files, ['z64', 'n64', 'v64']);
-    if (rom) return { main: rom, mainBytes: files[rom], support: [] };
+    var rom = firstFileWithExt(catalog, ['z64', 'n64', 'v64']);
+    if (rom) return { main: rom, mainBytes: null, support: [] };
     return null;
   }
 
@@ -1567,9 +1733,20 @@
     return next();
   }
 
-  // Unpack, pick the play files, and send them through the
-  // multi-file bridge: support files first, the play file last,
-  // then name it and let nativeEnd launch the player.
+  // Unpack and send a PlayStation or Nintendo 64 game to the native
+  // player, 1 MB at a time through the bridge, with spoken progress.
+  // The bridge launches the player when the last chunk lands. N64
+  // always uses Parallel (Mupen dropped in v1.4.13). An archived
+  // game (.7z/.zip/.rar) is unpacked first and its files are
+  // STREAMED to the bridge as the worker posts them (v1.4.14): the
+  // old code collected the whole ~500 MB set in memory before
+  // sending anything, which OOM-killed the TV's WebView renderer.
+  // Each file is sent the moment it arrives and freed right after,
+  // so peak memory is one file plus one chunk. The .cue sheet is the
+  // one exception: it is tiny, held back, rewritten to the real
+  // entry basenames once every name is known (the v1.4.13 case fix),
+  // and sent last — so the order is still support files first, play
+  // file last, and nativeSetMainFile still names the main file.
   function exportArchiveForNative(game, blob, type) {
     var CHUNK = 1024 * 1024;
     if (!window.LynxosRetro || !window.LynxosRetro.nativeBeginMulti ||
@@ -1579,72 +1756,93 @@
     }
     $('nowPlaying').textContent = 'Extracting ' + game.title + '…';
     announce('Extracting ' + game.title + '.');
-    return extractArchive(blob, type, game.title, function (percent) {
-      $('nowPlaying').textContent = 'Extracting ' + game.title + ', ' + percent + ' percent.';
-    }).then(function (files) {
-      var picked = pickNativeFiles(game.system, files);
-      if (!picked) {
-        // Name what the archive actually holds, so the failure is
-        // diagnosable instead of a bare "no playable file": a disc
-        // set with an odd extension, or a readme-only archive, shows
-        // up in the reason instead of guessing.
-        var names = Object.keys(files);
-        var listed = names.slice(0, 5).join(', ');
-        if (names.length > 5) listed += ', and ' + (names.length - 5) + ' more.';
-        throw new Error('No playable game file inside ' + (game.fileName || game.title) +
-          '. It contains: ' + (listed || 'nothing') + '.');
-      }
+    var sentBytes = 0;
+    // Total bytes of files seen so far (held or streamed): the full
+    // send total is only known once extraction ends, so the 25/50/75
+    // marks are measured against the total seen so far. In the usual
+    // case — one big disc file plus a tiny .cue — that is exact; with
+    // several large files the marks land early, but still in order,
+    // and the "Sending done" line below stays exact.
+    var totalSeen = 0;
+    var announced = { 25: false, 50: false, 75: false };
+    // The bridge session starts lazily, on the first file actually
+    // sent: if the archive holds nothing playable, no session is
+    // ever started and the failure reads exactly as before.
+    var sessionStarted = false;
+    function ensureSession() {
+      if (sessionStarted) return;
       var begin = window.LynxosRetro.nativeBeginMulti(game.title, game.system);
       if (begin !== 'ok') throw new Error(begin);
       if (game.system === 'n64' && window.LynxosRetro.nativeSetCore) {
         window.LynxosRetro.nativeSetCore('parallel');
       }
-      var order = picked.support.slice();
-      order.push(picked.main);
-      var totalBytes = 0;
-      order.forEach(function (name) {
-        totalBytes += name === picked.main ? picked.mainBytes.length : files[name].length;
+      sessionStarted = true;
+    }
+    function announceSend(name, percent) {
+      [25, 50, 75].forEach(function (mark) {
+        if (percent >= mark && !announced[mark]) {
+          announced[mark] = true;
+          $('nowPlaying').textContent = 'Sending ' + name + ', ' + mark + ' percent.';
+          announce('Sending ' + name + ', ' + mark + ' percent.');
+        }
       });
-      var sentBytes = 0;
-      var announced = { 25: false, 50: false, 75: false };
-      function announceSend(name, percent) {
-        [25, 50, 75].forEach(function (mark) {
-          if (percent >= mark && !announced[mark]) {
-            announced[mark] = true;
-            $('nowPlaying').textContent = 'Sending ' + name + ', ' + mark + ' percent.';
-            announce('Sending ' + name + ', ' + mark + ' percent.');
-          }
+    }
+    function sendOne(name, bytes) {
+      ensureSession();
+      var fileBlob = new Blob([bytes]);
+      var b = window.LynxosRetro.nativeBeginFile(name, fileBlob.size);
+      if (b !== 'ok') throw new Error(b);
+      var offset = 0;
+      function next() {
+        if (offset >= fileBlob.size) {
+          var end = window.LynxosRetro.nativeEndFile();
+          if (end !== 'ok') throw new Error(end);
+          return Promise.resolve();
+        }
+        var slice = fileBlob.slice(offset, offset + CHUNK);
+        return blobToBase64Timed(slice, 30000,
+            new Error('Sending ' + name + ' stalled.')).then(function (b64) {
+          var r = window.LynxosRetro.nativeChunk(b64);
+          if (r !== 'ok') throw new Error(r);
+          offset += slice.size;
+          sentBytes += slice.size;
+          if (totalSeen > 0) announceSend(name, Math.floor(sentBytes / totalSeen * 100));
+          return next();
         });
       }
-      function sendOne(name, bytes) {
-        var fileBlob = new Blob([bytes]);
-        var b = window.LynxosRetro.nativeBeginFile(name, fileBlob.size);
-        if (b !== 'ok') throw new Error(b);
-        var offset = 0;
-        function next() {
-          if (offset >= fileBlob.size) {
-            var end = window.LynxosRetro.nativeEndFile();
-            if (end !== 'ok') throw new Error(end);
-            return Promise.resolve();
-          }
-          var slice = fileBlob.slice(offset, offset + CHUNK);
-          return blobToBase64Timed(slice, 30000,
-              new Error('Sending ' + name + ' stalled.')).then(function (b64) {
-            var r = window.LynxosRetro.nativeChunk(b64);
-            if (r !== 'ok') throw new Error(r);
-            offset += slice.size;
-            sentBytes += slice.size;
-            announceSend(name, Math.floor(sentBytes / totalBytes * 100));
-            return next();
-          });
-        }
-        return next();
+      return next();
+    }
+    return extractArchive(blob, type, game.title, function (percent) {
+      $('nowPlaying').textContent = 'Extracting ' + game.title + ', ' + percent + ' percent.';
+    }, function (name, bytes, size) {
+      // Every file counts toward the send total, held or streamed:
+      // the .cue is tiny, so including it barely moves the marks.
+      totalSeen += size;
+      // The .cue is held, not streamed: it must be rewritten to the
+      // real entry basenames (v1.4.13 case fix) once every entry
+      // name is known, and it is the play file, so it goes last.
+      if (extOf(name) === 'cue') return 'hold';
+      return sendOne(name, bytes);
+    }).then(function (catalog) {
+      var picked = pickNativeFiles(game.system, catalog);
+      if (!picked) {
+        // Name what the archive actually holds, so the failure is
+        // diagnosable instead of a bare "no playable file": a disc
+        // set with an odd extension, or a readme-only archive, shows
+        // up in the reason instead of guessing.
+        var names = Object.keys(catalog);
+        var listed = names.slice(0, 5).join(', ');
+        if (names.length > 5) listed += ', and ' + (names.length - 5) + ' more.';
+        throw new Error('No playable game file inside ' + (game.fileName || game.title) +
+          '. It contains: ' + (listed || 'nothing') + '.');
       }
+      // Support files were already streamed during extraction. Only
+      // a held main file (a rewritten .cue) is still unsent, and it
+      // goes last, exactly as before.
       var chain = Promise.resolve();
-      order.forEach(function (name) {
-        var bytes = name === picked.main ? picked.mainBytes : files[name];
-        chain = chain.then(function () { return sendOne(name, bytes); });
-      });
+      if (picked.mainBytes) {
+        chain = chain.then(function () { return sendOne(picked.main, picked.mainBytes); });
+      }
       return chain.then(function () {
         var m = window.LynxosRetro.nativeSetMainFile(picked.main);
         if (m !== 'ok') throw new Error(m);
@@ -1658,8 +1856,13 @@
     });
   }
 
-  // TV remote Back: leave the player, otherwise exit the app.
+  // TV remote Back: close the side menu if it is open, leave the
+  // player if in one, otherwise exit the app.
   window.tvBack = function () {
+    if (tvMenuOpen()) {
+      closeTvMenu(true);
+      return 'handled';
+    }
     if (!$('playerScreen').hidden) {
       location.reload();
       return 'handled';
@@ -3038,9 +3241,40 @@
 
   // ---------- Wire up ----------
 
+  // The library's header actions, as named functions so both the
+  // library buttons and the TV side menu can run them.
+  function goAddGame() {
+    setStatus($('addStatus'), '', '');
+    $('addChdHint').hidden = true;
+    updateSyncStatus();
+    showScreen('add');
+    $('addTitle').focus();
+  }
+  function goAccount() {
+    updateAccountStatus();
+    showScreen('account');
+  }
+  function doSync() {
+    if (!syncConfigured) {
+      announce('Cloud sync is not set up yet.');
+    } else if (!currentUser) {
+      announce('Sign in first, then sync.');
+    } else {
+      syncLibrary();
+    }
+  }
+
   function init() {
     if (IS_TV) document.body.classList.add('tv');
     window.addEventListener('keydown', libraryGridNav);
+    // Escape closes the TV side menu (desktop testing; on the TV
+    // the remote Back key goes through tvBack instead).
+    window.addEventListener('keydown', function (ev) {
+      if (ev.key === 'Escape' && tvMenuOpen()) {
+        ev.preventDefault();
+        closeTvMenu(true);
+      }
+    });
     buildTabs();
     renderList();
     refreshLastPlayerClose();
@@ -3055,35 +3289,20 @@
     updateSyncStatus();
     updateAccountStatus();
 
-    $('addGameBtn').addEventListener('click', function () {
-      setStatus($('addStatus'), '', '');
-      $('addChdHint').hidden = true;
-      updateSyncStatus();
-      showScreen('add');
-      $('addTitle').focus();
-    });
+    $('tvMenuBtn').addEventListener('click', openTvMenu);
+    $('tvMenuCloseBtn').addEventListener('click', function () { closeTvMenu(true); });
+    $('addGameBtn').addEventListener('click', goAddGame);
     $('addCancelBtn').addEventListener('click', function () { cancelActiveUpload(); showScreen('library'); });
     $('addSaveBtn').addEventListener('click', addGame);
     $('editSaveBtn').addEventListener('click', saveEdit);
     $('editDeleteBtn').addEventListener('click', deleteGame);
     $('editCancelBtn').addEventListener('click', function () { showScreen('library'); });
-    $('accountBtn').addEventListener('click', function () {
-      updateAccountStatus();
-      showScreen('account');
-    });
+    $('accountBtn').addEventListener('click', goAccount);
     $('accountBackBtn').addEventListener('click', function () { showScreen('library'); });
     $('driveSignInBtn').addEventListener('click', startDriveSignIn);
     $('driveSignOutBtn').addEventListener('click', signOutDrive);
     $('driveCancelBtn').addEventListener('click', cancelDriveSignIn);
-    $('syncBtn').addEventListener('click', function () {
-      if (!syncConfigured) {
-        announce('Cloud sync is not set up yet.');
-      } else if (!currentUser) {
-        announce('Sign in first, then sync.');
-      } else {
-        syncLibrary();
-      }
-    });
+    $('syncBtn').addEventListener('click', doSync);
     $('backBtn').addEventListener('click', function () { location.reload(); });
 
     // Signed in before (tokens saved on this device)? Pick the session
